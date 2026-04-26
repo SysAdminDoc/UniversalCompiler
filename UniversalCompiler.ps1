@@ -559,6 +559,15 @@ $mainXaml = @"
 $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($mainXaml))
 $window = [Windows.Markup.XamlReader]::Load($reader)
 
+# codex-branding:start
+                try {
+                    $brandingIconPath = Join-Path $PSScriptRoot 'icon.ico'
+                    if (Test-Path $brandingIconPath) {
+                        $window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create((New-Object System.Uri($brandingIconPath)))
+                    }
+                } catch {
+                }
+                # codex-branding:end
 # Get all controls
 $dropZone = $window.FindName("dropZone"); $txtSource = $window.FindName("txtSource"); $btnBrowse = $window.FindName("btnBrowse"); $btnRecent = $window.FindName("btnRecent")
 $pnlInfo = $window.FindName("pnlInfo"); $lblType = $window.FindName("lblType"); $lblSize = $window.FindName("lblSize"); $lblCompiler = $window.FindName("lblCompiler"); $lblEstSize = $window.FindName("lblEstSize"); $lblStatus = $window.FindName("lblStatus")
