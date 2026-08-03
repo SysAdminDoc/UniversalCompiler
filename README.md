@@ -51,6 +51,7 @@
 - **⚡ Post-Build Actions** - Auto-run, open folder, or copy after build
 - **📤 Export Build Log** - Save detailed logs for troubleshooting
 - **📏 Size Estimation** - See estimated output size before compiling
+- **🖼️ Icon Extraction** - Reuse an icon from an existing executable
 - **💡 Tooltips** - Hover for helpful explanations
 - **🖥️ DPI Aware** - Sharp rendering on high-DPI displays
 
@@ -151,6 +152,7 @@ python .\UniversalCompiler.py analytics --recent 10
 # Inspect available toolchains or verify an artifact without running it
 python .\UniversalCompiler.py list-toolchains
 python .\UniversalCompiler.py verify .\dist\myscript.exe
+python .\UniversalCompiler.py extract-icon .\existing.exe --output .\icon.ico
 
 # Generate a language-specific workflow template
 python .\UniversalCompiler.py init-actions --language py

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import threading
 import ctypes
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List, Any
@@ -23,8 +24,8 @@ from compiler_core import (
     CompilerEngine,
     EXTENSION_BACKENDS,
     backend_status,
-    detect_file_type,
     estimate_output_size as core_estimate_output_size,
+    extract_icon,
     load_profiles,
     save_profiles,
 )
@@ -34,7 +35,7 @@ from compiler_core import (
 # the script is launched without a command.
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1].lower() in {
     "build", "batch", "inspect", "verify", "list-toolchains", "init-profiles",
-    "bytecode", "analytics", "init-actions", "--help", "-h"
+    "bytecode", "extract-icon", "analytics", "init-actions", "--help", "-h"
 }:
     from compiler_core import cli_main
 
@@ -58,13 +59,6 @@ except ImportError:
     print("Installing customtkinter...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "customtkinter"])
     import customtkinter as ctk
-
-try:
-    from PIL import Image, ImageTk
-except ImportError:
-    print("Installing Pillow...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow"])
-    from PIL import Image, ImageTk
 
 # ============================================================================
 # CONSTANTS & CONFIGURATION
@@ -1456,6 +1450,14 @@ class UniversalCompiler:
             text_color=self.theme["text1"],
             command=self._clear_icon
         ).pack(side="left", padx=(4, 0))
+
+        ctk.CTkButton(
+            icon_row, text="From EXE", width=82,
+            fg_color=self.theme["border"],
+            hover_color=self.theme["card_hover"],
+            text_color=self.theme["text1"],
+            command=self._extract_icon
+        ).pack(side="left", padx=(4, 0))
     
     def _create_options_section(self, parent):
         """Create build options section."""
@@ -1747,15 +1749,51 @@ class UniversalCompiler:
         inner = ctk.CTkFrame(card, fg_color="transparent")
         inner.pack(fill="both", expand=True, padx=12, pady=12)
         
-        header = ctk.CTkFrame(inner, fg_color="transparent")
-        header.pack(fill="x", pady=(0, 8))
-        
+        comparison = ctk.CTkFrame(inner, fg_color="transparent")
+        comparison.pack(fill="both", expand=True)
+        comparison.grid_columnconfigure(0, weight=1)
+        comparison.grid_columnconfigure(1, weight=1)
+        comparison.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            comparison, text="📄 Source Preview",
+            font=("Segoe UI", 11, "bold"),
+            text_color=self.theme["text1"]
+        ).grid(row=0, column=0, sticky="w", padx=(0, 6), pady=(0, 6))
+        self.source_preview = ctk.CTkTextbox(
+            comparison,
+            fg_color=self.theme["log_bg"],
+            text_color=self.theme["text2"],
+            font=("Consolas", 9)
+        )
+        self.source_preview.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
+        self.source_preview.configure(state="disabled")
+
+        log_panel = ctk.CTkFrame(comparison, fg_color="transparent")
+        log_panel.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(6, 0))
+        log_panel.grid_rowconfigure(1, weight=1)
+        log_panel.grid_columnconfigure(0, weight=1)
+        header = ctk.CTkFrame(log_panel, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
         ctk.CTkLabel(
             header, text="📜 Build Log",
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 11, "bold"),
             text_color=self.theme["text1"]
         ).pack(side="left")
-        
+
+        self.jump_error_btn = ctk.CTkButton(
+            header, text="Jump Error", width=74,
+            fg_color=self.theme["border"],
+            hover_color=self.theme["card_hover"],
+            text_color=self.theme["text1"],
+            font=("Segoe UI", 9),
+            height=24,
+            command=self._jump_to_error,
+            state="disabled"
+        )
+        self.jump_error_btn.pack(side="left", padx=(8, 0))
+
         ctk.CTkButton(
             header, text="Clear", width=50,
             fg_color=self.theme["border"],
@@ -1764,8 +1802,8 @@ class UniversalCompiler:
             font=("Segoe UI", 9),
             height=24,
             command=self._clear_log
-        ).pack(side="left", padx=(8, 0))
-        
+        ).pack(side="left", padx=(4, 0))
+
         ctk.CTkButton(
             header, text="Export", width=50,
             fg_color=self.theme["border"],
@@ -1775,14 +1813,15 @@ class UniversalCompiler:
             height=24,
             command=self._export_log
         ).pack(side="left", padx=(4, 0))
-        
+
         self.log_text = ctk.CTkTextbox(
-            inner,
+            log_panel,
             fg_color=self.theme["log_bg"],
             text_color=self.theme["text2"],
             font=("Consolas", 10)
         )
-        self.log_text.pack(fill="both", expand=True)
+        self.log_text.grid(row=1, column=0, sticky="nsew")
+        self.error_line: Optional[int] = None
     
     def _create_actions_section(self, parent):
         """Create actions section."""
@@ -1940,6 +1979,34 @@ class UniversalCompiler:
         self.icon_entry.delete(0, "end")
         self.icon_entry.configure(state="readonly")
         self.icon_preview_frame.pack_forget()
+
+    def _extract_icon(self):
+        """Extract an icon from an existing executable for reuse."""
+        executable = filedialog.askopenfilename(
+            title="Select executable",
+            filetypes=[("Executables", "*.exe"), ("All Files", "*.*")],
+        )
+        if not executable:
+            return
+        output = filedialog.asksaveasfilename(
+            title="Save extracted icon",
+            defaultextension=".ico",
+            filetypes=[("Icons", "*.ico")],
+        )
+        if not output:
+            return
+        try:
+            icon_path = extract_icon(executable, output)
+        except Exception as error:
+            self.log(f"Icon extraction failed: {error}", "error")
+            return
+        self.icon_entry.configure(state="normal")
+        self.icon_entry.delete(0, "end")
+        self.icon_entry.insert(0, str(icon_path))
+        self.icon_entry.configure(state="readonly")
+        self.icon_preview_label.configure(text=f"🖼️ {icon_path.name}")
+        self.icon_preview_frame.pack(fill="x", pady=(10, 0))
+        self.log(f"Icon extracted: {icon_path}", "success")
     
     def _on_profile_change(self, profile_name: str):
         """Handle profile selection change."""
@@ -2087,6 +2154,37 @@ class UniversalCompiler:
     def _clear_log(self):
         """Clear build log."""
         self.log_text.delete("1.0", "end")
+        self.error_line = None
+        self.jump_error_btn.configure(state="disabled")
+
+    def _load_source_preview(self, filepath: str) -> None:
+        """Show a bounded, line-numbered source preview beside the log."""
+        try:
+            lines = Path(filepath).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as error:
+            lines = [f"Unable to preview source: {error}"]
+        preview = "\n".join(
+            f"{index:4d} | {line}" for index, line in enumerate(lines[:2000], start=1)
+        )
+        self.source_preview.configure(state="normal")
+        self.source_preview.delete("1.0", "end")
+        self.source_preview.insert("1.0", preview)
+        self.source_preview.configure(state="disabled")
+
+    def _jump_to_error(self):
+        """Scroll the source preview to the first compiler-reported line."""
+        if not self.error_line:
+            return
+        self.source_preview.configure(state="normal")
+        self.source_preview.tag_remove("error_line", "1.0", "end")
+        self.source_preview.tag_add(
+            "error_line",
+            f"{self.error_line}.0",
+            f"{self.error_line}.end",
+        )
+        self.source_preview.tag_config("error_line", background=self.theme["border"])
+        self.source_preview.see(f"{self.error_line}.0")
+        self.source_preview.configure(state="disabled")
     
     def _export_log(self):
         """Export build log."""
@@ -2144,6 +2242,7 @@ Source: {self.source_file}
         
         self.source_file = filepath
         self.recent_files.add(filepath)
+        self._load_source_preview(filepath)
         
         # Update source entry
         self.source_entry.configure(state="normal")
@@ -2333,6 +2432,12 @@ Source: {self.source_file}
         """Add message to build log."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         prefix = {"info": "[*]", "success": "[OK]", "warning": "[!]", "error": "[X]"}.get(level, "[*]")
+
+        if level == "error":
+            match = re.search(r"(?:line\s+|:)(\d+)\b", message, re.IGNORECASE)
+            if match:
+                self.error_line = int(match.group(1))
+                self.jump_error_btn.configure(state="normal")
         
         self.log_text.insert("end", f"{timestamp} {prefix} {message}\n")
         self.log_text.see("end")

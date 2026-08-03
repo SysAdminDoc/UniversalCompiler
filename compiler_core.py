@@ -1032,6 +1032,19 @@ class CompilerEngine:
                 command_parts.append(f"--product-name={_metadata(request, 'product')}")
             if _metadata(request, "company"):
                 command_parts.append(f"--company-name={_metadata(request, 'company')}")
+            if _metadata(request, "version"):
+                command_parts.extend(
+                    (
+                        f"--file-version={_metadata(request, 'version')}",
+                        f"--product-version={_metadata(request, 'version')}",
+                    )
+                )
+            if _metadata(request, "description"):
+                command_parts.append(
+                    f"--file-description={_metadata(request, 'description')}"
+                )
+            if _metadata(request, "copyright"):
+                command_parts.append(f"--copyright={_metadata(request, 'copyright')}")
             command_parts.extend((str(source), *request.extra_args))
             command = tuple(command_parts)
         elif backend in {"bun", "pkg", "deno"}:
@@ -1507,6 +1520,40 @@ def compile_bytecode(
     return output_path
 
 
+def extract_icon(
+    executable: os.PathLike[str] | str,
+    output: os.PathLike[str] | str | None = None,
+) -> Path:
+    """Extract the associated Windows icon through a hidden .NET call."""
+
+    source_path = Path(executable).expanduser()
+    if not source_path.is_file() or source_path.suffix.lower() != ".exe":
+        raise BuildValidationError(f"Windows executable not found: {source_path}")
+    output_path = (
+        Path(output).expanduser() if output else source_path.with_suffix(".ico")
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    powershell = _powershell_executable()
+    if not powershell:
+        raise BuildValidationError("PowerShell is required for icon extraction")
+    script = " ".join(
+        [
+            "$ErrorActionPreference='Stop';",
+            "Add-Type -AssemblyName System.Drawing;",
+            f"$icon=[System.Drawing.Icon]::ExtractAssociatedIcon({_ps_quote(source_path)});",
+            "if($null -eq $icon){throw 'No associated icon found'};",
+            f"$stream=[IO.File]::Open({_ps_quote(output_path)},[IO.FileMode]::Create);",
+            "try{$icon.Save($stream)}finally{$stream.Dispose();$icon.Dispose()};",
+        ]
+    )
+    result = run_command(
+        (powershell, "-NoProfile", "-NonInteractive", "-Command", script)
+    )
+    if not result.success or not output_path.is_file():
+        raise BuildValidationError(result.output or "Icon extraction failed")
+    return output_path
+
+
 class BuildAnalytics:
     """Local-only build timing and size history backed by SQLite."""
 
@@ -1876,6 +1923,12 @@ def create_cli_parser() -> argparse.ArgumentParser:
     bytecode_parser.add_argument("--output", "-o")
     bytecode_parser.add_argument("--json", action="store_true")
 
+    icon_parser = subparsers.add_parser(
+        "extract-icon", help="Extract a Windows executable icon as .ico"
+    )
+    icon_parser.add_argument("executable")
+    icon_parser.add_argument("--output", "-o")
+
     analytics_parser = subparsers.add_parser(
         "analytics", help="Show local build timing and size analytics"
     )
@@ -1945,6 +1998,14 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             return 1
         value = {"source": args.source, "output": str(output)}
         print(json.dumps(value, indent=2) if args.json else str(output))
+        return 0
+    if args.command == "extract-icon":
+        try:
+            output = extract_icon(args.executable, args.output)
+        except (BuildValidationError, OSError) as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+        print(output)
         return 0
     if args.command == "analytics":
         analytics = BuildAnalytics(args.path)
@@ -2105,7 +2166,9 @@ __all__ = [
     "config_dir",
     "detect_file_type",
     "estimate_output_size",
+    "extract_icon",
     "format_size",
+    "github_actions_template",
     "load_json",
     "load_profiles",
     "profiles_path",
