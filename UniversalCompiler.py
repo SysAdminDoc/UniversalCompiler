@@ -25,13 +25,16 @@ from compiler_core import (
     backend_status,
     detect_file_type,
     estimate_output_size as core_estimate_output_size,
+    load_profiles,
+    save_profiles,
 )
 
 # Keep automation side-effect free: CLI invocations must not import the GUI or
 # install optional desktop packages.  The legacy GUI remains the default when
 # the script is launched without a command.
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1].lower() in {
-    "build", "batch", "inspect", "verify", "list-toolchains", "init-profiles", "--help", "-h"
+    "build", "batch", "inspect", "verify", "list-toolchains", "init-profiles",
+    "bytecode", "analytics", "init-actions", "--help", "-h"
 }:
     from compiler_core import cli_main
 
@@ -71,7 +74,7 @@ APP_NAME = "Universal Compiler"
 APP_VERSION = "2.0"
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "UniversalCompiler"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-PROFILES_FILE = CONFIG_DIR / "profiles.json"
+PROFILES_FILE = CONFIG_DIR / "profiles.yaml"
 HISTORY_FILE = CONFIG_DIR / "history.json"
 RECENT_FILE = CONFIG_DIR / "recent.json"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
@@ -142,6 +145,13 @@ DEFAULT_PROFILES = {
         "console": False,
         "admin": False,
         "single_file": True,
+        "backend": "auto",
+        "architecture": "native",
+        "prefetch": False,
+        "verify": True,
+        "cache": True,
+        "toolchain_versions": {},
+        "upx": False,
         "version": "1.0.0.0",
         "company": "",
         "copyright": "",
@@ -152,6 +162,13 @@ DEFAULT_PROFILES = {
         "console": True,
         "admin": False,
         "single_file": True,
+        "backend": "auto",
+        "architecture": "native",
+        "prefetch": False,
+        "verify": True,
+        "cache": True,
+        "toolchain_versions": {},
+        "upx": False,
         "version": "1.0.0.0",
         "company": "",
         "copyright": "",
@@ -162,6 +179,13 @@ DEFAULT_PROFILES = {
         "console": True,
         "admin": True,
         "single_file": True,
+        "backend": "auto",
+        "architecture": "native",
+        "prefetch": False,
+        "verify": True,
+        "cache": True,
+        "toolchain_versions": {},
+        "upx": False,
         "version": "1.0.0.0",
         "company": "",
         "copyright": "",
@@ -172,6 +196,13 @@ DEFAULT_PROFILES = {
         "console": False,
         "admin": False,
         "single_file": True,
+        "backend": "auto",
+        "architecture": "native",
+        "prefetch": False,
+        "verify": True,
+        "cache": True,
+        "toolchain_versions": {},
+        "upx": False,
         "version": "1.0.0.0",
         "company": "",
         "copyright": "",
@@ -399,13 +430,16 @@ class BuildProfiles:
     
     def load(self) -> None:
         """Load profiles from disk."""
-        saved = load_json(PROFILES_FILE, {})
+        saved = load_profiles(PROFILES_FILE, self._profiles)
+        legacy_file = CONFIG_DIR / "profiles.json"
+        if not PROFILES_FILE.exists() and legacy_file.exists():
+            saved = load_json(legacy_file, saved)
         for name, profile in saved.items():
             self._profiles[name] = profile
     
     def save(self) -> None:
         """Save profiles to disk."""
-        save_json(PROFILES_FILE, self._profiles)
+        save_profiles(PROFILES_FILE, self._profiles)
     
     def get(self, name: str) -> Optional[Dict]:
         """Get profile by name."""

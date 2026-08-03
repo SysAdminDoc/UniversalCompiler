@@ -9,13 +9,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from compiler_core import (
+    BuildAnalytics,
     DEFAULT_PROFILES,
     BuildRequest,
     CommandResult,
     CompilerEngine,
     cli_main,
+    compile_bytecode,
     detect_file_type,
     format_size,
+    github_actions_template,
     load_profiles,
     save_profiles,
     verify_artifact,
@@ -44,6 +47,10 @@ def test_profiles_round_trip_without_extra_dependency(tmp_path: Path) -> None:
         "console": True,
         "single_file": True,
     }
+    profiles["Pinned Profile"] = {
+        "toolchain_versions": {"pyinstaller": "6.20.0"},
+        "upx": True,
+    }
 
     save_profiles(path, profiles)
     loaded = load_profiles(path)
@@ -51,6 +58,7 @@ def test_profiles_round_trip_without_extra_dependency(tmp_path: Path) -> None:
     assert loaded["Release Profile"]["backend"] == "nuitka"
     assert loaded["Release Profile"]["console"] is True
     assert loaded["Default"]["single_file"] is True
+    assert loaded["Pinned Profile"]["toolchain_versions"]["pyinstaller"] == "6.20.0"
 
 
 def test_static_artifact_verification(tmp_path: Path) -> None:
@@ -62,6 +70,39 @@ def test_static_artifact_verification(tmp_path: Path) -> None:
 
     artifact.write_bytes(b"not an executable")
     assert verify_artifact(artifact).passed is False
+
+
+def test_bytecode_compile_only(tmp_path: Path) -> None:
+    source = tmp_path / "bytecode.py"
+    output = tmp_path / "bytecode.pyc"
+    source.write_text("value = 42\n", encoding="utf-8")
+
+    result = compile_bytecode(source, output)
+
+    assert result == output
+    assert output.read_bytes()[:4] != b""
+
+
+def test_local_analytics_records_summary(tmp_path: Path) -> None:
+    source = tmp_path / "analytics.py"
+    source.write_text("print(1)\n", encoding="utf-8")
+    output = tmp_path / "analytics.exe"
+
+    def fake_runner(command, cwd=None, environment=None, timeout=None):
+        _fake_pe(output)
+        return CommandResult(tuple(command), 0)
+
+    result = CompilerEngine(
+        runner=fake_runner,
+        require_available=False,
+    ).build(BuildRequest(source=source, output=output, backend="pyinstaller"))
+    analytics = BuildAnalytics(tmp_path / "analytics.sqlite3")
+    analytics.record(result)
+
+    summary = analytics.summary()
+    assert summary["total_builds"] == 1
+    assert summary["successful_builds"] == 1
+    assert analytics.recent(1)[0]["backend"] == "pyinstaller"
 
 
 def test_engine_builds_and_uses_cache(tmp_path: Path) -> None:
@@ -122,11 +163,60 @@ def test_engine_batch_preserves_input_order(tmp_path: Path) -> None:
     assert all(result.success for result in results)
 
 
+def test_engine_matrix_suffixes_outputs(tmp_path: Path) -> None:
+    source = tmp_path / "matrix.py"
+    source.write_text("print(1)\n", encoding="utf-8")
+
+    def fake_runner(command, cwd=None, environment=None, timeout=None):
+        output = Path(command[command.index("--distpath") + 1]) / (
+            Path(command[command.index("--name") + 1]).stem + ".exe"
+        )
+        _fake_pe(output)
+        return CommandResult(tuple(command), 0)
+
+    request = BuildRequest(
+        source=source,
+        output=tmp_path / "matrix.exe",
+        backend="pyinstaller",
+    )
+    results = CompilerEngine(
+        runner=fake_runner,
+        require_available=False,
+    ).build_matrix(request, ["x86", "x64"], workers=2)
+
+    assert [result.output.name for result in results] == [
+        "matrix-x86.exe",
+        "matrix-x64.exe",
+    ]
+    assert all(result.success for result in results)
+
+
 def test_cli_list_toolchains_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli_main(["list-toolchains", "--json"]) == 0
     output = json.loads(capsys.readouterr().out)
     assert "nuitka" in output
     assert "rs" in output["rust"]["extensions"]
+
+
+def test_github_actions_template_is_language_specific(tmp_path: Path) -> None:
+    workflow = github_actions_template("py")
+    assert "setup-python" in workflow
+    assert "--no-analytics" in workflow
+
+    destination = tmp_path / ".github" / "workflow.yml"
+    assert (
+        cli_main(
+            [
+                "init-actions",
+                "--language",
+                "ts",
+                "--output",
+                str(destination),
+            ]
+        )
+        == 0
+    )
+    assert "setup-bun" in destination.read_text(encoding="utf-8")
 
 
 def test_cli_preview_does_not_execute(

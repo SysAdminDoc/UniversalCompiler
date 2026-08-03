@@ -1,0 +1,45 @@
+{
+  "name": "universal-compiler",
+  "displayName": "Universal Compiler",
+  "description": "Build the active source file with Universal Compiler.",
+  "version": "0.1.0",
+  "publisher": "SysAdminDoc",
+  "engines": {
+    "vscode": ">=1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:universalCompiler.buildActiveFile"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "universalCompiler.buildActiveFile",
+        "title": "Universal Compiler: Build Active File"
+      }
+    ],
+    "configuration": {
+      "title": "Universal Compiler",
+      "properties": {
+        "universalCompiler.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Python executable used to launch UniversalCompiler.py."
+        },
+        "universalCompiler.scriptPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/UniversalCompiler.py",
+          "description": "Path to the UniversalCompiler.py CLI entry point."
+        },
+        "universalCompiler.backend": {
+          "type": "string",
+          "default": "auto",
+          "description": "Optional backend override, for example nuitka or bun."
+        }
+      }
+    }
+  }
+}

@@ -9,6 +9,9 @@ All notable changes to UniversalCompiler will be documented in this file.
   watch mode, and static post-build verification.
 - Add Nuitka, Bun, Deno, TypeScript, Rust, Lua, Perl, and Kotlin/Native backend
   planning to the shared engine and GUI backend selector.
+- Add YAML toolchain pins, architecture matrix builds, optional UPX compression,
+  bytecode-only compilation, local SQLite analytics, language-specific GitHub
+  Actions templates, and a VS Code command extension.
 
 ## [v0.1.0] - %Y->- (HEAD -> main, origin/main, origin/HEAD)
 

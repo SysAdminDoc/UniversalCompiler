@@ -14,16 +14,18 @@ import hashlib
 import importlib.util
 import json
 import os
+import py_compile
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,8 @@ DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
         "prefetch": False,
         "verify": True,
         "cache": True,
+        "toolchain_versions": {},
+        "upx": False,
     },
     "Console App": {
         "console": True,
@@ -64,6 +68,8 @@ DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
         "prefetch": False,
         "verify": True,
         "cache": True,
+        "toolchain_versions": {},
+        "upx": False,
     },
     "Admin Tool": {
         "console": True,
@@ -80,6 +86,8 @@ DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
         "prefetch": False,
         "verify": True,
         "cache": True,
+        "toolchain_versions": {},
+        "upx": False,
     },
     "GUI Application": {
         "console": False,
@@ -96,6 +104,8 @@ DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
         "prefetch": False,
         "verify": True,
         "cache": True,
+        "toolchain_versions": {},
+        "upx": False,
     },
 }
 
@@ -138,6 +148,7 @@ BACKEND_NAMES: dict[str, str] = {
     "luastatic": "Lua luastatic",
     "perl-pp": "Perl PAR::Packer",
     "kotlin-native": "Kotlin/Native",
+    "upx": "UPX compressor",
 }
 
 
@@ -166,6 +177,8 @@ class BuildRequest:
     cache: bool = True
     force: bool = False
     extra_args: tuple[str, ...] = ()
+    toolchain_versions: Mapping[str, str] = field(default_factory=dict)
+    upx: bool = False
 
     def normalized(self) -> BuildRequest:
         source = Path(self.source).expanduser()
@@ -193,6 +206,11 @@ class BuildRequest:
             cache=bool(self.cache),
             force=bool(self.force),
             extra_args=tuple(str(value) for value in self.extra_args),
+            toolchain_versions={
+                str(key): str(value)
+                for key, value in dict(self.toolchain_versions).items()
+            },
+            upx=bool(self.upx),
         )
 
 
@@ -377,12 +395,22 @@ def _dump_profiles_yaml(profiles: Mapping[str, Mapping[str, Any]]) -> str:
     for name, profile in profiles.items():
         lines.append(f"{_yaml_scalar(name)}:")
         for key, value in profile.items():
-            lines.append(f"  {key}: {_yaml_scalar(value)}")
+            if isinstance(value, Mapping):
+                if value:
+                    lines.append(f"  {key}:")
+                    for nested_key, nested_value in value.items():
+                        lines.append(f"    {nested_key}: {_yaml_scalar(nested_value)}")
+                else:
+                    lines.append(f"  {key}: {{}}")
+            else:
+                lines.append(f"  {key}: {_yaml_scalar(value)}")
     return "\n".join(lines) + "\n"
 
 
 def _parse_yaml_scalar(value: str) -> Any:
     value = value.strip()
+    if value == "{}":
+        return {}
     if value in {"true", "True"}:
         return True
     if value in {"false", "False"}:
@@ -408,15 +436,27 @@ def _parse_yaml_scalar(value: str) -> Any:
 def _load_simple_yaml(text: str) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     current: dict[str, Any] | None = None
-    current_name: str | None = None
+    nested: dict[str, Any] | None = None
     for raw_line in text.splitlines():
         if not raw_line.strip() or raw_line.lstrip().startswith("#"):
             continue
-        if raw_line.startswith("  "):
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        if indent >= 4:
+            if nested is None or ":" not in raw_line:
+                continue
+            key, value = raw_line.strip().split(":", 1)
+            nested[key.strip()] = _parse_yaml_scalar(value)
+            continue
+        if indent == 2:
             if current is None or ":" not in raw_line:
                 continue
             key, value = raw_line.strip().split(":", 1)
-            current[key.strip()] = _parse_yaml_scalar(value)
+            if value.strip():
+                current[key.strip()] = _parse_yaml_scalar(value)
+                nested = None
+            else:
+                nested = {}
+                current[key.strip()] = nested
             continue
         if ":" not in raw_line:
             continue
@@ -424,6 +464,7 @@ def _load_simple_yaml(text: str) -> dict[str, dict[str, Any]]:
         current_name = str(_parse_yaml_scalar(name.strip()))
         current = {}
         result[current_name] = current
+        nested = None
         if value.strip():
             result[current_name] = _parse_yaml_scalar(value)
             current = None
@@ -601,6 +642,7 @@ def resolve_backend_executable(backend: str) -> str | None:
         "luastatic": ("luastatic",),
         "perl-pp": ("pp",),
         "kotlin-native": ("kotlinc-native",),
+        "upx": ("upx",),
     }
     if backend == "ps2exe":
         return _powershell_executable()
@@ -659,6 +701,13 @@ def _target_for(backend: str, architecture: str) -> str:
         return f"{prefix}-win-{suffix}" if backend == "pkg" else f"bun-windows-{suffix}"
     if backend == "deno":
         return {
+            "x64": "x86_64-pc-windows-msvc",
+            "amd64": "x86_64-pc-windows-msvc",
+            "arm64": "aarch64-pc-windows-msvc",
+        }.get(arch, arch)
+    if backend == "rust":
+        return {
+            "x86": "i686-pc-windows-msvc",
             "x64": "x86_64-pc-windows-msvc",
             "amd64": "x86_64-pc-windows-msvc",
             "arm64": "aarch64-pc-windows-msvc",
@@ -761,6 +810,38 @@ class CompilerEngine:
                 return backend
         return choices[0] if choices else None
 
+    def _version_command(self, backend: str) -> tuple[str, ...] | None:
+        executable = resolve_backend_executable(backend)
+        if not executable:
+            return None
+        if backend == "nuitka":
+            return (sys.executable, "-m", "nuitka", "--version")
+        if backend == "ps2exe":
+            return (
+                executable,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-Module -ListAvailable ps2exe | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty Version)",
+            )
+        if backend == "csc":
+            return (executable, "/version")
+        return (executable, "--version")
+
+    def _validate_toolchain_versions(self, request: BuildRequest) -> None:
+        for backend, expected in request.toolchain_versions.items():
+            command = self._version_command(backend)
+            if not command:
+                raise BuildValidationError(
+                    f"Pinned toolchain is not installed: {backend} ({expected})"
+                )
+            result = self.runner(command)
+            if not result.success or str(expected) not in result.output:
+                actual = result.output.splitlines()[0] if result.output else "unknown"
+                raise BuildValidationError(
+                    f"Toolchain pin mismatch for {backend}: expected {expected}, got {actual}"
+                )
+
     def _validate(
         self, request: BuildRequest, allow_missing_source: bool = False
     ) -> BuildRequest:
@@ -780,6 +861,8 @@ class CompilerEngine:
             normalized = BuildRequest(**{**asdict(normalized), "backend": backend})
         if self.require_available and not resolve_backend_executable(backend):
             raise BuildValidationError(f"Compiler backend is not installed: {backend}")
+        if not allow_missing_source and normalized.toolchain_versions:
+            self._validate_toolchain_versions(normalized)
         return normalized
 
     def _tool_identity(self, backend: str) -> dict[str, Any]:
@@ -819,6 +902,8 @@ class CompilerEngine:
                 else None,
                 "metadata": dict(request.metadata),
                 "extra_args": list(request.extra_args),
+                "toolchain_versions": dict(request.toolchain_versions),
+                "upx": request.upx,
                 "tool": self._tool_identity(backend),
             }
         )
@@ -1036,20 +1121,22 @@ class CompilerEngine:
                     raise BuildValidationError(
                         f"Could not determine Cargo package name: {cargo_file}"
                     )
-                command = (cargo, "build", "--release", *request.extra_args)
-                candidate_dir = cargo_file.parent / "target" / "release"
+                cargo_args = [cargo, "build", "--release"]
+                if target != "native":
+                    cargo_args.extend(("--target", target))
+                command = tuple(cargo_args + list(request.extra_args))
+                candidate_dir = cargo_file.parent / "target"
+                if target != "native":
+                    candidate_dir /= target
+                candidate_dir /= "release"
                 candidates.append(candidate_dir / f"{package}.exe")
             else:
                 rustc = _find_first(("rustc",)) or executable
-                command = (
-                    rustc,
-                    "--edition",
-                    "2021",
-                    "-O",
-                    "-o",
-                    str(output),
-                    *request.extra_args,
-                    str(source),
+                rustc_args = [rustc, "--edition", "2021", "-O"]
+                if target != "native":
+                    rustc_args.extend(("--target", target))
+                command = tuple(
+                    rustc_args + ["-o", str(output), *request.extra_args, str(source)]
                 )
         elif backend == "srlua":
             command = (executable, str(source), str(output), *request.extra_args)
@@ -1193,6 +1280,39 @@ class CompilerEngine:
                 if candidate and candidate != normalized.output:
                     normalized.output.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(candidate, normalized.output)
+            if normalized.upx:
+                upx = resolve_backend_executable("upx")
+                if not upx:
+                    return BuildResult(
+                        False,
+                        "failed",
+                        normalized,
+                        normalized.output,
+                        plan.backend,
+                        commands=commands,
+                        source_hash=source_hash,
+                        cache_key=cache_key,
+                        message="UPX was requested but is not installed",
+                        duration_seconds=time.monotonic() - started,
+                    )
+                compression = self.runner(
+                    (upx, "--best", "--lzma", str(normalized.output)),
+                    cwd=normalized.output.parent,
+                )
+                commands.append(compression)
+                if not compression.success:
+                    return BuildResult(
+                        False,
+                        "failed",
+                        normalized,
+                        normalized.output,
+                        plan.backend,
+                        commands=commands,
+                        source_hash=source_hash,
+                        cache_key=cache_key,
+                        message=f"UPX compression failed: {compression.output}",
+                        duration_seconds=time.monotonic() - started,
+                    )
             verification = (
                 verify_artifact(normalized.output) if normalized.verify else None
             )
@@ -1267,6 +1387,30 @@ class CompilerEngine:
             futures = [pool.submit(self.build, request) for request in requests]
             return [future.result() for future in futures]
 
+    def build_matrix(
+        self,
+        request: BuildRequest,
+        architectures: Sequence[str],
+        workers: int = 1,
+    ) -> list[BuildResult]:
+        """Build one source for each requested architecture."""
+
+        values: list[str] = []
+        for architecture in architectures:
+            normalized = str(architecture).lower()
+            if normalized and normalized not in values:
+                values.append(normalized)
+        if not values:
+            raise BuildValidationError("At least one matrix architecture is required")
+        requests: list[BuildRequest] = []
+        for architecture in values:
+            suffix = f"-{architecture}"
+            output = request.output.with_name(
+                f"{request.output.stem}{suffix}{request.output.suffix}"
+            )
+            requests.append(replace(request, output=output, architecture=architecture))
+        return self.build_batch(requests, workers=workers)
+
     def watch(
         self,
         request: BuildRequest,
@@ -1340,6 +1484,141 @@ def verify_artifact(path: os.PathLike[str] | str) -> VerificationResult:
     )
 
 
+def compile_bytecode(
+    source: os.PathLike[str] | str,
+    output: os.PathLike[str] | str | None = None,
+) -> Path:
+    """Compile a Python source file to an explicit .pyc without packaging it."""
+
+    source_path = Path(source).expanduser()
+    if source_path.suffix.lower() != ".py":
+        raise BuildValidationError(
+            "Bytecode compile-only mode currently supports Python .py sources"
+        )
+    output_path = (
+        Path(output).expanduser() if output else source_path.with_suffix(".pyc")
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    py_compile.compile(
+        str(source_path),
+        cfile=str(output_path),
+        doraise=True,
+    )
+    return output_path
+
+
+class BuildAnalytics:
+    """Local-only build timing and size history backed by SQLite."""
+
+    def __init__(self, path: os.PathLike[str] | str | None = None) -> None:
+        self.path = (
+            Path(path).expanduser() if path else config_dir() / "analytics.sqlite3"
+        )
+
+    def _connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS builds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                source TEXT NOT NULL,
+                output TEXT NOT NULL,
+                file_type TEXT,
+                backend TEXT,
+                profile TEXT,
+                success INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                duration_seconds REAL NOT NULL
+            )
+            """
+        )
+        connection.commit()
+        return connection
+
+    def record(self, result: BuildResult) -> None:
+        size = 0
+        try:
+            size = result.output.stat().st_size
+        except OSError:
+            pass
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO builds (
+                    timestamp, source, output, file_type, backend, profile,
+                    success, status, size_bytes, duration_seconds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(UTC).isoformat(),
+                    str(result.request.source),
+                    str(result.output),
+                    result.request.file_type,
+                    result.backend,
+                    result.request.profile_name,
+                    int(result.success),
+                    result.status,
+                    size,
+                    result.duration_seconds,
+                ),
+            )
+
+    def summary(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(success), 0),
+                       COALESCE(SUM(size_bytes), 0),
+                       COALESCE(AVG(duration_seconds), 0)
+                FROM builds
+                """
+            ).fetchone()
+            by_backend = connection.execute(
+                """
+                SELECT COALESCE(backend, 'unknown'), COUNT(*), SUM(success)
+                FROM builds GROUP BY backend ORDER BY backend
+                """
+            ).fetchall()
+        total, successful, bytes_built, average_seconds = row or (0, 0, 0, 0)
+        return {
+            "database": str(self.path),
+            "total_builds": int(total),
+            "successful_builds": int(successful),
+            "bytes_built": int(bytes_built),
+            "average_duration_seconds": float(average_seconds),
+            "by_backend": {
+                str(backend): {"builds": int(count), "successes": int(successes)}
+                for backend, count, successes in by_backend
+            },
+        }
+
+    def recent(self, limit: int = 10) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT timestamp, source, output, backend, profile, success,
+                       status, size_bytes, duration_seconds
+                FROM builds ORDER BY id DESC LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        keys = (
+            "timestamp",
+            "source",
+            "output",
+            "backend",
+            "profile",
+            "success",
+            "status",
+            "size_bytes",
+            "duration_seconds",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
+
 def parse_metadata(values: Sequence[str]) -> dict[str, str]:
     metadata: dict[str, str] = {}
     for value in values:
@@ -1353,6 +1632,84 @@ def parse_metadata(values: Sequence[str]) -> dict[str, str]:
     return metadata
 
 
+def parse_toolchain_versions(values: Sequence[str]) -> dict[str, str]:
+    versions: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise BuildValidationError(
+                f"Toolchain pins must use backend=version: {value}"
+            )
+        backend, version = value.split("=", 1)
+        backend = backend.strip().lower()
+        if not backend or not version.strip():
+            raise BuildValidationError(f"Toolchain pin is incomplete: {value}")
+        versions[backend] = version.strip()
+    return versions
+
+
+def github_actions_template(file_type: str) -> str:
+    """Return a minimal workflow that invokes the repository's CLI."""
+
+    extension = file_type.lower().lstrip(".")
+    if extension not in EXTENSION_BACKENDS:
+        raise BuildValidationError(f"No GitHub Actions template for: {file_type}")
+    setup: list[str]
+    if extension == "py":
+        setup = [
+            "      - uses: actions/setup-python@v5",
+            "        with:",
+            "          python-version: '3.12'",
+            "      - run: python -m pip install pyinstaller",
+        ]
+    elif extension in {"js", "ts"}:
+        setup = [
+            "      - uses: oven-sh/setup-bun@v2",
+            "      - run: bun install --frozen-lockfile",
+        ]
+    elif extension == "go":
+        setup = [
+            "      - uses: actions/setup-go@v5",
+            "        with:",
+            "          go-version: stable",
+        ]
+    elif extension == "rs":
+        setup = [
+            "      - uses: actions-rust-lang/setup-rust-toolchain@v1",
+            "        with:",
+            "          toolchain: stable",
+        ]
+    else:
+        setup = []
+    setup_text = "\n".join(setup)
+    return f"""name: Universal Compiler ({extension})
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '**/*.{extension}'
+      - 'UniversalCompiler.py'
+      - 'compiler_core.py'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+{setup_text}
+      - name: Build source
+        shell: pwsh
+        run: python .\\UniversalCompiler.py build $env:UC_SOURCE --output dist\\artifact.exe --verify --no-analytics
+        env:
+          UC_SOURCE: ${{{{ vars.UC_SOURCE || 'src/main.{extension}' }}}}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: universal-compiler-{extension}
+          path: dist/*.exe
+"""
+
+
 def _profile_request(
     profile: Mapping[str, Any], args: argparse.Namespace, source: Path, output: Path
 ) -> BuildRequest:
@@ -1362,6 +1719,11 @@ def _profile_request(
         if profile.get(key, "") != ""
     }
     metadata.update(parse_metadata(args.metadata or []))
+    toolchain_versions = {
+        str(key): str(value)
+        for key, value in dict(profile.get("toolchain_versions") or {}).items()
+    }
+    toolchain_versions.update(parse_toolchain_versions(args.tool_version or []))
     return BuildRequest(
         source=source,
         output=output,
@@ -1381,12 +1743,18 @@ def _profile_request(
         metadata=metadata,
         profile_name=args.profile,
         prefetch=args.prefetch or bool(profile.get("prefetch", False)),
-        verify=not args.no_verify
-        if args.no_verify
-        else bool(profile.get("verify", True)),
+        verify=(
+            True
+            if args.verify_flag
+            else not args.no_verify
+            if args.no_verify
+            else bool(profile.get("verify", True))
+        ),
         cache=not args.no_cache if args.no_cache else bool(profile.get("cache", True)),
         force=args.force,
         extra_args=tuple(args.extra_arg or []),
+        toolchain_versions=toolchain_versions,
+        upx=args.upx or bool(profile.get("upx", False)),
     )
 
 
@@ -1423,6 +1791,24 @@ def _add_build_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--extra-arg", action="append", default=[])
+    parser.add_argument(
+        "--tool-version",
+        action="append",
+        default=[],
+        metavar="BACKEND=VERSION",
+        help="Require a toolchain version (repeatable)",
+    )
+    parser.add_argument(
+        "--upx", action="store_true", help="Compress the output with UPX"
+    )
+    parser.add_argument(
+        "--matrix",
+        nargs="+",
+        metavar="ARCH",
+        help="Build a matrix for x86, x64, and/or arm64",
+    )
+    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--no-analytics", action="store_true")
 
 
 def create_cli_parser() -> argparse.ArgumentParser:
@@ -1444,7 +1830,6 @@ def create_cli_parser() -> argparse.ArgumentParser:
     batch_parser = subparsers.add_parser("batch", help="Build multiple source files")
     batch_parser.add_argument("sources", nargs="+")
     _add_build_options(batch_parser)
-    batch_parser.add_argument("--jobs", type=int, default=1)
     batch_parser.add_argument("--output-dir")
     batch_parser.add_argument("--json", action="store_true")
 
@@ -1473,6 +1858,30 @@ def create_cli_parser() -> argparse.ArgumentParser:
         nargs="?",
         help="Destination, defaulting to the per-user config directory",
     )
+
+    actions_parser = subparsers.add_parser(
+        "init-actions", help="Create a GitHub Actions workflow for a source type"
+    )
+    actions_parser.add_argument(
+        "--language", required=True, choices=sorted(EXTENSION_BACKENDS)
+    )
+    actions_parser.add_argument(
+        "--output", default=".github/workflows/universal-compiler.yml"
+    )
+
+    bytecode_parser = subparsers.add_parser(
+        "bytecode", help="Compile a Python source file to .pyc"
+    )
+    bytecode_parser.add_argument("source")
+    bytecode_parser.add_argument("--output", "-o")
+    bytecode_parser.add_argument("--json", action="store_true")
+
+    analytics_parser = subparsers.add_parser(
+        "analytics", help="Show local build timing and size analytics"
+    )
+    analytics_parser.add_argument("--path")
+    analytics_parser.add_argument("--recent", type=int, default=0)
+    analytics_parser.add_argument("--json", action="store_true")
 
     return parser
 
@@ -1519,6 +1928,35 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         save_profiles(destination, DEFAULT_PROFILES)
         print(destination)
         return 0
+    if args.command == "init-actions":
+        destination = Path(args.output).expanduser()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            github_actions_template(args.language),
+            encoding="utf-8",
+        )
+        print(destination)
+        return 0
+    if args.command == "bytecode":
+        try:
+            output = compile_bytecode(args.source, args.output)
+        except (BuildValidationError, OSError, py_compile.PyCompileError) as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+        value = {"source": args.source, "output": str(output)}
+        print(json.dumps(value, indent=2) if args.json else str(output))
+        return 0
+    if args.command == "analytics":
+        analytics = BuildAnalytics(args.path)
+        value: dict[str, Any] = analytics.summary()
+        if args.recent:
+            value["recent"] = analytics.recent(args.recent)
+        print(
+            json.dumps(value, indent=2, default=str)
+            if args.json
+            else json.dumps(value, indent=2, default=str)
+        )
+        return 0
     if args.command == "verify":
         result = verify_artifact(args.artifact)
         print(
@@ -1550,6 +1988,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     if profile is None:
         parser.error(f"Profile not found: {args.profile}")
     engine = CompilerEngine()
+    analytics = None if args.no_analytics else BuildAnalytics()
     if args.command == "build":
         source = Path(args.source).expanduser()
         output = (
@@ -1570,6 +2009,8 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         if args.watch:
             try:
                 for result in engine.watch(request, interval=args.watch_interval):
+                    if analytics:
+                        analytics.record(result)
                     print(
                         json.dumps(result.as_dict(), indent=2, default=str)
                         if args.json
@@ -1579,7 +2020,25 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             except KeyboardInterrupt:
                 return 0
             return 0
+        if args.matrix:
+            results = engine.build_matrix(request, args.matrix, workers=args.jobs)
+            if analytics:
+                for matrix_result in results:
+                    analytics.record(matrix_result)
+            if args.json:
+                print(
+                    json.dumps(
+                        [result.as_dict() for result in results],
+                        indent=2,
+                        default=str,
+                    )
+                )
+            else:
+                print("\n\n".join(_result_text(result) for result in results))
+            return 0 if all(result.success for result in results) else 1
         result = engine.build(request)
+        if analytics:
+            analytics.record(result)
         print(
             json.dumps(result.as_dict(), indent=2, default=str)
             if args.json
@@ -1597,7 +2056,21 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                 else _default_output(source)
             )
             requests.append(_profile_request(profile, args, source, output))
-        results = engine.build_batch(requests, workers=args.jobs)
+        if args.matrix:
+            results = [
+                result
+                for request in requests
+                for result in engine.build_matrix(
+                    request,
+                    args.matrix,
+                    workers=args.jobs,
+                )
+            ]
+        else:
+            results = engine.build_batch(requests, workers=args.jobs)
+        if analytics:
+            for batch_result in results:
+                analytics.record(batch_result)
         if args.json:
             print(
                 json.dumps(
@@ -1615,6 +2088,7 @@ __all__ = [
     "APP_NAME",
     "APP_VERSION",
     "BACKEND_NAMES",
+    "BuildAnalytics",
     "BuildPlan",
     "BuildRequest",
     "BuildResult",
@@ -1627,6 +2101,7 @@ __all__ = [
     "backend_status",
     "cli_main",
     "command_display",
+    "compile_bytecode",
     "config_dir",
     "detect_file_type",
     "estimate_output_size",
@@ -1634,6 +2109,7 @@ __all__ = [
     "load_json",
     "load_profiles",
     "profiles_path",
+    "parse_toolchain_versions",
     "run_command",
     "save_json",
     "save_profiles",

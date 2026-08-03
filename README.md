@@ -141,9 +141,19 @@ python .\UniversalCompiler.py build .\myscript.py --profile Release --verify
 # Build a queue in parallel
 python .\UniversalCompiler.py batch .\src\*.py --jobs 4 --output-dir .\dist
 
+# Produce x86/x64/arm64-named matrix artifacts when the toolchain supports them
+python .\UniversalCompiler.py build .\myscript.go --matrix x86 x64 arm64 --jobs 3
+
+# Compile Python bytecode only, or inspect local build analytics
+python .\UniversalCompiler.py bytecode .\module.py
+python .\UniversalCompiler.py analytics --recent 10
+
 # Inspect available toolchains or verify an artifact without running it
 python .\UniversalCompiler.py list-toolchains
 python .\UniversalCompiler.py verify .\dist\myscript.exe
+
+# Generate a language-specific workflow template
+python .\UniversalCompiler.py init-actions --language py
 ```
 
 Profiles are stored in `%APPDATA%\UniversalCompiler\profiles.yaml`; use
@@ -151,6 +161,10 @@ Profiles are stored in `%APPDATA%\UniversalCompiler\profiles.yaml`; use
 next to the output and opt-in dependency prefetching (`--prefetch`). Static
 verification checks the produced container or PE header without launching the
 artifact, so a GUI build cannot steal focus or alter the active desktop.
+
+The optional `vscode-extension/` package adds a **Universal Compiler: Build
+Active File** command. Point its `universalCompiler.scriptPath` setting at the
+repository's `UniversalCompiler.py` when the extension is installed locally.
 
 ### Drag & Drop
 
@@ -203,8 +217,9 @@ To sign your executables:
 | Item | Location |
 |------|----------|
 | Configuration | `%APPDATA%\UniversalCompiler\config.json` |
-| Build Profiles | `%APPDATA%\UniversalCompiler\profiles.json` |
+| Build Profiles | `%APPDATA%\UniversalCompiler\profiles.yaml` |
 | Compilation History | `%APPDATA%\UniversalCompiler\history.json` |
+| Local Analytics | `%APPDATA%\UniversalCompiler\analytics.sqlite3` |
 | Recent Files | `%APPDATA%\UniversalCompiler\recent.json` |
 | Settings | `%APPDATA%\UniversalCompiler\settings.json` |
 | Templates | `%APPDATA%\UniversalCompiler\Templates\` |
