@@ -16,6 +16,8 @@ All notable changes to UniversalCompiler will be documented in this file.
   executable icon extraction for reuse in later builds.
 - Add unsigned MSIX/APPX wrapping, WebAssembly text compilation, and explicit
   opt-in obfuscator command support.
+- Add platform/architecture target mapping for Go, Rust, Bun, Deno, and pkg
+  cross-build plans.
 
 ## [v0.1.0] - %Y->- (HEAD -> main, origin/main, origin/HEAD)
 

@@ -146,6 +146,9 @@ python .\UniversalCompiler.py batch .\src\*.py --jobs 4 --output-dir .\dist
 # Produce x86/x64/arm64-named matrix artifacts when the toolchain supports them
 python .\UniversalCompiler.py build .\myscript.go --matrix x86 x64 arm64 --jobs 3
 
+# Cross-target Go/Rust/Bun builds when the installed SDK has that target
+python .\UniversalCompiler.py build .\main.go --target linux --arch x64 --output .\dist\main
+
 # Compile Python bytecode only, or inspect local build analytics
 python .\UniversalCompiler.py bytecode .\module.py
 python .\UniversalCompiler.py analytics --recent 10

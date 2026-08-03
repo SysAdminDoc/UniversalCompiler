@@ -213,6 +213,25 @@ def test_engine_matrix_suffixes_outputs(tmp_path: Path) -> None:
     assert all(result.success for result in results)
 
 
+def test_cross_target_plan_sets_platform_environment(tmp_path: Path) -> None:
+    source = tmp_path / "main.go"
+    request = BuildRequest(
+        source=source,
+        output=tmp_path / "main",
+        backend="go",
+        target="linux",
+        architecture="x64",
+    )
+
+    plan = CompilerEngine(require_available=False).plan(
+        request,
+        allow_missing_source=True,
+    )
+
+    assert plan.environment["GOOS"] == "linux"
+    assert plan.environment["GOARCH"] == "amd64"
+
+
 def test_cli_list_toolchains_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli_main(["list-toolchains", "--json"]) == 0
     output = json.loads(capsys.readouterr().out)

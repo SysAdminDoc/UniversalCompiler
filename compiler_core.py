@@ -719,29 +719,54 @@ def backend_status() -> dict[str, dict[str, Any]]:
     return status
 
 
-def _target_for(backend: str, architecture: str) -> str:
+def _target_for(backend: str, architecture: str, platform: str = "native") -> str:
     arch = architecture.lower()
-    if arch in {"native", "auto"}:
+    platform = platform.lower()
+    if platform in {"native", "auto"}:
+        platform = "windows"
+    if arch in {"native", "auto"} and platform == "windows":
         return "native"
+    if arch in {"native", "auto"}:
+        arch = "x64"
     if backend in {"pkg", "bun"}:
         suffix = {"x64": "x64", "amd64": "x64", "x86": "x86", "arm64": "arm64"}.get(
             arch, arch
         )
-        prefix = "node" if backend == "pkg" else "bun"
-        return f"{prefix}-win-{suffix}" if backend == "pkg" else f"bun-windows-{suffix}"
+        if backend == "pkg":
+            return f"node18-{platform[:3]}-{suffix}"
+        return f"bun-{platform}-{suffix}"
     if backend == "deno":
-        return {
-            "x64": "x86_64-pc-windows-msvc",
-            "amd64": "x86_64-pc-windows-msvc",
-            "arm64": "aarch64-pc-windows-msvc",
+        prefix = {
+            "windows": "pc-windows-msvc",
+            "linux": "unknown-linux-gnu",
+            "darwin": "apple-darwin",
+        }.get(platform, platform)
+        architecture_name = {
+            "x86": "i686",
+            "x64": "x86_64",
+            "amd64": "x86_64",
+            "arm64": "aarch64",
         }.get(arch, arch)
+        return {
+            "native": "native",
+        }.get(arch, f"{architecture_name}-{prefix}")
     if backend == "rust":
-        return {
-            "x86": "i686-pc-windows-msvc",
-            "x64": "x86_64-pc-windows-msvc",
-            "amd64": "x86_64-pc-windows-msvc",
-            "arm64": "aarch64-pc-windows-msvc",
+        if "-" in platform:
+            return platform
+        suffix = {
+            "windows": "pc-windows-msvc",
+            "linux": "unknown-linux-gnu",
+            "darwin": "apple-darwin",
+        }.get(platform, platform)
+        architecture_name = {
+            "x86": "i686",
+            "x64": "x86_64",
+            "amd64": "x86_64",
+            "arm64": "aarch64",
         }.get(arch, arch)
+        return {
+            "native": "native",
+        }.get(arch, f"{architecture_name}-{suffix}")
     return arch
 
 
@@ -977,7 +1002,7 @@ class CompilerEngine:
         cleanup: list[Path] = []
         candidates: list[Path] = [output]
         environment: dict[str, str] = {}
-        target = _target_for(backend, request.architecture)
+        target = _target_for(backend, request.architecture, request.target)
 
         if backend == "ps2exe":
             args = [
@@ -1138,7 +1163,12 @@ class CompilerEngine:
                 str(source),
             )
         elif backend == "go":
-            environment = {"GOOS": "windows"}
+            goos = (
+                request.target
+                if request.target not in {"native", "auto"}
+                else "windows"
+            )
+            environment = {"GOOS": goos}
             if request.architecture not in {"native", "auto"}:
                 environment["GOARCH"] = {
                     "x86": "386",
