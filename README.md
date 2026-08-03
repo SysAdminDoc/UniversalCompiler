@@ -23,14 +23,19 @@
 | Language | Extension | Compiler | Status |
 |----------|-----------|----------|--------|
 | PowerShell | `.ps1` | PS2EXE | ✅ Full Support |
-| Python | `.py` | PyInstaller | ✅ Full Support |
+| Python | `.py` | PyInstaller / Nuitka | ✅ Full Support |
 | Batch | `.bat`, `.cmd` | IExpress | ✅ Full Support |
 | Node.js | `.js` | pkg | ✅ Full Support |
+| TypeScript | `.ts` | Bun `build --compile` | ✅ Full Support |
 | C# | `.cs` | CSC (.NET) | ✅ Full Support |
 | Go | `.go` | go build | ✅ Full Support |
 | Ruby | `.rb` | Ocra | ✅ Full Support |
 | VBScript | `.vbs` | IExpress | ✅ Full Support |
 | AutoHotkey | `.ahk` | Ahk2Exe | ✅ Full Support |
+| Rust | `.rs` | Cargo / rustc | ✅ Full Support |
+| Lua | `.lua` | srlua / luastatic | ✅ Full Support |
+| Perl | `.pl`, `.pm` | PAR::Packer | ✅ Full Support |
+| Kotlin | `.kt`, `.kts` | Kotlin/Native | ✅ Full Support |
 
 ### 🚀 Key Features
 
@@ -121,6 +126,31 @@ The setup wizard can automatically install these for you:
 3. **Configure** options as needed
 4. **Click** "⚡ Compile"
 5. **Done!** Your EXE is ready
+
+### Command Line Usage
+
+The same build engine is available without opening the GUI:
+
+```powershell
+# Preview a backend command without executing it
+python .\UniversalCompiler.py build .\myscript.py --backend nuitka --preview
+
+# Build with a named YAML profile and static artifact verification
+python .\UniversalCompiler.py build .\myscript.py --profile Release --verify
+
+# Build a queue in parallel
+python .\UniversalCompiler.py batch .\src\*.py --jobs 4 --output-dir .\dist
+
+# Inspect available toolchains or verify an artifact without running it
+python .\UniversalCompiler.py list-toolchains
+python .\UniversalCompiler.py verify .\dist\myscript.exe
+```
+
+Profiles are stored in `%APPDATA%\UniversalCompiler\profiles.yaml`; use
+`init-profiles` to create a starter file. Builds use a content/toolchain cache
+next to the output and opt-in dependency prefetching (`--prefetch`). Static
+verification checks the produced container or PE header without launching the
+artifact, so a GUI build cannot steal focus or alter the active desktop.
 
 ### Drag & Drop
 

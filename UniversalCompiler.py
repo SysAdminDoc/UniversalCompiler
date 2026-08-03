@@ -17,6 +17,26 @@ import ctypes
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List, Any
+from compiler_core import (
+    BACKEND_NAMES,
+    BuildRequest,
+    CompilerEngine,
+    EXTENSION_BACKENDS,
+    backend_status,
+    detect_file_type,
+    estimate_output_size as core_estimate_output_size,
+)
+
+# Keep automation side-effect free: CLI invocations must not import the GUI or
+# install optional desktop packages.  The legacy GUI remains the default when
+# the script is launched without a command.
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1].lower() in {
+    "build", "batch", "inspect", "verify", "list-toolchains", "init-profiles", "--help", "-h"
+}:
+    from compiler_core import cli_main
+
+    raise SystemExit(cli_main(sys.argv[1:]))
+
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -166,15 +186,22 @@ DEFAULT_PROFILES = {
 
 COMPILERS = {
     "ps1": {"name": "PowerShell", "compiler": "PS2EXE", "desc": "PowerShell Script"},
-    "py": {"name": "Python", "compiler": "PyInstaller", "desc": "Python Script"},
+    "py": {"name": "Python", "compiler": "PyInstaller / Nuitka", "desc": "Python Script"},
     "bat": {"name": "Batch", "compiler": "IExpress", "desc": "Batch Script"},
     "cmd": {"name": "Command", "compiler": "IExpress", "desc": "Command Script"},
     "js": {"name": "Node.js", "compiler": "pkg", "desc": "JavaScript"},
+    "ts": {"name": "TypeScript", "compiler": "Bun compile", "desc": "TypeScript Source"},
     "vbs": {"name": "VBScript", "compiler": "IExpress", "desc": "VBScript"},
     "ahk": {"name": "AutoHotkey", "compiler": "Ahk2Exe", "desc": "AutoHotkey"},
     "cs": {"name": "C#", "compiler": "CSC", "desc": "C# Source"},
     "go": {"name": "Go", "compiler": "go build", "desc": "Go Source"},
     "rb": {"name": "Ruby", "compiler": "Ocra", "desc": "Ruby Script"},
+    "rs": {"name": "Rust", "compiler": "Cargo / rustc", "desc": "Rust Source"},
+    "lua": {"name": "Lua", "compiler": "srlua / luastatic", "desc": "Lua Script"},
+    "pl": {"name": "Perl", "compiler": "PAR::Packer", "desc": "Perl Script"},
+    "pm": {"name": "Perl Module", "compiler": "PAR::Packer", "desc": "Perl Module"},
+    "kt": {"name": "Kotlin", "compiler": "Kotlin/Native", "desc": "Kotlin Source"},
+    "kts": {"name": "Kotlin Script", "compiler": "Kotlin/Native", "desc": "Kotlin Script"},
 }
 
 # ============================================================================
@@ -461,6 +488,9 @@ pause
     "HelloWorld.js": '''// Node.js Hello World
 console.log("Hello, World!");
 ''',
+    "HelloWorld.ts": '''// TypeScript Hello World
+console.log("Hello, World!");
+''',
     "HelloWorld.cs": '''using System;
 using System.Windows.Forms;
 
@@ -485,6 +515,18 @@ puts "Hello, World!"
     "HelloWorld.vbs": '''MsgBox "Hello, World!", vbInformation, "Hello"
 ''',
     "HelloWorld.ahk": '''MsgBox, Hello, World!
+''',
+    "HelloWorld.rs": '''fn main() {
+    println!("Hello, World!");
+}
+''',
+    "HelloWorld.lua": '''print("Hello, World!")
+''',
+    "HelloWorld.pl": '''print "Hello, World!\\n";
+''',
+    "HelloWorld.kt": '''fun main() {
+    println("Hello, World!")
+}
 ''',
 }
 
@@ -568,8 +610,15 @@ class DependencyChecker:
         return (Path(windir) / "System32/iexpress.exe").exists()
     
     @classmethod
-    def check_compiler(cls, file_type: str) -> bool:
+    def check_compiler(cls, file_type: str, backend: str = "auto") -> bool:
         """Check if compiler for file type is available."""
+        if backend != "auto":
+            return bool(backend_status().get(backend, {}).get("available"))
+        if file_type in EXTENSION_BACKENDS:
+            return any(
+                backend_status().get(candidate, {}).get("available")
+                for candidate in EXTENSION_BACKENDS[file_type]
+            )
         checkers = {
             "ps1": cls.check_ps2exe,
             "py": cls.check_pyinstaller,
@@ -588,7 +637,7 @@ class DependencyChecker:
     @classmethod
     def get_all_status(cls) -> Dict[str, Dict]:
         """Get status of all dependencies."""
-        return {
+        status = {
             "PS2EXE": {"name": "PS2EXE", "desc": "PowerShell (.ps1)", "installed": cls.check_ps2exe(), "size": "~2 MB"},
             "PyInstaller": {"name": "PyInstaller", "desc": "Python (.py)", "installed": cls.check_pyinstaller(), "size": "~15 MB"},
             "pkg": {"name": "pkg", "desc": "Node.js (.js)", "installed": cls.check_pkg(), "size": "~50 MB"},
@@ -598,6 +647,16 @@ class DependencyChecker:
             "CSC": {"name": "CSC", "desc": "C# (.cs)", "installed": cls.check_csc(), "size": "Built-in", "builtin": True},
             "IExpress": {"name": "IExpress", "desc": "Batch/VBS", "installed": cls.check_iexpress(), "size": "Built-in", "builtin": True},
         }
+        for backend, info in backend_status().items():
+            if backend in {"ps2exe", "pyinstaller", "iexpress", "pkg", "go", "ocra", "ahk2exe", "csc"}:
+                continue
+            status[info["name"]] = {
+                "name": info["name"],
+                "desc": ", ".join(f".{extension}" for extension in info["extensions"]),
+                "installed": info["available"],
+                "size": "Toolchain",
+            }
+        return status
 
 
 # ============================================================================
@@ -752,25 +811,32 @@ SourceFiles0={temp_dir}\\
     def compile(cls, source: str, output: str, file_type: str,
                 icon: Optional[str] = None, admin: bool = False,
                 console: bool = False, single_file: bool = True,
-                metadata: Optional[Dict] = None) -> tuple:
-        """Compile source file based on type."""
-        compilers = {
-            "ps1": lambda: cls.compile_ps1(source, output, icon, admin, not console, metadata),
-            "py": lambda: cls.compile_py(source, output, icon, single_file, console),
-            "bat": lambda: cls.compile_batch(source, output),
-            "cmd": lambda: cls.compile_batch(source, output),
-            "js": lambda: cls.compile_js(source, output),
-            "vbs": lambda: cls.compile_batch(source, output),
-            "ahk": lambda: cls.compile_ahk(source, output, icon),
-            "cs": lambda: cls.compile_cs(source, output),
-            "go": lambda: cls.compile_go(source, output),
-            "rb": lambda: cls.compile_rb(source, output),
-        }
-        
-        compiler = compilers.get(file_type)
-        if compiler:
-            return compiler()
-        return False, f"Unsupported file type: {file_type}"
+                metadata: Optional[Dict] = None, backend: str = "auto",
+                prefetch: bool = False, verify: bool = True,
+                force: bool = False) -> tuple:
+        """Compile through the shared engine used by the CLI."""
+        request = BuildRequest(
+            source=Path(source),
+            output=Path(output),
+            file_type=file_type,
+            backend=backend,
+            icon=Path(icon) if icon else None,
+            admin=admin,
+            console=console,
+            single_file=single_file,
+            metadata=metadata or {},
+            prefetch=prefetch,
+            verify=verify,
+            force=force,
+        )
+        result = CompilerEngine().build(request)
+        details = [result.message]
+        for command in result.commands:
+            if command.output:
+                details.append(command.output)
+        if result.verification:
+            details.append(result.verification.details)
+        return result.success, "\n".join(detail for detail in details if detail)
 
 
 # ============================================================================
@@ -1008,6 +1074,7 @@ class UniversalCompiler:
         self.file_type: Optional[str] = None
         self.compiling = False
         self.batch_queue: List[str] = []
+        self.engine = CompilerEngine()
         
         # Initialize templates
         initialize_templates()
@@ -1402,6 +1469,27 @@ class UniversalCompiler:
             text_color=self.theme["text1"],
             command=self._save_profile
         ).pack(side="left", padx=(4, 0))
+
+        ctk.CTkLabel(
+            header, text="Backend:",
+            font=("Segoe UI", 10),
+            text_color=self.theme["text3"]
+        ).pack(side="left", padx=(16, 5))
+
+        self.backend_combo = ctk.CTkComboBox(
+            header, width=150,
+            values=["auto"],
+            fg_color=self.theme["input"],
+            border_color=self.theme["border"],
+            button_color=self.theme["border"],
+            button_hover_color=self.theme["card_hover"],
+            dropdown_fg_color=self.theme["card"],
+            dropdown_hover_color=self.theme["card_hover"],
+            text_color=self.theme["text1"],
+            command=self._on_backend_change
+        )
+        self.backend_combo.set("auto")
+        self.backend_combo.pack(side="left")
         
         # Checkboxes
         checks = ctk.CTkFrame(inner, fg_color="transparent")
@@ -1764,7 +1852,7 @@ class UniversalCompiler:
     def _browse_source(self):
         """Browse for source file."""
         filetypes = [
-            ("All Scripts", "*.ps1 *.py *.bat *.cmd *.js *.vbs *.ahk *.cs *.go *.rb"),
+            ("All Scripts", "*.ps1 *.py *.bat *.cmd *.js *.ts *.vbs *.ahk *.cs *.go *.rb *.rs *.lua *.pl *.pm *.kt *.kts"),
             ("All Files", "*.*")
         ]
         filepath = filedialog.askopenfilename(filetypes=filetypes)
@@ -1834,6 +1922,25 @@ class UniversalCompiler:
             self.copyright_entry.insert(0, profile.get("copyright", ""))
             self.product_entry.delete(0, "end")
             self.product_entry.insert(0, profile.get("product", ""))
+            if hasattr(self, "backend_combo"):
+                backend = profile.get("backend", "auto")
+                values = list(self.backend_combo.cget("values"))
+                if backend in values:
+                    self.backend_combo.set(backend)
+
+    def _on_backend_change(self, backend: str):
+        """Refresh the selected source status after a backend switch."""
+        if not self.file_type:
+            return
+        available = DependencyChecker.check_compiler(self.file_type, backend)
+        self.compiler_label.configure(
+            text=BACKEND_NAMES.get(backend, COMPILERS[self.file_type]["compiler"])
+        )
+        self.status_label.configure(
+            text="Ready" if available else "Compiler not installed",
+            text_color=self.theme["green"] if available else self.theme["red"]
+        )
+        self.compile_btn.configure(state="normal" if available else "disabled")
     
     def _save_profile(self):
         """Save current settings as profile."""
@@ -1845,6 +1952,7 @@ class UniversalCompiler:
             "console": self.console_var.get(),
             "admin": self.admin_var.get(),
             "single_file": self.single_var.get(),
+            "backend": self.backend_combo.get(),
             "version": self.version_entry.get(),
             "company": self.company_entry.get(),
             "copyright": self.copyright_entry.get(),
@@ -1900,7 +2008,10 @@ class UniversalCompiler:
         
         # Refresh compiler status
         if self.file_type:
-            available = DependencyChecker.check_compiler(self.file_type)
+            available = DependencyChecker.check_compiler(
+                self.file_type,
+                self.backend_combo.get(),
+            )
             self.status_label.configure(
                 text="Ready" if available else "Compiler not installed",
                 text_color=self.theme["green"] if available else self.theme["red"]
@@ -1910,7 +2021,7 @@ class UniversalCompiler:
     def _add_to_queue(self):
         """Add files to batch queue."""
         filetypes = [
-            ("All Scripts", "*.ps1 *.py *.bat *.cmd *.js *.vbs *.ahk *.cs *.go *.rb"),
+            ("All Scripts", "*.ps1 *.py *.bat *.cmd *.js *.ts *.vbs *.ahk *.cs *.go *.rb *.rs *.lua *.pl *.pm *.kt *.kts"),
             ("All Files", "*.*")
         ]
         files = filedialog.askopenfilenames(filetypes=filetypes)
@@ -2017,11 +2128,22 @@ Source: {self.source_file}
             # Update info panel
             self.type_label.configure(text=compiler_info["desc"])
             self.size_label.configure(text=format_size(file_size))
-            self.compiler_label.configure(text=compiler_info["compiler"])
-            self.est_label.configure(text=estimate_output_size(filepath, ext))
+            backend_values = ["auto", *EXTENSION_BACKENDS.get(ext, ())]
+            self.backend_combo.configure(values=backend_values)
+            if self.backend_combo.get() not in backend_values:
+                self.backend_combo.set("auto")
+            selected_backend = self.backend_combo.get()
+            resolved_backend = self.engine.choose_backend(ext, selected_backend)
+            self.compiler_label.configure(
+                text=BACKEND_NAMES.get(
+                    resolved_backend or selected_backend,
+                    compiler_info["compiler"],
+                )
+            )
+            self.est_label.configure(text=core_estimate_output_size(filepath, ext))
             
             # Check compiler availability
-            available = DependencyChecker.check_compiler(ext)
+            available = DependencyChecker.check_compiler(ext, selected_backend)
             self.status_label.configure(
                 text="Ready" if available else "Compiler not installed",
                 text_color=self.theme["green"] if available else self.theme["red"]
@@ -2070,6 +2192,7 @@ Source: {self.source_file}
         
         # Get options
         icon = self.icon_entry.get().strip() or None
+        backend = self.backend_combo.get()
         admin = self.admin_var.get()
         console = self.console_var.get()
         single_file = self.single_var.get()
@@ -2092,7 +2215,7 @@ Source: {self.source_file}
             
             success, output = Compiler.compile(
                 self.source_file, output_path, self.file_type,
-                icon, admin, console, single_file, metadata
+                icon, admin, console, single_file, metadata, backend=backend
             )
             
             self.progress_bar.set(0.9)
