@@ -2,6 +2,11 @@
 *.log
 *.tmp
 .vs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 CLAUDE.md
 
 # Markdown files local-only (except README)
