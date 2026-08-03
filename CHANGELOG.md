@@ -2,7 +2,7 @@
 
 All notable changes to UniversalCompiler will be documented in this file.
 
-## [Unreleased]
+## [v2.1.0] - 2026-08-03
 
 - Add a side-effect-free Python build engine and CLI with YAML profiles, backend
   previews, cache-aware builds, dependency prefetching, parallel batch builds,

@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Universal Compiler v2.0 - Script to EXE Compiler
+    Universal Compiler v2.1.0 - Script to EXE Compiler
 .DESCRIPTION
     Compiles PowerShell, Python, Batch, Node.js, C#, Go, Ruby, VBScript, and AutoHotkey scripts to Windows executables.
     Features: Drag & Drop, Batch Compilation, Build Profiles, Recent Files, Theme Toggle, and unsigned builds.
@@ -14,7 +14,7 @@ param([switch]$ForceSetup, [switch]$SkipSetup, [string]$File, [string]$Output, [
 # ============================================================================
 
 $script:AppName = "Universal Compiler"
-$script:AppVersion = "2.0"
+$script:AppVersion = "2.1.0"
 $script:ConfigDir = Join-Path $env:APPDATA "UniversalCompiler"
 $script:ConfigFile = Join-Path $script:ConfigDir "config.json"
 $script:ProfilesFile = Join-Path $script:ConfigDir "profiles.json"
@@ -239,7 +239,7 @@ public class SetupDpiAwareness {
         <Grid>
             <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
             <Border Background="$($th.Card)" CornerRadius="12,12,0,0" Padding="20,15">
-                <Grid><StackPanel><StackPanel Orientation="Horizontal"><TextBlock Text="⚡" FontSize="22" Foreground="$($th.Green)" Margin="0,0,10,0"/><TextBlock Text="Universal Compiler" FontSize="20" FontWeight="Bold" Foreground="$($th.T1)"/><TextBlock Text="v2.0" FontSize="10" Foreground="$($th.T3)" VerticalAlignment="Bottom" Margin="8,0,0,4"/></StackPanel>
+                <Grid><StackPanel><StackPanel Orientation="Horizontal"><TextBlock Text="⚡" FontSize="22" Foreground="$($th.Green)" Margin="0,0,10,0"/><TextBlock Text="Universal Compiler" FontSize="20" FontWeight="Bold" Foreground="$($th.T1)"/><TextBlock Text="v$($script:AppVersion)" FontSize="10" Foreground="$($th.T3)" VerticalAlignment="Bottom" Margin="8,0,0,4"/></StackPanel>
                 <TextBlock Text="Select compilers to install" FontSize="11" Foreground="$($th.T2)" Margin="32,4,0,0"/></StackPanel>
                 <Button x:Name="btnClose" Content="✕" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Foreground="$($th.T3)" BorderThickness="0" FontSize="14" Cursor="Hand" Padding="8,4"/></Grid>
             </Border>
@@ -340,7 +340,7 @@ $th = $script:Themes[$script:Settings.Theme]
 
 $mainXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Universal Compiler v2.0" Height="900" Width="1200" WindowStartupLocation="CenterScreen" Background="$($th.Bg)" AllowDrop="True" MinHeight="600" MinWidth="800" WindowState="Maximized">
+        Title="Universal Compiler v$($script:AppVersion)" Height="900" Width="1200" WindowStartupLocation="CenterScreen" Background="$($th.Bg)" AllowDrop="True" MinHeight="600" MinWidth="800" WindowState="Maximized">
     <Window.Resources>
         <Style x:Key="BtnG" TargetType="Button"><Setter Property="Background" Value="$($th.Green)"/><Setter Property="Foreground" Value="$($th.Bg)"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Padding" Value="16,10"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="5" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="$($th.GreenHover)"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter TargetName="bd" Property="Background" Value="$($th.Border)"/><Setter Property="Foreground" Value="$($th.T3)"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
         <Style x:Key="BtnS" TargetType="Button"><Setter Property="Background" Value="$($th.Border)"/><Setter Property="Foreground" Value="$($th.T1)"/><Setter Property="Padding" Value="12,8"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="5" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="$($th.CardHover)"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
@@ -411,7 +411,7 @@ $mainXaml = @"
         <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
         <!-- Header -->
         <Grid Margin="0,0,0,15">
-            <StackPanel><StackPanel Orientation="Horizontal"><TextBlock Text="⚡" FontSize="26" Foreground="$($th.Green)" Margin="0,0,10,0"/><TextBlock Text="Universal Compiler" FontSize="24" FontWeight="Bold" Foreground="$($th.T1)"/><TextBlock Text="v2.0" FontSize="10" Foreground="$($th.T3)" VerticalAlignment="Bottom" Margin="8,0,0,4"/></StackPanel><TextBlock Text="Drag files here or browse to compile" FontSize="11" Foreground="$($th.T2)" Margin="36,2,0,0"/></StackPanel>
+            <StackPanel><StackPanel Orientation="Horizontal"><TextBlock Text="⚡" FontSize="26" Foreground="$($th.Green)" Margin="0,0,10,0"/><TextBlock Text="Universal Compiler" FontSize="24" FontWeight="Bold" Foreground="$($th.T1)"/><TextBlock Text="v$($script:AppVersion)" FontSize="10" Foreground="$($th.T3)" VerticalAlignment="Bottom" Margin="8,0,0,4"/></StackPanel><TextBlock Text="Drag files here or browse to compile" FontSize="11" Foreground="$($th.T2)" Margin="36,2,0,0"/></StackPanel>
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top">
                 <Button x:Name="btnTheme" Content="🌙" Style="{StaticResource BtnS}" Padding="10,8" ToolTip="Toggle Theme" Margin="0,0,8,0"/>
                 <Button x:Name="btnSettings" Content="⚙" Style="{StaticResource BtnS}" Padding="10,8" ToolTip="Settings"/>
@@ -539,7 +539,7 @@ $mainXaml = @"
             </Grid>
         </Grid>
         <!-- Footer -->
-        <TextBlock Grid.Row="2" Text="Universal Compiler v2.0 • Drag &amp; Drop • Batch Build • Profiles • Unsigned Builds" Foreground="$($th.T3)" FontSize="9" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+        <TextBlock Grid.Row="2" Text="Universal Compiler v$($script:AppVersion) • Drag &amp; Drop • Batch Build • Profiles • Unsigned Builds" Foreground="$($th.T3)" FontSize="9" HorizontalAlignment="Center" Margin="0,12,0,0"/>
     </Grid>
 </Window>
 "@
@@ -823,7 +823,7 @@ $btnCompileAll.Add_Click({
 # INITIALIZE
 # ============================================================================
 
-Log "Universal Compiler v2.0 ready" -L Success
+Log "Universal Compiler v$($script:AppVersion) ready" -L Success
 Log "Drag files here or click Browse" -L Info
 if (Test-PS2EXEInstalled) { Log "PS2EXE: Ready" -L Success } else { Log "PS2EXE: Not installed" -L Warning }
 Status "Ready"

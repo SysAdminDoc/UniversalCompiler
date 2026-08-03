@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Universal Compiler v2.0 - Python Edition
+Universal Compiler v2.1.0 - Python Edition
 A powerful, all-in-one script-to-EXE compiler with a modern dark-themed GUI
 
 Compiles PowerShell, Python, Batch, Node.js, C#, Go, Ruby, VBScript, 
@@ -46,7 +46,7 @@ from tkinter import filedialog, messagebox
 
 # Optional drag & drop support
 try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
+    from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore[import-untyped]
     HAS_DND = True
 except ImportError:
     HAS_DND = False
@@ -54,18 +54,18 @@ except ImportError:
     print("Install with: pip install tkinterdnd2")
 
 try:
-    import customtkinter as ctk
+    import customtkinter as ctk  # type: ignore[import-untyped]
 except ImportError:
     print("Installing customtkinter...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "customtkinter"])
-    import customtkinter as ctk
+    import customtkinter as ctk  # type: ignore[import-untyped]
 
 # ============================================================================
 # CONSTANTS & CONFIGURATION
 # ============================================================================
 
 APP_NAME = "Universal Compiler"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1.0"
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "UniversalCompiler"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 PROFILES_FILE = CONFIG_DIR / "profiles.yaml"
@@ -322,7 +322,7 @@ def which(program: str) -> Optional[str]:
 def show_notification(title: str, message: str) -> None:
     """Show Windows toast notification."""
     try:
-        from win10toast import ToastNotifier
+        from win10toast import ToastNotifier  # type: ignore[import-not-found]
         toaster = ToastNotifier()
         toaster.show_toast(title, message, duration=5, threaded=True)
     except ImportError:
@@ -915,7 +915,7 @@ class SetupWindow(ctk.CTkToplevel):
         ).pack(side="left")
         
         ctk.CTkLabel(
-            title_frame, text="v2.0",
+            title_frame, text=f"v{APP_VERSION}",
             font=("Segoe UI", 10),
             text_color=self.theme["text3"]
         ).pack(side="left", padx=(10, 0), pady=(8, 0))
@@ -1092,6 +1092,17 @@ class SetupWindow(ctk.CTkToplevel):
 
 class UniversalCompiler:
     """Main application class."""
+
+    # These controls are created through setattr in the legacy UI builders.
+    # Declare them here so static analysis can follow their later use.
+    version_entry: Any
+    company_entry: Any
+    copyright_entry: Any
+    product_entry: Any
+    type_label: Any
+    size_label: Any
+    compiler_label: Any
+    est_label: Any
     
     def __init__(self):
         # Initialize managers
@@ -1197,7 +1208,7 @@ class UniversalCompiler:
         # Footer
         ctk.CTkLabel(
             main,
-            text="Universal Compiler v2.0 • Drag & Drop • Batch Build • Profiles • Unsigned Builds",
+            text=f"Universal Compiler v{APP_VERSION} • Drag & Drop • Batch Build • Profiles • Unsigned Builds",
             font=("Segoe UI", 9),
             text_color=self.theme["text3"]
         ).pack(pady=(10, 0))
@@ -1224,7 +1235,7 @@ class UniversalCompiler:
         ).pack(side="left", padx=(10, 0))
         
         ctk.CTkLabel(
-            title_frame, text="v2.0",
+            title_frame, text=f"v{APP_VERSION}",
             font=("Segoe UI", 10),
             text_color=self.theme["text3"]
         ).pack(side="left", padx=(8, 0), pady=(10, 0))

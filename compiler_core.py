@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 APP_NAME = "Universal Compiler"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1.0"
 
 
 DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
@@ -499,7 +499,7 @@ def load_profiles(
         return merged
     loaded: Any = None
     try:
-        import yaml  # type: ignore[import-not-found]
+        import yaml  # type: ignore[import-not-found, import-untyped]
 
         loaded = yaml.safe_load(text)
     except (ImportError, AttributeError, ValueError):
@@ -671,11 +671,11 @@ def resolve_backend_executable(backend: str) -> str | None:
         return str(path) if path.exists() else None
     if backend == "csc":
         windir = os.environ.get("WINDIR", "C:\\Windows")
-        candidates = (
+        csc_candidates = (
             Path(windir) / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe",
             Path(windir) / "Microsoft.NET" / "Framework" / "v4.0.30319" / "csc.exe",
         )
-        return next((str(path) for path in candidates if path.exists()), None)
+        return next((str(path) for path in csc_candidates if path.exists()), None)
     if backend == "nuitka":
         return sys.executable if importlib.util.find_spec("nuitka") else None
     names = direct.get(backend)
@@ -1003,6 +1003,7 @@ class CompilerEngine:
         candidates: list[Path] = [output]
         environment: dict[str, str] = {}
         target = _target_for(backend, request.architecture, request.target)
+        command: tuple[str, ...]
 
         if backend == "ps2exe":
             args = [
@@ -1037,7 +1038,7 @@ class CompilerEngine:
             if not allow_missing_source:
                 work.mkdir(parents=True, exist_ok=True)
             cleanup.append(work)
-            command_parts = [
+            pyinstaller_command_parts = [
                 executable,
                 "--noconfirm",
                 "--clean",
@@ -1051,24 +1052,24 @@ class CompilerEngine:
                 output.stem,
             ]
             if request.single_file:
-                command_parts.append("--onefile")
+                pyinstaller_command_parts.append("--onefile")
             if not request.console:
-                command_parts.append("--noconsole")
+                pyinstaller_command_parts.append("--noconsole")
             if request.icon:
-                command_parts.extend(("--icon", str(request.icon)))
+                pyinstaller_command_parts.extend(("--icon", str(request.icon)))
             if request.metadata:
                 version_file = work / "version_info.txt"
                 if not allow_missing_source:
                     _write_pyinstaller_version_file(version_file, request.metadata)
-                command_parts.extend(("--version-file", str(version_file)))
-            command_parts.extend((str(source), *request.extra_args))
-            command = tuple(command_parts)
+                pyinstaller_command_parts.extend(("--version-file", str(version_file)))
+            pyinstaller_command_parts.extend((str(source), *request.extra_args))
+            command = tuple(pyinstaller_command_parts)
         elif backend == "nuitka":
             work = output.parent / ".uc-build" / output.stem
             if not allow_missing_source:
                 work.mkdir(parents=True, exist_ok=True)
             cleanup.append(work)
-            command_parts = [
+            nuitka_command_parts = [
                 sys.executable,
                 "-m",
                 "nuitka",
@@ -1080,28 +1081,28 @@ class CompilerEngine:
                 else "--windows-console-mode=disable",
             ]
             if request.admin:
-                command_parts.append("--windows-uac-admin")
+                nuitka_command_parts.append("--windows-uac-admin")
             if request.icon:
-                command_parts.append(f"--windows-icon-from-ico={request.icon}")
+                nuitka_command_parts.append(f"--windows-icon-from-ico={request.icon}")
             if _metadata(request, "product"):
-                command_parts.append(f"--product-name={_metadata(request, 'product')}")
+                nuitka_command_parts.append(f"--product-name={_metadata(request, 'product')}")
             if _metadata(request, "company"):
-                command_parts.append(f"--company-name={_metadata(request, 'company')}")
+                nuitka_command_parts.append(f"--company-name={_metadata(request, 'company')}")
             if _metadata(request, "version"):
-                command_parts.extend(
+                nuitka_command_parts.extend(
                     (
                         f"--file-version={_metadata(request, 'version')}",
                         f"--product-version={_metadata(request, 'version')}",
                     )
                 )
             if _metadata(request, "description"):
-                command_parts.append(
+                nuitka_command_parts.append(
                     f"--file-description={_metadata(request, 'description')}"
                 )
             if _metadata(request, "copyright"):
-                command_parts.append(f"--copyright={_metadata(request, 'copyright')}")
-            command_parts.extend((str(source), *request.extra_args))
-            command = tuple(command_parts)
+                nuitka_command_parts.append(f"--copyright={_metadata(request, 'copyright')}")
+            nuitka_command_parts.extend((str(source), *request.extra_args))
+            command = tuple(nuitka_command_parts)
         elif backend in {"bun", "pkg", "deno"}:
             command_parts: list[str]
             if backend == "bun":
@@ -1229,10 +1230,10 @@ class CompilerEngine:
         elif backend == "wat2wasm":
             command = (executable, str(source), "-o", str(output), *request.extra_args)
         elif backend == "ahk2exe":
-            command_parts = [executable, "/in", str(source), "/out", str(output)]
+            ahk_command_parts = [executable, "/in", str(source), "/out", str(output)]
             if request.icon:
-                command_parts.extend(("/icon", str(request.icon)))
-            command = tuple(command_parts + list(request.extra_args))
+                ahk_command_parts.extend(("/icon", str(request.icon)))
+            command = tuple(ahk_command_parts + list(request.extra_args))
         elif backend == "ocra":
             command = (
                 executable,
@@ -1711,6 +1712,7 @@ def obfuscate_source(
     if not executable:
         raise BuildValidationError(f"Obfuscator is not installed: {normalized}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    command: tuple[str, ...]
     if normalized == "pyarmor":
         output_path.mkdir(parents=True, exist_ok=True)
         command = (executable, "gen", "--output", str(output_path), str(source_path))
@@ -2165,13 +2167,13 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     parser = create_cli_parser()
     args = parser.parse_args(argv)
     if args.command == "list-toolchains":
-        value = backend_status()
+        status_value = backend_status()
         print(
-            json.dumps(value, indent=2)
+            json.dumps(status_value, indent=2)
             if args.json
             else "\n".join(
                 f"{key}: {'available' if item['available'] else 'missing'}"
-                for key, item in value.items()
+                for key, item in status_value.items()
             )
         )
         return 0
@@ -2195,8 +2197,8 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         except (BuildValidationError, OSError, py_compile.PyCompileError) as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 1
-        value = {"source": args.source, "output": str(output)}
-        print(json.dumps(value, indent=2) if args.json else str(output))
+        bytecode_value = {"source": args.source, "output": str(output)}
+        print(json.dumps(bytecode_value, indent=2) if args.json else str(output))
         return 0
     if args.command == "extract-icon":
         try:
@@ -2229,35 +2231,35 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         print(output)
         return 0
     if args.command == "analytics":
-        analytics = BuildAnalytics(args.path)
-        value: dict[str, Any] = analytics.summary()
+        analytics_store = BuildAnalytics(args.path)
+        analytics_value: dict[str, Any] = analytics_store.summary()
         if args.recent:
-            value["recent"] = analytics.recent(args.recent)
+            analytics_value["recent"] = analytics_store.recent(args.recent)
         print(
-            json.dumps(value, indent=2, default=str)
+            json.dumps(analytics_value, indent=2, default=str)
             if args.json
-            else json.dumps(value, indent=2, default=str)
+            else json.dumps(analytics_value, indent=2, default=str)
         )
         return 0
     if args.command == "verify":
-        result = verify_artifact(args.artifact)
+        verification_result = verify_artifact(args.artifact)
         print(
-            json.dumps(asdict(result), indent=2, default=str)
+            json.dumps(asdict(verification_result), indent=2, default=str)
             if args.json
-            else f"{'PASS' if result.passed else 'FAIL'}: {result.details}"
+            else f"{'PASS' if verification_result.passed else 'FAIL'}: {verification_result.details}"
         )
-        return 0 if result.passed else 1
+        return 0 if verification_result.passed else 1
     if args.command == "inspect":
         source = Path(args.source).expanduser()
         file_type = detect_file_type(source)
         choices = EXTENSION_BACKENDS.get(file_type or "", ())
-        value = {
+        inspect_value = {
             "source": str(source),
             "file_type": file_type,
             "estimated_size": estimate_output_size(source, file_type),
             "backends": {backend: backend_status()[backend] for backend in choices},
         }
-        print(json.dumps(value, indent=2) if args.json else json.dumps(value, indent=2))
+        print(json.dumps(inspect_value, indent=2) if args.json else json.dumps(inspect_value, indent=2))
         return 0
 
     profile_file = (
@@ -2270,7 +2272,9 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     if profile is None:
         parser.error(f"Profile not found: {args.profile}")
     engine = CompilerEngine()
-    analytics = None if args.no_analytics else BuildAnalytics()
+    build_analytics: BuildAnalytics | None = (
+        None if args.no_analytics else BuildAnalytics()
+    )
     if args.command == "build":
         source = Path(args.source).expanduser()
         output = (
@@ -2291,8 +2295,8 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         if args.watch:
             try:
                 for result in engine.watch(request, interval=args.watch_interval):
-                    if analytics:
-                        analytics.record(result)
+                    if build_analytics:
+                        build_analytics.record(result)
                     print(
                         json.dumps(result.as_dict(), indent=2, default=str)
                         if args.json
@@ -2304,9 +2308,9 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.matrix:
             results = engine.build_matrix(request, args.matrix, workers=args.jobs)
-            if analytics:
+            if build_analytics:
                 for matrix_result in results:
-                    analytics.record(matrix_result)
+                    build_analytics.record(matrix_result)
             if args.json:
                 print(
                     json.dumps(
@@ -2318,15 +2322,15 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             else:
                 print("\n\n".join(_result_text(result) for result in results))
             return 0 if all(result.success for result in results) else 1
-        result = engine.build(request)
-        if analytics:
-            analytics.record(result)
+        build_result = engine.build(request)
+        if build_analytics:
+            build_analytics.record(build_result)
         print(
-            json.dumps(result.as_dict(), indent=2, default=str)
+            json.dumps(build_result.as_dict(), indent=2, default=str)
             if args.json
-            else _result_text(result)
+            else _result_text(build_result)
         )
-        return 0 if result.success else 1
+        return 0 if build_result.success else 1
     if args.command == "batch":
         output_dir = Path(args.output_dir).expanduser() if args.output_dir else None
         requests: list[BuildRequest] = []
@@ -2350,9 +2354,9 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             ]
         else:
             results = engine.build_batch(requests, workers=args.jobs)
-        if analytics:
+        if build_analytics:
             for batch_result in results:
-                analytics.record(batch_result)
+                build_analytics.record(batch_result)
         if args.json:
             print(
                 json.dumps(
