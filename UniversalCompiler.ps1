@@ -4,7 +4,7 @@
     Universal Compiler v2.0 - Script to EXE Compiler
 .DESCRIPTION
     Compiles PowerShell, Python, Batch, Node.js, C#, Go, Ruby, VBScript, and AutoHotkey scripts to Windows executables.
-    Features: Drag & Drop, Batch Compilation, Build Profiles, Recent Files, Theme Toggle, Code Signing, and more.
+    Features: Drag & Drop, Batch Compilation, Build Profiles, Recent Files, Theme Toggle, and unsigned builds.
 #>
 
 param([switch]$ForceSetup, [switch]$SkipSetup, [string]$File, [string]$Output, [string]$Profile)
@@ -33,7 +33,7 @@ if (-not (Test-Path $script:ConfigDir)) { New-Item -ItemType Directory -Path $sc
 # SETTINGS & THEMES
 # ============================================================================
 
-$script:DefaultSettings = @{ Theme = 'Dark'; PostBuildAction = 'None'; PostBuildCopyPath = ''; ShowNotifications = $true; AutoCheckUpdates = $true; MaxRecentFiles = 10; MaxHistoryItems = 50; DefaultProfile = 'Default'; SigningCertPath = ''; SigningCertPassword = '' }
+$script:DefaultSettings = @{ Theme = 'Dark'; PostBuildAction = 'None'; PostBuildCopyPath = ''; ShowNotifications = $true; AutoCheckUpdates = $true; MaxRecentFiles = 10; MaxHistoryItems = 50; DefaultProfile = 'Default' }
 
 function Get-AppSettings { if (Test-Path $script:SettingsFile) { try { $loaded = Get-Content $script:SettingsFile -Raw | ConvertFrom-Json; $s = $script:DefaultSettings.Clone(); foreach ($p in $loaded.PSObject.Properties) { if ($s.ContainsKey($p.Name)) { $s[$p.Name] = $p.Value } }; return $s } catch { } }; return $script:DefaultSettings.Clone() }
 function Save-AppSettings { param([hashtable]$S); $S | ConvertTo-Json -Depth 3 | Set-Content -Path $script:SettingsFile -Force }
@@ -101,17 +101,6 @@ function Export-BuildLog { param([string]$Log, [string]$Src)
     $path = Join-Path ([Environment]::GetFolderPath('Desktop')) "BuildLog_${bn}_${ts}.txt"
     $hdr = "================================================================================`r`nUniversal Compiler v$($script:AppVersion) - Build Log`r`n================================================================================`r`nDate: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`nSource: $Src`r`n================================================================================`r`n`r`n"
     Set-Content -Path $path -Value ($hdr + $Log) -Encoding UTF8; return $path
-}
-
-function Sign-Executable { param([string]$Exe, [string]$Cert, [string]$Pass)
-    if (-not $Cert -or -not (Test-Path $Cert)) { return @{ Success=$false; Message="Certificate not found" } }
-    if (-not (Test-Path $Exe)) { return @{ Success=$false; Message="Executable not found" } }
-    try {
-        $certificate = if ($Pass) { Get-PfxCertificate -FilePath $Cert -Password (ConvertTo-SecureString $Pass -AsPlainText -Force) } else { Get-PfxCertificate -FilePath $Cert }
-        $result = Set-AuthenticodeSignature -FilePath $Exe -Certificate $certificate -TimestampServer "http://timestamp.digicert.com"
-        if ($result.Status -eq 'Valid') { return @{ Success=$true; Message="Signed successfully" } }
-        return @{ Success=$false; Message=$result.StatusMessage }
-    } catch { return @{ Success=$false; Message=$_.Exception.Message } }
 }
 
 # ============================================================================
@@ -484,7 +473,6 @@ $mainXaml = @"
                                     <CheckBox x:Name="chkSingle" Content="Single File" Style="{StaticResource Chk}" IsChecked="True" ToolTip="Bundle everything into one EXE"/>
                                 </StackPanel>
                                 <StackPanel Grid.Column="1">
-                                    <CheckBox x:Name="chkSign" Content="Code Sign" Style="{StaticResource Chk}" ToolTip="Sign with certificate after build"/>
                                     <CheckBox x:Name="chkNotify" Content="Notify on Complete" Style="{StaticResource Chk}" IsChecked="True" ToolTip="Show notification when build finishes"/>
                                 </StackPanel>
                             </Grid>
@@ -551,7 +539,7 @@ $mainXaml = @"
             </Grid>
         </Grid>
         <!-- Footer -->
-        <TextBlock Grid.Row="2" Text="Universal Compiler v2.0 • Drag &amp; Drop • Batch Build • Profiles • Code Signing" Foreground="$($th.T3)" FontSize="9" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+        <TextBlock Grid.Row="2" Text="Universal Compiler v2.0 • Drag &amp; Drop • Batch Build • Profiles • Unsigned Builds" Foreground="$($th.T3)" FontSize="9" HorizontalAlignment="Center" Margin="0,12,0,0"/>
     </Grid>
 </Window>
 "@
@@ -575,7 +563,7 @@ $iconPreview = $window.FindName("iconPreview"); $imgIcon = $window.FindName("img
 $txtOutName = $window.FindName("txtOutName"); $txtOutDir = $window.FindName("txtOutDir"); $btnOutDir = $window.FindName("btnOutDir")
 $txtIcon = $window.FindName("txtIcon"); $btnIcon = $window.FindName("btnIcon"); $btnIconClear = $window.FindName("btnIconClear")
 $cmbProfile = $window.FindName("cmbProfile"); $btnSaveProfile = $window.FindName("btnSaveProfile")
-$chkConsole = $window.FindName("chkConsole"); $chkAdmin = $window.FindName("chkAdmin"); $chkSingle = $window.FindName("chkSingle"); $chkSign = $window.FindName("chkSign"); $chkNotify = $window.FindName("chkNotify")
+$chkConsole = $window.FindName("chkConsole"); $chkAdmin = $window.FindName("chkAdmin"); $chkSingle = $window.FindName("chkSingle"); $chkNotify = $window.FindName("chkNotify")
 $cmbPostBuild = $window.FindName("cmbPostBuild"); $txtPostBuildPath = $window.FindName("txtPostBuildPath"); $btnPostBuildPath = $window.FindName("btnPostBuildPath")
 $txtProduct = $window.FindName("txtProduct"); $txtCompany = $window.FindName("txtCompany"); $txtVersion = $window.FindName("txtVersion"); $txtCopyright = $window.FindName("txtCopyright"); $txtDesc = $window.FindName("txtDesc")
 $lstQueue = $window.FindName("lstQueue"); $lblQueueCount = $window.FindName("lblQueueCount"); $btnAddQueue = $window.FindName("btnAddQueue"); $btnClearQueue = $window.FindName("btnClearQueue")
@@ -793,12 +781,6 @@ function Start-Compile {
         }
         if ($ok -and (Test-Path $script:outPath)) {
             Progress -V 95
-            # Code signing
-            if ($chkSign.IsChecked -and $script:Settings.SigningCertPath) {
-                Log "Signing executable..." -L Info
-                $signResult = Sign-Executable $script:outPath $script:Settings.SigningCertPath $script:Settings.SigningCertPassword
-                if ($signResult.Success) { Log "Code signed successfully" -L Success } else { Log "Signing failed: $($signResult.Message)" -L Warning }
-            }
             Progress -V 100; $fi = Get-Item $script:outPath
             Log "========================================" -L Success; Log "BUILD SUCCESSFUL" -L Success; Log "Size: $(FmtSize $fi.Length)" -L Success
             Status "Complete!"

@@ -35,7 +35,7 @@ from compiler_core import (
 # the script is launched without a command.
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1].lower() in {
     "build", "batch", "inspect", "verify", "list-toolchains", "init-profiles",
-    "bytecode", "extract-icon", "analytics", "init-actions", "--help", "-h"
+    "bytecode", "extract-icon", "wrap-msix", "obfuscate", "analytics", "init-actions", "--help", "-h"
 }:
     from compiler_core import cli_main
 
@@ -130,8 +130,6 @@ DEFAULT_SETTINGS = {
     "max_recent_files": 10,
     "max_history_items": 50,
     "default_profile": "Default",
-    "signing_cert_path": "",
-    "signing_cert_password": "",
 }
 
 DEFAULT_PROFILES = {
@@ -227,6 +225,7 @@ COMPILERS = {
     "pm": {"name": "Perl Module", "compiler": "PAR::Packer", "desc": "Perl Module"},
     "kt": {"name": "Kotlin", "compiler": "Kotlin/Native", "desc": "Kotlin Source"},
     "kts": {"name": "Kotlin Script", "compiler": "Kotlin/Native", "desc": "Kotlin Script"},
+    "wat": {"name": "WebAssembly", "compiler": "wat2wasm", "desc": "WebAssembly Text"},
 }
 
 # ============================================================================
@@ -555,6 +554,10 @@ puts "Hello, World!"
     "HelloWorld.kt": '''fun main() {
     println("Hello, World!")
 }
+''',
+    "HelloWorld.wat": '''(module
+  (func (export "hello"))
+)
 ''',
 }
 
@@ -1194,7 +1197,7 @@ class UniversalCompiler:
         # Footer
         ctk.CTkLabel(
             main,
-            text="Universal Compiler v2.0 • Drag & Drop • Batch Build • Profiles • Code Signing",
+            text="Universal Compiler v2.0 • Drag & Drop • Batch Build • Profiles • Unsigned Builds",
             font=("Segoe UI", 9),
             text_color=self.theme["text3"]
         ).pack(pady=(10, 0))
@@ -1569,16 +1572,6 @@ class UniversalCompiler:
         right_checks = ctk.CTkFrame(checks, fg_color="transparent")
         right_checks.pack(side="left", fill="x", expand=True)
         
-        self.sign_var = ctk.BooleanVar()
-        ctk.CTkCheckBox(
-            right_checks, text="Code Sign",
-            variable=self.sign_var,
-            fg_color=self.theme["green"],
-            hover_color=self.theme["green_hover"],
-            border_color=self.theme["border"],
-            text_color=self.theme["text1"]
-        ).pack(anchor="w", pady=3)
-        
         self.notify_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
             right_checks, text="Notify on Complete",
@@ -1925,7 +1918,7 @@ class UniversalCompiler:
     def _browse_source(self):
         """Browse for source file."""
         filetypes = [
-            ("All Scripts", "*.ps1 *.py *.bat *.cmd *.js *.ts *.vbs *.ahk *.cs *.go *.rb *.rs *.lua *.pl *.pm *.kt *.kts"),
+            ("All Scripts", "*.ps1 *.py *.bat *.cmd *.js *.ts *.vbs *.ahk *.cs *.go *.rb *.rs *.lua *.pl *.pm *.kt *.kts *.wat"),
             ("All Files", "*.*")
         ]
         filepath = filedialog.askopenfilename(filetypes=filetypes)
@@ -2122,7 +2115,7 @@ class UniversalCompiler:
     def _add_to_queue(self):
         """Add files to batch queue."""
         filetypes = [
-            ("All Scripts", "*.ps1 *.py *.bat *.cmd *.js *.ts *.vbs *.ahk *.cs *.go *.rb *.rs *.lua *.pl *.pm *.kt *.kts"),
+            ("All Scripts", "*.ps1 *.py *.bat *.cmd *.js *.ts *.vbs *.ahk *.cs *.go *.rb *.rs *.lua *.pl *.pm *.kt *.kts *.wat"),
             ("All Files", "*.*")
         ]
         files = filedialog.askopenfilenames(filetypes=filetypes)

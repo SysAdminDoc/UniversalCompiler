@@ -36,6 +36,7 @@
 | Lua | `.lua` | srlua / luastatic | ✅ Full Support |
 | Perl | `.pl`, `.pm` | PAR::Packer | ✅ Full Support |
 | Kotlin | `.kt`, `.kts` | Kotlin/Native | ✅ Full Support |
+| WebAssembly Text | `.wat` | wat2wasm | ✅ Full Support |
 
 ### 🚀 Key Features
 
@@ -44,7 +45,6 @@
 - **💾 Build Profiles** - Save and load compilation presets
 - **📁 Recent Files** - Quick access to recently compiled scripts
 - **🌙 Dark/Light Theme** - Toggle between themes for comfortable viewing
-- **🔐 Code Signing** - Sign executables with PFX certificates
 - **🔔 Toast Notifications** - Get notified when builds complete
 - **📊 Compilation History** - Track all your previous builds
 - **📄 Template Scripts** - Pre-made "Hello World" for all languages
@@ -52,6 +52,7 @@
 - **📤 Export Build Log** - Save detailed logs for troubleshooting
 - **📏 Size Estimation** - See estimated output size before compiling
 - **🖼️ Icon Extraction** - Reuse an icon from an existing executable
+- **📦 Unsigned MSIX** - Wrap a finished EXE for package distribution
 - **💡 Tooltips** - Hover for helpful explanations
 - **🖥️ DPI Aware** - Sharp rendering on high-DPI displays
 
@@ -153,6 +154,8 @@ python .\UniversalCompiler.py analytics --recent 10
 python .\UniversalCompiler.py list-toolchains
 python .\UniversalCompiler.py verify .\dist\myscript.exe
 python .\UniversalCompiler.py extract-icon .\existing.exe --output .\icon.ico
+python .\UniversalCompiler.py wrap-msix .\dist\myscript.exe --output .\dist\myscript.msix
+python .\UniversalCompiler.py obfuscate .\myscript.py --method pyarmor --output .\obfuscated
 
 # Generate a language-specific workflow template
 python .\UniversalCompiler.py init-actions --language py
@@ -163,6 +166,8 @@ Profiles are stored in `%APPDATA%\UniversalCompiler\profiles.yaml`; use
 next to the output and opt-in dependency prefetching (`--prefetch`). Static
 verification checks the produced container or PE header without launching the
 artifact, so a GUI build cannot steal focus or alter the active desktop.
+MSIX/APPX output is deliberately unsigned and is intended for packaging or
+internal testing only.
 
 The optional `vscode-extension/` package adds a **Universal Compiler: Build
 Active File** command. Point its `universalCompiler.scriptPath` setting at the
@@ -192,17 +197,6 @@ Save your favorite settings as profiles:
 | Open Output Folder | Opens Explorer to the EXE location |
 | Run Executable | Launches the compiled EXE |
 | Copy to Folder | Copies EXE to a specified directory |
-
-### Code Signing
-
-To sign your executables:
-
-1. Go to **Settings**
-2. Set your **Certificate Path** (`.pfx` file)
-3. Enter **Certificate Password**
-4. Check **"Code Sign"** in Build Options
-
----
 
 ## ⌨️ Keyboard Shortcuts
 
@@ -330,7 +324,6 @@ Remove-Item "$env:APPDATA\UniversalCompiler" -Recurse -Force
 - 💾 Build profiles system
 - 📁 Recent files tracking
 - 🌙 Light/Dark theme toggle
-- 🔐 Code signing support
 - 🔔 Toast notifications
 - 📊 Compilation history
 - 📄 Template scripts

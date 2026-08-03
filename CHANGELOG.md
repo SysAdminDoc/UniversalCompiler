@@ -14,6 +14,8 @@ All notable changes to UniversalCompiler will be documented in this file.
   Actions templates, and a VS Code command extension.
 - Add side-by-side source/log diagnostics with error-line navigation and
   executable icon extraction for reuse in later builds.
+- Add unsigned MSIX/APPX wrapping, WebAssembly text compilation, and explicit
+  opt-in obfuscator command support.
 
 ## [v0.1.0] - %Y->- (HEAD -> main, origin/main, origin/HEAD)
 

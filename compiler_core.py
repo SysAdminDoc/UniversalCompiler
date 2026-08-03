@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -128,6 +129,7 @@ EXTENSION_BACKENDS: dict[str, tuple[str, ...]] = {
     "pm": ("perl-pp",),
     "kt": ("kotlin-native",),
     "kts": ("kotlin-native",),
+    "wat": ("wat2wasm",),
 }
 
 
@@ -149,6 +151,13 @@ BACKEND_NAMES: dict[str, str] = {
     "perl-pp": "Perl PAR::Packer",
     "kotlin-native": "Kotlin/Native",
     "upx": "UPX compressor",
+    "wat2wasm": "WebAssembly wat2wasm",
+}
+
+OBFUSCATOR_NAMES: dict[str, str] = {
+    "pyarmor": "PyArmor Python obfuscator",
+    "javascript-obfuscator": "JavaScript Obfuscator",
+    "confuserex": "ConfuserEx .NET obfuscator",
 }
 
 
@@ -347,6 +356,7 @@ def estimate_output_size(
         "pm": (15 * 1024 * 1024, 1.5),
         "kt": (20 * 1024 * 1024, 1.5),
         "kts": (20 * 1024 * 1024, 1.5),
+        "wat": (100 * 1024, 1.2),
     }
     key = (file_type or detect_file_type(path) or "").lower()
     if key not in estimates:
@@ -643,6 +653,7 @@ def resolve_backend_executable(backend: str) -> str | None:
         "perl-pp": ("pp",),
         "kotlin-native": ("kotlinc-native",),
         "upx": ("upx",),
+        "wat2wasm": ("wat2wasm",),
     }
     if backend == "ps2exe":
         return _powershell_executable()
@@ -669,6 +680,25 @@ def resolve_backend_executable(backend: str) -> str | None:
         return sys.executable if importlib.util.find_spec("nuitka") else None
     names = direct.get(backend)
     return _find_first(names) if names else None
+
+
+def resolve_obfuscator(method: str) -> str | None:
+    """Resolve an optional obfuscator without installing or modifying source."""
+
+    normalized = method.lower()
+    if normalized == "pyarmor":
+        return _find_first(("pyarmor",))
+    if normalized == "javascript-obfuscator":
+        return _find_first(("javascript-obfuscator", "js-obfuscator"))
+    if normalized == "confuserex":
+        direct = _find_first(("Confuser.CLI.exe", "Confuser.CLI"))
+        if direct:
+            return direct
+        for root in _windows_path_candidates("ConfuserEx"):
+            candidate = root / "Confuser.CLI.exe"
+            if candidate.exists():
+                return str(candidate)
+    return None
 
 
 def backend_status() -> dict[str, dict[str, Any]]:
@@ -1166,6 +1196,8 @@ class CompilerEngine:
                 *request.extra_args,
             )
             candidates.append(output.with_suffix(""))
+        elif backend == "wat2wasm":
+            command = (executable, str(source), "-o", str(output), *request.extra_args)
         elif backend == "ahk2exe":
             command_parts = [executable, "/in", str(source), "/out", str(output)]
             if request.icon:
@@ -1472,7 +1504,7 @@ def verify_artifact(path: os.PathLike[str] | str) -> VerificationResult:
         return VerificationResult(
             True, "pe", f"Valid PE artifact ({format_size(artifact.stat().st_size)})"
         )
-    if artifact.suffix.lower() in {".jar", ".zip"}:
+    if artifact.suffix.lower() in {".jar", ".zip", ".msix", ".appx"}:
         try:
             import zipfile
 
@@ -1552,6 +1584,125 @@ def extract_icon(
     if not result.success or not output_path.is_file():
         raise BuildValidationError(result.output or "Icon extraction failed")
     return output_path
+
+
+def wrap_msix(
+    executable: os.PathLike[str] | str,
+    output: os.PathLike[str] | str,
+    display_name: str = "Universal Compiler Application",
+    publisher: str = "CN=UniversalCompiler",
+    version: str = "1.0.0.0",
+) -> Path:
+    """Package an executable as an explicitly unsigned MSIX/APPX archive."""
+
+    from xml.sax.saxutils import escape
+
+    source_path = Path(executable).expanduser()
+    if not source_path.is_file() or source_path.suffix.lower() != ".exe":
+        raise BuildValidationError(f"Windows executable not found: {source_path}")
+    output_path = Path(output).expanduser()
+    if output_path.suffix.lower() not in {".msix", ".appx"}:
+        raise BuildValidationError("MSIX output must end in .msix or .appx")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    identity = re.sub(r"[^A-Za-z0-9.\-]", "", display_name)[:50] or "UniversalCompiler"
+    safe_version = ".".join(str(version).split(".")[:4])
+    if len(safe_version.split(".")) != 4:
+        safe_version = "1.0.0.0"
+    manifest = f"""<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+  <Identity Name="{escape(identity)}" Publisher="{escape(publisher)}" Version="{escape(safe_version)}" />
+  <Properties>
+    <DisplayName>{escape(display_name)}</DisplayName>
+    <PublisherDisplayName>{escape(publisher)}</PublisherDisplayName>
+    <Description>{escape(display_name)}</Description>
+    <Logo>Assets/StoreLogo.png</Logo>
+  </Properties>
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+  <Applications>
+    <Application Id="App" Executable="App.exe" EntryPoint="Windows.FullTrustApplication" />
+  </Applications>
+  <Capabilities>
+    <Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>
+"""
+    makeappx = _find_first(("makeappx", "makeappx.exe"))
+    with tempfile.TemporaryDirectory(prefix="uc-msix-") as directory:
+        package_dir = Path(directory)
+        shutil.copy2(source_path, package_dir / "App.exe")
+        assets = package_dir / "Assets"
+        assets.mkdir()
+        assets.joinpath("StoreLogo.png").write_bytes(
+            bytes.fromhex(
+                "89504E470D0A1A0A0000000D49484452000000010000000108060000001F15C489"
+                "0000000D49444154789C6360F8CF00000003000101F9D5C2A00000000049454E44AE426082"
+            )
+        )
+        (package_dir / "AppxManifest.xml").write_text(manifest, encoding="utf-8")
+        if makeappx:
+            result = run_command(
+                (
+                    makeappx,
+                    "pack",
+                    "/d",
+                    str(package_dir),
+                    "/p",
+                    str(output_path),
+                    "/o",
+                )
+            )
+            if not result.success or not output_path.is_file():
+                raise BuildValidationError(result.output or "MSIX packaging failed")
+        else:
+            with zipfile.ZipFile(
+                output_path, "w", compression=zipfile.ZIP_DEFLATED
+            ) as archive:
+                archive.write(package_dir / "App.exe", "App.exe")
+                archive.write(package_dir / "AppxManifest.xml", "AppxManifest.xml")
+                archive.write(assets / "StoreLogo.png", "Assets/StoreLogo.png")
+    return output_path
+
+
+def obfuscate_source(
+    source: os.PathLike[str] | str,
+    method: str,
+    output: os.PathLike[str] | str,
+) -> Path:
+    """Run an opt-in obfuscator into a separate destination."""
+
+    source_path = Path(source).expanduser()
+    output_path = Path(output).expanduser()
+    normalized = method.lower()
+    if not source_path.is_file():
+        raise BuildValidationError(f"Source file not found: {source_path}")
+    executable = resolve_obfuscator(normalized)
+    if not executable:
+        raise BuildValidationError(f"Obfuscator is not installed: {normalized}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if normalized == "pyarmor":
+        output_path.mkdir(parents=True, exist_ok=True)
+        command = (executable, "gen", "--output", str(output_path), str(source_path))
+        expected = output_path / source_path.name
+    elif normalized == "javascript-obfuscator":
+        command = (executable, str(source_path), "--output", str(output_path))
+        expected = output_path
+    elif normalized == "confuserex":
+        if source_path.suffix.lower() != ".crproj":
+            raise BuildValidationError(
+                "ConfuserEx requires a .crproj project file as its source"
+            )
+        command = (executable, str(source_path))
+        expected = output_path
+    else:
+        raise BuildValidationError(f"Unsupported obfuscator: {method}")
+    result = run_command(command, cwd=source_path.parent)
+    if not result.success:
+        raise BuildValidationError(result.output or "Obfuscation failed")
+    if not expected.exists():
+        raise BuildValidationError(f"Obfuscator did not create: {expected}")
+    return expected
 
 
 class BuildAnalytics:
@@ -1929,6 +2080,24 @@ def create_cli_parser() -> argparse.ArgumentParser:
     icon_parser.add_argument("executable")
     icon_parser.add_argument("--output", "-o")
 
+    msix_parser = subparsers.add_parser(
+        "wrap-msix", help="Create an unsigned MSIX/APPX package around an EXE"
+    )
+    msix_parser.add_argument("executable")
+    msix_parser.add_argument("--output", "-o", required=True)
+    msix_parser.add_argument("--display-name", default="Universal Compiler Application")
+    msix_parser.add_argument("--publisher", default="CN=UniversalCompiler")
+    msix_parser.add_argument("--version", default="1.0.0.0")
+
+    obfuscate_parser = subparsers.add_parser(
+        "obfuscate", help="Run an opt-in source obfuscator into a separate path"
+    )
+    obfuscate_parser.add_argument("source")
+    obfuscate_parser.add_argument(
+        "--method", required=True, choices=sorted(OBFUSCATOR_NAMES)
+    )
+    obfuscate_parser.add_argument("--output", "-o", required=True)
+
     analytics_parser = subparsers.add_parser(
         "analytics", help="Show local build timing and size analytics"
     )
@@ -2002,6 +2171,28 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     if args.command == "extract-icon":
         try:
             output = extract_icon(args.executable, args.output)
+        except (BuildValidationError, OSError) as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+        print(output)
+        return 0
+    if args.command == "wrap-msix":
+        try:
+            output = wrap_msix(
+                args.executable,
+                args.output,
+                display_name=args.display_name,
+                publisher=args.publisher,
+                version=args.version,
+            )
+        except (BuildValidationError, OSError, zipfile.BadZipFile) as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+        print(output)
+        return 0
+    if args.command == "obfuscate":
+        try:
+            output = obfuscate_source(args.source, args.method, args.output)
         except (BuildValidationError, OSError) as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 1
@@ -2169,6 +2360,7 @@ __all__ = [
     "extract_icon",
     "format_size",
     "github_actions_template",
+    "obfuscate_source",
     "load_json",
     "load_profiles",
     "profiles_path",
@@ -2178,4 +2370,5 @@ __all__ = [
     "save_profiles",
     "sha256_file",
     "verify_artifact",
+    "wrap_msix",
 ]

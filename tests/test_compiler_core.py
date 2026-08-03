@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import compiler_core
 from compiler_core import (
     BuildAnalytics,
     DEFAULT_PROFILES,
@@ -22,6 +24,7 @@ from compiler_core import (
     load_profiles,
     save_profiles,
     verify_artifact,
+    wrap_msix,
 )
 
 
@@ -70,6 +73,25 @@ def test_static_artifact_verification(tmp_path: Path) -> None:
 
     artifact.write_bytes(b"not an executable")
     assert verify_artifact(artifact).passed is False
+
+
+def test_unsigned_msix_contains_manifest_and_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "app.exe"
+    package = tmp_path / "app.msix"
+    _fake_pe(executable)
+    monkeypatch.setattr(compiler_core, "_find_first", lambda names: None)
+
+    result = wrap_msix(executable, package, display_name="Test App")
+
+    assert result == package
+    assert verify_artifact(package).passed is True
+    with zipfile.ZipFile(package) as archive:
+        assert {"App.exe", "AppxManifest.xml", "Assets/StoreLogo.png"} <= set(
+            archive.namelist()
+        )
+        assert "Test App" in archive.read("AppxManifest.xml").decode("utf-8")
 
 
 def test_bytecode_compile_only(tmp_path: Path) -> None:
@@ -196,6 +218,7 @@ def test_cli_list_toolchains_json(capsys: pytest.CaptureFixture[str]) -> None:
     output = json.loads(capsys.readouterr().out)
     assert "nuitka" in output
     assert "rs" in output["rust"]["extensions"]
+    assert "wat" in output["wat2wasm"]["extensions"]
 
 
 def test_github_actions_template_is_language_specific(tmp_path: Path) -> None:
