@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Optional, Dict, List, Any, Callable
 from compiler_core import (
     BACKEND_NAMES,
+    BuildValidationError,
     BuildRequest,
     BuildResult,
     CompilerEngine,
@@ -29,7 +30,10 @@ from compiler_core import (
     estimate_output_size as core_estimate_output_size,
     extract_icon,
     load_profiles,
+    load_project_manifest,
+    project_manifest_path,
     run_command as core_run_command,
+    save_project_manifest,
     save_profiles,
 )
 
@@ -37,7 +41,7 @@ from compiler_core import (
 # install optional desktop packages.  The legacy GUI remains the default when
 # the script is launched without a command.
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1].lower() in {
-    "build", "batch", "inspect", "verify", "list-toolchains", "init-profiles",
+    "build", "batch", "inspect", "verify", "list-toolchains", "init-profiles", "manifest",
     "bytecode", "extract-icon", "wrap-msix", "obfuscate", "analytics", "init-actions", "--help", "-h"
 }:
     from compiler_core import cli_main
@@ -73,6 +77,7 @@ APP_VERSION = "2.1.0"
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "UniversalCompiler"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 PROFILES_FILE = CONFIG_DIR / "profiles.yaml"
+MANIFEST_FILE = project_manifest_path("user")
 HISTORY_FILE = CONFIG_DIR / "history.json"
 RECENT_FILE = CONFIG_DIR / "recent.json"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
@@ -359,14 +364,26 @@ class Settings:
     
     def load(self) -> None:
         """Load settings from file."""
-        saved = load_json(SETTINGS_FILE, {})
+        try:
+            saved = load_project_manifest(
+                MANIFEST_FILE, expected_scope="user"
+            ).manifest["settings"]
+        except (BuildValidationError, OSError, ValueError):
+            saved = load_json(SETTINGS_FILE, {})
         for key, value in saved.items():
             if key in self._settings:
                 self._settings[key] = value
     
     def save(self) -> None:
         """Save settings to file."""
-        save_json(SETTINGS_FILE, self._settings)
+        try:
+            manifest = load_project_manifest(
+                MANIFEST_FILE, expected_scope="user"
+            ).manifest
+            manifest["settings"] = dict(self._settings)
+            save_project_manifest(MANIFEST_FILE, manifest)
+        except (BuildValidationError, OSError, ValueError):
+            save_json(SETTINGS_FILE, self._settings)
     
     def get(self, key: str, default: Any = None) -> Any:
         """Get setting value."""
@@ -434,16 +451,28 @@ class BuildProfiles:
     
     def load(self) -> None:
         """Load profiles from disk."""
-        saved = load_profiles(PROFILES_FILE, self._profiles)
-        legacy_file = CONFIG_DIR / "profiles.json"
-        if not PROFILES_FILE.exists() and legacy_file.exists():
-            saved = load_json(legacy_file, saved)
+        try:
+            saved = load_project_manifest(
+                MANIFEST_FILE, expected_scope="user"
+            ).manifest["profiles"]
+        except (BuildValidationError, OSError, ValueError):
+            saved = load_profiles(PROFILES_FILE, self._profiles)
+            legacy_file = CONFIG_DIR / "profiles.json"
+            if not PROFILES_FILE.exists() and legacy_file.exists():
+                saved = load_json(legacy_file, saved)
         for name, profile in saved.items():
             self._profiles[name] = profile
     
     def save(self) -> None:
         """Save profiles to disk."""
-        save_profiles(PROFILES_FILE, self._profiles)
+        try:
+            manifest = load_project_manifest(
+                MANIFEST_FILE, expected_scope="user"
+            ).manifest
+            manifest["profiles"] = dict(self._profiles)
+            save_project_manifest(MANIFEST_FILE, manifest)
+        except (BuildValidationError, OSError, ValueError):
+            save_profiles(PROFILES_FILE, self._profiles)
     
     def get(self, name: str) -> Optional[Dict]:
         """Get profile by name."""
@@ -473,11 +502,23 @@ class CompilationHistory:
     
     def load(self) -> None:
         """Load history from disk."""
-        self._history = load_json(HISTORY_FILE, [])
+        try:
+            self._history = load_project_manifest(
+                MANIFEST_FILE, expected_scope="user"
+            ).manifest["history"]
+        except (BuildValidationError, OSError, ValueError):
+            self._history = load_json(HISTORY_FILE, [])
     
     def save(self) -> None:
         """Save history to disk."""
-        save_json(HISTORY_FILE, self._history)
+        try:
+            manifest = load_project_manifest(
+                MANIFEST_FILE, expected_scope="user"
+            ).manifest
+            manifest["history"] = list(self._history)
+            save_project_manifest(MANIFEST_FILE, manifest)
+        except (BuildValidationError, OSError, ValueError):
+            save_json(HISTORY_FILE, self._history)
     
     def add(self, source: str, output: str, file_type: str, 
             success: bool, profile: str, size: int) -> None:

@@ -176,10 +176,27 @@ python .\UniversalCompiler.py obfuscate .\myscript.py --method pyarmor --output 
 
 # Generate a language-specific workflow template
 python .\UniversalCompiler.py init-actions --language py
+
+# Initialize, inspect, migrate, or recover canonical project state
+python .\UniversalCompiler.py manifest init --scope user --json
+python .\UniversalCompiler.py manifest show --path .\universal-compiler.json --json
+python .\UniversalCompiler.py manifest migrate --path .\universal-compiler.json --scope workspace --json
+python .\UniversalCompiler.py manifest rollback --path .\universal-compiler.json --json
+
+# Build from a canonical manifest instead of a legacy profiles file
+python .\UniversalCompiler.py build .\myscript.py --manifest .\universal-compiler.json --profile Release
 ```
 
-Profiles are stored in `%APPDATA%\UniversalCompiler\profiles.yaml`; use
-`init-profiles` to create a starter file. Builds use a content/toolchain cache
+Project state is stored in the versioned `%APPDATA%\UniversalCompiler\universal-compiler.json`
+manifest by default. A workspace manifest lives beside the project and is selected
+with `--manifest`; it records settings, profiles, history, analytics metadata, and
+an explicit `user` or `workspace` scope. `manifest migrate` imports legacy
+`profiles.yaml`/`profiles.json`, `settings.json`, and `history.json` files
+idempotently. Unknown fields and future schema versions fail closed, while a valid
+`.bak` is used for recovery after an interrupted or invalid write. `init-profiles`
+remains available for creating a legacy YAML file for older integrations.
+
+Builds use a content/toolchain cache
 next to the output and opt-in dependency prefetching (`--prefetch
 --allow-network --allow-dependency-install`). Every compiler command is
 launched without a shell with bounded timeout/output capture, a minimal
@@ -250,11 +267,13 @@ Save your favorite settings as profiles:
 | Item | Location |
 |------|----------|
 | Configuration | `%APPDATA%\UniversalCompiler\config.json` |
-| Build Profiles | `%APPDATA%\UniversalCompiler\profiles.yaml` |
-| Compilation History | `%APPDATA%\UniversalCompiler\history.json` |
+| Canonical project state | `%APPDATA%\UniversalCompiler\universal-compiler.json` |
+| Workspace project state | `<project>\universal-compiler.json` |
+| Legacy Build Profiles | `%APPDATA%\UniversalCompiler\profiles.yaml` (imported on migration) |
+| Legacy Compilation History | `%APPDATA%\UniversalCompiler\history.json` (imported on migration) |
 | Local Analytics | `%APPDATA%\UniversalCompiler\analytics.sqlite3` |
 | Recent Files | `%APPDATA%\UniversalCompiler\recent.json` |
-| Settings | `%APPDATA%\UniversalCompiler\settings.json` |
+| Legacy Settings | `%APPDATA%\UniversalCompiler\settings.json` (imported on migration) |
 | Templates | `%APPDATA%\UniversalCompiler\Templates\` |
 | Install Log | `%APPDATA%\UniversalCompiler\install.log` |
 

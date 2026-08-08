@@ -9,6 +9,7 @@ as an import side effect.
 from __future__ import annotations
 
 import argparse
+import copy
 import concurrent.futures
 import hashlib
 import importlib.util
@@ -40,6 +41,9 @@ REQUEST_SCHEMA_VERSION = "uc.request.v1"
 RESULT_SCHEMA_VERSION = "uc.result.v1"
 CAPABILITY_SCHEMA_VERSION = "uc.capability.v1"
 ARTIFACT_MANIFEST_SCHEMA_VERSION = "uc.artifact-manifest.v1"
+PROJECT_MANIFEST_SCHEMA_VERSION = "uc.project.v1"
+PROJECT_MANIFEST_KIND = "universal-compiler.project"
+PROJECT_MANIFEST_FILENAME = "universal-compiler.json"
 
 
 DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
@@ -116,6 +120,48 @@ DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
         "upx": False,
     },
 }
+
+DEFAULT_MANIFEST_SETTINGS: dict[str, Any] = {
+    "theme": "Dark",
+    "post_build_action": "None",
+    "post_build_copy_path": "",
+    "show_notifications": True,
+    "auto_check_updates": True,
+    "max_recent_files": 10,
+    "max_history_items": 50,
+    "default_profile": "Default",
+}
+PROJECT_MANIFEST_PROFILE_FIELDS = frozenset(
+    {
+        "console",
+        "admin",
+        "single_file",
+        "backend",
+        "target",
+        "architecture",
+        "version",
+        "company",
+        "copyright",
+        "description",
+        "product",
+        "prefetch",
+        "verify",
+        "cache",
+        "force",
+        "extra_args",
+        "toolchain_versions",
+        "upx",
+        "timeout_seconds",
+        "max_output_bytes",
+        "allow_network",
+        "allow_dependency_install",
+    }
+)
+PROJECT_MANIFEST_SETTINGS_FIELDS = frozenset(DEFAULT_MANIFEST_SETTINGS)
+PROJECT_MANIFEST_HISTORY_FIELDS = frozenset(
+    {"timestamp", "source", "output", "type", "success", "profile", "size", "backend", "message", "manifest"}
+)
+PROJECT_MANIFEST_ANALYTICS_FIELDS = frozenset({"enabled", "scope", "database"})
 
 
 BACKEND_CATALOG: dict[str, dict[str, Any]] = {
@@ -697,6 +743,17 @@ class BuildPlan:
     environment: Mapping[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ManifestLoadResult:
+    """Result of loading, recovering, or migrating a project manifest."""
+
+    manifest: dict[str, Any]
+    migrated: bool = False
+    recovered: bool = False
+    warnings: tuple[str, ...] = ()
+    source_paths: tuple[Path, ...] = ()
+
+
 def config_dir(environment: Mapping[str, str] | None = None) -> Path:
     """Return the per-user configuration directory without creating it."""
 
@@ -707,6 +764,24 @@ def config_dir(environment: Mapping[str, str] | None = None) -> Path:
 
 def profiles_path(environment: Mapping[str, str] | None = None) -> Path:
     return config_dir(environment) / "profiles.yaml"
+
+
+def project_manifest_path(
+    scope: str = "user",
+    workspace: os.PathLike[str] | str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    """Return the explicit per-user or workspace-local manifest path."""
+
+    normalized_scope = str(scope).lower()
+    if normalized_scope == "user":
+        return config_dir(environment) / PROJECT_MANIFEST_FILENAME
+    if normalized_scope == "workspace":
+        root = Path(workspace or Path.cwd()).expanduser().resolve()
+        return root / PROJECT_MANIFEST_FILENAME
+    raise BuildValidationError(
+        f"Unknown manifest scope {scope!r}; expected 'user' or 'workspace'"
+    )
 
 
 def detect_file_type(source: os.PathLike[str] | str) -> str | None:
@@ -767,7 +842,7 @@ def load_json(path: os.PathLike[str] | str, default: Any = None) -> Any:
     """Load JSON safely, returning a caller-provided default on failure."""
 
     try:
-        with Path(path).open("r", encoding="utf-8") as handle:
+        with Path(path).open("r", encoding="utf-8-sig") as handle:
             return json.load(handle)
     except (OSError, ValueError, TypeError):
         return default if default is not None else {}
@@ -892,7 +967,7 @@ def load_profiles(
     if not source.exists():
         return merged
     try:
-        text = source.read_text(encoding="utf-8")
+        text = source.read_text(encoding="utf-8-sig")
     except OSError:
         return merged
     loaded: Any = None
@@ -922,6 +997,455 @@ def save_profiles(
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     temporary.write_text(_dump_profiles_yaml(profiles), encoding="utf-8")
     os.replace(temporary, destination)
+
+
+_PROJECT_MANIFEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "scope",
+        "workspace",
+        "settings",
+        "profiles",
+        "history",
+        "analytics",
+    }
+)
+_PROJECT_MANIFEST_WORKSPACE_FIELDS = frozenset({"root", "name"})
+
+
+def _manifest_unknown_fields(
+    value: Mapping[str, Any], allowed: Iterable[str], location: str
+) -> None:
+    unknown = sorted(str(key) for key in value if str(key) not in allowed)
+    if unknown:
+        raise BuildValidationError(
+            f"Unknown manifest field(s) at {location}: {', '.join(unknown)}"
+        )
+
+
+def _manifest_mapping(value: Any, location: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise BuildValidationError(f"Manifest field {location} must be an object")
+    return value
+
+
+def default_project_manifest(
+    scope: str = "user", workspace: os.PathLike[str] | str | None = None
+) -> dict[str, Any]:
+    """Return a complete manifest with explicit ownership scope metadata."""
+
+    normalized_scope = str(scope).lower()
+    if normalized_scope not in {"user", "workspace"}:
+        raise BuildValidationError(
+            f"Unknown manifest scope {scope!r}; expected 'user' or 'workspace'"
+        )
+    workspace_root = (
+        str(Path(workspace or Path.cwd()).expanduser().resolve())
+        if normalized_scope == "workspace"
+        else None
+    )
+    return {
+        "schema_version": PROJECT_MANIFEST_SCHEMA_VERSION,
+        "kind": PROJECT_MANIFEST_KIND,
+        "scope": normalized_scope,
+        "workspace": {"root": workspace_root, "name": None},
+        "settings": copy.deepcopy(DEFAULT_MANIFEST_SETTINGS),
+        "profiles": copy.deepcopy(DEFAULT_PROFILES),
+        "history": [],
+        "analytics": {
+            "enabled": True,
+            "scope": "user",
+            "database": "analytics.sqlite3",
+        },
+    }
+
+
+def validate_project_manifest(
+    manifest: Mapping[str, Any],
+    expected_scope: str | None = None,
+) -> dict[str, Any]:
+    """Strictly validate and normalize a project manifest.
+
+    Unknown fields are errors. Missing optional sections receive their v1
+    defaults, while a newer schema is rejected as forward-incompatible.
+    """
+
+    source = _manifest_mapping(manifest, "<root>")
+    _manifest_unknown_fields(source, _PROJECT_MANIFEST_FIELDS, "<root>")
+    schema_version = source.get("schema_version")
+    if schema_version != PROJECT_MANIFEST_SCHEMA_VERSION:
+        if isinstance(schema_version, str) and schema_version.startswith("uc.project.v"):
+            raise BuildValidationError(
+                f"Forward-incompatible project manifest schema {schema_version}; "
+                f"this build supports {PROJECT_MANIFEST_SCHEMA_VERSION}"
+            )
+        raise BuildValidationError(
+            f"Unsupported project manifest schema {schema_version!r}; "
+            f"expected {PROJECT_MANIFEST_SCHEMA_VERSION}"
+        )
+    if source.get("kind") != PROJECT_MANIFEST_KIND:
+        raise BuildValidationError(
+            f"Unsupported project manifest kind {source.get('kind')!r}"
+        )
+    scope = str(source.get("scope", "")).lower()
+    if scope not in {"user", "workspace"}:
+        raise BuildValidationError("Manifest scope must be 'user' or 'workspace'")
+    if expected_scope and scope != str(expected_scope).lower():
+        raise BuildValidationError(
+            f"Manifest scope {scope!r} does not match requested scope {expected_scope!r}"
+        )
+    normalized = default_project_manifest(scope)
+    normalized["workspace"] = dict(
+        _manifest_mapping(source.get("workspace", normalized["workspace"]), "workspace")
+    )
+    _manifest_unknown_fields(
+        normalized["workspace"], _PROJECT_MANIFEST_WORKSPACE_FIELDS, "workspace"
+    )
+    workspace_root = normalized["workspace"].get("root")
+    if workspace_root is not None and not isinstance(workspace_root, str):
+        raise BuildValidationError("Manifest field workspace.root must be a string or null")
+    workspace_name = normalized["workspace"].get("name")
+    if workspace_name is not None and not isinstance(workspace_name, str):
+        raise BuildValidationError("Manifest field workspace.name must be a string or null")
+
+    settings = _manifest_mapping(
+        source.get("settings", normalized["settings"]), "settings"
+    )
+    _manifest_unknown_fields(settings, PROJECT_MANIFEST_SETTINGS_FIELDS, "settings")
+    normalized["settings"].update(dict(settings))
+    for key, default in DEFAULT_MANIFEST_SETTINGS.items():
+        value = normalized["settings"][key]
+        if not isinstance(value, type(default)):
+            raise BuildValidationError(
+                f"Manifest field settings.{key} has invalid type"
+            )
+
+    profiles = _manifest_mapping(
+        source.get("profiles", normalized["profiles"]), "profiles"
+    )
+    normalized_profiles: dict[str, dict[str, Any]] = {}
+    for name, raw_profile in profiles.items():
+        profile = _manifest_mapping(raw_profile, f"profiles.{name}")
+        _manifest_unknown_fields(
+            profile, PROJECT_MANIFEST_PROFILE_FIELDS, f"profiles.{name}"
+        )
+        base = copy.deepcopy(DEFAULT_PROFILES.get(str(name), {}))
+        base.update(dict(profile))
+        if not isinstance(base.get("toolchain_versions", {}), Mapping):
+            raise BuildValidationError(
+                f"Manifest field profiles.{name}.toolchain_versions must be an object"
+            )
+        if not isinstance(base.get("extra_args", []), (list, tuple)):
+            raise BuildValidationError(
+                f"Manifest field profiles.{name}.extra_args must be an array"
+            )
+        base["extra_args"] = [str(item) for item in base.get("extra_args", [])]
+        base["toolchain_versions"] = {
+            str(key): str(value)
+            for key, value in dict(base.get("toolchain_versions", {})).items()
+        }
+        normalized_profiles[str(name)] = base
+    if not normalized_profiles:
+        normalized_profiles = copy.deepcopy(DEFAULT_PROFILES)
+    normalized["profiles"] = normalized_profiles
+
+    history = source.get("history", normalized["history"])
+    if not isinstance(history, list):
+        raise BuildValidationError("Manifest field history must be an array")
+    normalized_history: list[dict[str, Any]] = []
+    for index, raw_entry in enumerate(history):
+        entry = _manifest_mapping(raw_entry, f"history[{index}]")
+        _manifest_unknown_fields(entry, PROJECT_MANIFEST_HISTORY_FIELDS, f"history[{index}]")
+        normalized_history.append(dict(entry))
+    normalized["history"] = normalized_history
+
+    analytics = _manifest_mapping(
+        source.get("analytics", normalized["analytics"]), "analytics"
+    )
+    _manifest_unknown_fields(analytics, PROJECT_MANIFEST_ANALYTICS_FIELDS, "analytics")
+    normalized["analytics"].update(dict(analytics))
+    if not isinstance(normalized["analytics"]["enabled"], bool):
+        raise BuildValidationError("Manifest field analytics.enabled must be boolean")
+    if not isinstance(normalized["analytics"]["scope"], str):
+        raise BuildValidationError("Manifest field analytics.scope must be a string")
+    if not isinstance(normalized["analytics"]["database"], str):
+        raise BuildValidationError("Manifest field analytics.database must be a string")
+    return normalized
+
+
+def project_manifest_backup_path(path: os.PathLike[str] | str) -> Path:
+    """Return the recoverable backup path for a project manifest."""
+
+    destination = Path(path).expanduser()
+    return destination.with_name(f"{destination.name}.bak")
+
+
+def _atomic_write_bytes(destination: Path, value: bytes) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def save_project_manifest(
+    path: os.PathLike[str] | str, manifest: Mapping[str, Any]
+) -> Path:
+    """Validate and atomically save a manifest, retaining the prior version."""
+
+    destination = Path(path).expanduser()
+    normalized = validate_project_manifest(manifest)
+    if destination.exists():
+        backup = project_manifest_backup_path(destination)
+        backup_temporary = backup.with_name(
+            f".{backup.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            shutil.copy2(destination, backup_temporary)
+            os.replace(backup_temporary, backup)
+        except BaseException:
+            try:
+                backup_temporary.unlink()
+            except OSError:
+                pass
+            raise
+    encoded = json.dumps(normalized, indent=2, sort_keys=True).encode("utf-8")
+    _atomic_write_bytes(destination, encoded)
+    return destination
+
+
+def rollback_project_manifest(path: os.PathLike[str] | str) -> Path:
+    """Restore the last valid manifest backup without deleting the backup."""
+
+    destination = Path(path).expanduser()
+    backup = project_manifest_backup_path(destination)
+    try:
+        candidate = json.loads(backup.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as error:
+        raise BuildValidationError(
+            f"Manifest backup is unavailable or invalid: {backup}"
+        ) from error
+    normalized = validate_project_manifest(candidate)
+    _atomic_write_bytes(
+        destination, json.dumps(normalized, indent=2, sort_keys=True).encode("utf-8")
+    )
+    return destination
+
+
+def _legacy_paths_for_manifest(destination: Path) -> tuple[Path, ...]:
+    return tuple(
+        destination.parent / name
+        for name in ("profiles.yaml", "profiles.yml", "profiles.json", "settings.json", "history.json")
+    )
+
+
+_LEGACY_MANIFEST_KEY_MAP = {
+    "console": "console",
+    "admin": "admin",
+    "singlefile": "single_file",
+    "single_file": "single_file",
+    "backend": "backend",
+    "target": "target",
+    "architecture": "architecture",
+    "version": "version",
+    "company": "company",
+    "copyright": "copyright",
+    "description": "description",
+    "product": "product",
+    "prefetch": "prefetch",
+    "verify": "verify",
+    "cache": "cache",
+    "force": "force",
+    "extraargs": "extra_args",
+    "extra_args": "extra_args",
+    "toolchainversions": "toolchain_versions",
+    "toolchain_versions": "toolchain_versions",
+    "upx": "upx",
+    "timeoutseconds": "timeout_seconds",
+    "timeout_seconds": "timeout_seconds",
+    "maxoutputbytes": "max_output_bytes",
+    "max_output_bytes": "max_output_bytes",
+    "allownetwork": "allow_network",
+    "allow_network": "allow_network",
+    "allowdependencyinstall": "allow_dependency_install",
+    "allow_dependency_install": "allow_dependency_install",
+    "theme": "theme",
+    "postbuildaction": "post_build_action",
+    "post_build_action": "post_build_action",
+    "postbuildcopypath": "post_build_copy_path",
+    "post_build_copy_path": "post_build_copy_path",
+    "shownotifications": "show_notifications",
+    "show_notifications": "show_notifications",
+    "autocheckupdates": "auto_check_updates",
+    "auto_check_updates": "auto_check_updates",
+    "maxrecentfiles": "max_recent_files",
+    "max_recent_files": "max_recent_files",
+    "maxhistoryitems": "max_history_items",
+    "max_history_items": "max_history_items",
+    "defaultprofile": "default_profile",
+    "default_profile": "default_profile",
+}
+
+
+def _normalize_legacy_mapping(
+    value: Mapping[str, Any], allowed: Iterable[str]
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    normalized: dict[str, Any] = {}
+    ignored: list[str] = []
+    allowed_values = set(allowed)
+    allowed_lower = {str(value).lower(): str(value) for value in allowed_values}
+    for raw_key, raw_value in value.items():
+        key_text = str(raw_key)
+        lowered = key_text.lower().replace("-", "")
+        key = _LEGACY_MANIFEST_KEY_MAP.get(
+            lowered, allowed_lower.get(lowered, key_text)
+        )
+        if key in allowed_values:
+            normalized[key] = raw_value
+        else:
+            ignored.append(key_text)
+    return normalized, tuple(ignored)
+
+
+def migrate_project_manifest(
+    destination: os.PathLike[str] | str,
+    legacy_paths: Sequence[os.PathLike[str] | str] | None = None,
+    scope: str = "user",
+) -> ManifestLoadResult:
+    """Import currently supported YAML/JSON state into the canonical schema."""
+
+    destination_path = Path(destination).expanduser()
+    if destination_path.exists():
+        return load_project_manifest(destination_path, expected_scope=scope)
+    manifest = default_project_manifest(scope, destination_path.parent)
+    candidates = tuple(
+        Path(path).expanduser()
+        for path in (legacy_paths or _legacy_paths_for_manifest(destination_path))
+    )
+    sources: list[Path] = []
+    warnings: list[str] = []
+    for source in candidates:
+        if not source.is_file() or source == destination_path:
+            continue
+        try:
+            if source.suffix.lower() in {".yaml", ".yml"}:
+                imported_profiles = load_profiles(source, {})
+                if imported_profiles:
+                    manifest["profiles"] = {
+                        str(name): _normalize_legacy_mapping(
+                            profile, PROJECT_MANIFEST_PROFILE_FIELDS
+                        )[0]
+                        for name, profile in imported_profiles.items()
+                        if isinstance(profile, Mapping)
+                    }
+            else:
+                loaded = json.loads(source.read_text(encoding="utf-8-sig"))
+                if source.name.lower().startswith("profiles") and isinstance(loaded, Mapping):
+                    manifest["profiles"] = {
+                        str(name): _normalize_legacy_mapping(
+                            profile, PROJECT_MANIFEST_PROFILE_FIELDS
+                        )[0]
+                        for name, profile in loaded.items()
+                        if isinstance(profile, Mapping)
+                    }
+                elif source.name.lower().startswith("settings") and isinstance(loaded, Mapping):
+                    imported_settings, _ = _normalize_legacy_mapping(
+                        loaded, PROJECT_MANIFEST_SETTINGS_FIELDS
+                    )
+                    manifest["settings"].update(imported_settings)
+                elif source.name.lower().startswith("history") and isinstance(loaded, list):
+                    manifest["history"] = [
+                        _normalize_legacy_mapping(
+                            entry, PROJECT_MANIFEST_HISTORY_FIELDS
+                        )[0]
+                        for entry in loaded
+                        if isinstance(entry, Mapping)
+                    ]
+                elif isinstance(loaded, Mapping):
+                    candidate = dict(loaded)
+                    if "profiles" in candidate and isinstance(candidate["profiles"], Mapping):
+                        manifest["profiles"] = {
+                            str(name): _normalize_legacy_mapping(
+                                profile, PROJECT_MANIFEST_PROFILE_FIELDS
+                            )[0]
+                            for name, profile in candidate["profiles"].items()
+                            if isinstance(profile, Mapping)
+                        }
+                    if "settings" in candidate and isinstance(candidate["settings"], Mapping):
+                        imported_settings, _ = _normalize_legacy_mapping(
+                            candidate["settings"], PROJECT_MANIFEST_SETTINGS_FIELDS
+                        )
+                        manifest["settings"].update(imported_settings)
+                    if "history" in candidate and isinstance(candidate["history"], list):
+                        manifest["history"] = [
+                            _normalize_legacy_mapping(
+                                entry, PROJECT_MANIFEST_HISTORY_FIELDS
+                            )[0]
+                            for entry in candidate["history"]
+                            if isinstance(entry, Mapping)
+                        ]
+            sources.append(source)
+        except (OSError, ValueError, BuildValidationError) as error:
+            warnings.append(f"Could not import {source.name}: {error}")
+    normalized = validate_project_manifest(manifest, expected_scope=scope)
+    if sources:
+        save_project_manifest(destination_path, normalized)
+        return ManifestLoadResult(
+            normalized,
+            migrated=True,
+            warnings=tuple(warnings),
+            source_paths=tuple(sources),
+        )
+    return ManifestLoadResult(normalized, warnings=tuple(warnings))
+
+
+def load_project_manifest(
+    path: os.PathLike[str] | str,
+    expected_scope: str | None = None,
+    legacy_paths: Sequence[os.PathLike[str] | str] | None = None,
+) -> ManifestLoadResult:
+    """Load a canonical manifest, recovering from backup or importing legacy state."""
+
+    destination = Path(path).expanduser()
+    scope = expected_scope or "user"
+    if destination.is_file():
+        try:
+            loaded = json.loads(destination.read_text(encoding="utf-8-sig"))
+            normalized = validate_project_manifest(loaded, expected_scope=expected_scope)
+            return ManifestLoadResult(normalized)
+        except (OSError, ValueError, BuildValidationError) as error:
+            backup = project_manifest_backup_path(destination)
+            if backup.is_file():
+                try:
+                    backup_loaded = json.loads(backup.read_text(encoding="utf-8-sig"))
+                    recovered = validate_project_manifest(
+                        backup_loaded, expected_scope=expected_scope
+                    )
+                    rollback_project_manifest(destination)
+                    return ManifestLoadResult(
+                        recovered,
+                        recovered=True,
+                        warnings=(f"Recovered invalid manifest from {backup.name}",),
+                        source_paths=(backup,),
+                    )
+                except (OSError, ValueError, BuildValidationError):
+                    pass
+            raise BuildValidationError(
+                f"Could not load project manifest {destination}: {error}"
+            ) from error
+    return migrate_project_manifest(destination, legacy_paths, scope=scope)
 
 
 def sha256_file(path: os.PathLike[str] | str, chunk_size: int = 1024 * 1024) -> str:
@@ -2518,7 +3042,7 @@ def verify_artifact_manifest(
 
     manifest_path = Path(path).expanduser()
     try:
-        with manifest_path.open("r", encoding="utf-8") as handle:
+        with manifest_path.open("r", encoding="utf-8-sig") as handle:
             manifest = json.load(handle)
     except (OSError, ValueError) as error:
         return VerificationResult(False, "manifest", f"Could not read artifact manifest: {error}")
@@ -3045,6 +3569,10 @@ def _profile_request(
 def _add_build_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", "-o", help="Output executable or artifact path")
     parser.add_argument(
+        "--manifest",
+        help="Versioned project manifest supplying settings and profiles",
+    )
+    parser.add_argument(
         "--profile", default="Default", help="Profile name from profiles.yaml"
     )
     parser.add_argument("--profiles-file", help="Path to a YAML profiles file")
@@ -3166,6 +3694,22 @@ def create_cli_parser() -> argparse.ArgumentParser:
         help="Destination, defaulting to the per-user config directory",
     )
 
+    manifest_parser = subparsers.add_parser(
+        "manifest", help="Show, initialize, migrate, or roll back project state"
+    )
+    manifest_parser.add_argument(
+        "action",
+        nargs="?",
+        choices=("show", "init", "migrate", "rollback"),
+        default="show",
+    )
+    manifest_parser.add_argument("--path")
+    manifest_parser.add_argument(
+        "--scope", choices=("user", "workspace"), default="user"
+    )
+    manifest_parser.add_argument("--workspace")
+    manifest_parser.add_argument("--json", action="store_true")
+
     actions_parser = subparsers.add_parser(
         "init-actions", help="Create a GitHub Actions workflow for a source type"
     )
@@ -3253,6 +3797,47 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                 for key, item in status_value.items()
             )
         )
+        return 0
+    if args.command == "manifest":
+        destination = (
+            Path(args.path).expanduser()
+            if args.path
+            else project_manifest_path(args.scope, args.workspace)
+        )
+        try:
+            if args.action == "init":
+                manifest_result = ManifestLoadResult(
+                    validate_project_manifest(
+                        default_project_manifest(args.scope, args.workspace),
+                        expected_scope=args.scope,
+                    )
+                )
+                save_project_manifest(destination, manifest_result.manifest)
+            elif args.action == "rollback":
+                rollback_project_manifest(destination)
+                manifest_result = load_project_manifest(
+                    destination, expected_scope=args.scope
+                )
+            else:
+                manifest_result = load_project_manifest(
+                    destination,
+                    expected_scope=args.scope if args.path is None else None,
+                )
+        except (BuildValidationError, OSError, ValueError) as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+        for warning in manifest_result.warnings:
+            print(f"WARNING: {warning}", file=sys.stderr)
+        if args.json:
+            print(json.dumps(manifest_result.manifest, indent=2, default=str))
+        else:
+            print(destination)
+            print(
+                f"schema={manifest_result.manifest['schema_version']} "
+                f"scope={manifest_result.manifest['scope']} "
+                f"migrated={manifest_result.migrated} "
+                f"recovered={manifest_result.recovered}"
+            )
         return 0
     if args.command == "init-profiles":
         destination = Path(args.path).expanduser() if args.path else profiles_path()
@@ -3348,7 +3933,19 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         if getattr(args, "profiles_file", None)
         else profiles_path()
     )
-    profiles = load_profiles(profile_file)
+    try:
+        if getattr(args, "manifest", None):
+            manifest_result = load_project_manifest(
+                Path(args.manifest).expanduser()
+            )
+            profiles = manifest_result.manifest["profiles"]
+            for warning in manifest_result.warnings:
+                print(f"WARNING: {warning}", file=sys.stderr)
+        else:
+            profiles = load_profiles(profile_file)
+    except (BuildValidationError, OSError, ValueError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
     profile = profiles.get(args.profile)
     if profile is None:
         parser.error(f"Profile not found: {args.profile}")
@@ -3466,11 +4063,13 @@ __all__ = [
     "CAPABILITY_SCHEMA_VERSION",
     "CommandResult",
     "CompilerEngine",
+    "DEFAULT_MANIFEST_SETTINGS",
     "DEFAULT_PROFILES",
     "DEFAULT_EXECUTION_TIMEOUT_SECONDS",
     "DEFAULT_MAX_OUTPUT_BYTES",
     "ExecutionPolicy",
     "EXTENSION_BACKENDS",
+    "ManifestLoadResult",
     "VerificationResult",
     "backend_status",
     "artifact_manifest_path",
@@ -3485,17 +4084,28 @@ __all__ = [
     "github_actions_template",
     "obfuscate_source",
     "load_json",
+    "load_project_manifest",
     "load_profiles",
+    "default_project_manifest",
+    "migrate_project_manifest",
+    "project_manifest_backup_path",
+    "project_manifest_path",
     "profiles_path",
     "parse_toolchain_versions",
     "run_command",
+    "PROJECT_MANIFEST_FILENAME",
+    "PROJECT_MANIFEST_KIND",
+    "PROJECT_MANIFEST_SCHEMA_VERSION",
     "REQUEST_SCHEMA_VERSION",
     "redact_command",
     "redact_text",
     "RESULT_SCHEMA_VERSION",
     "save_json",
+    "save_project_manifest",
     "save_profiles",
     "sha256_file",
+    "rollback_project_manifest",
+    "validate_project_manifest",
     "verify_artifact_manifest",
     "verify_artifact",
     "wrap_msix",

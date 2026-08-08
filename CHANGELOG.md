@@ -39,6 +39,9 @@ All notable changes to UniversalCompiler will be documented in this file.
   opt-in obfuscator command support.
 - Add platform/architecture target mapping for Go, Rust, Bun, Deno, and pkg
   cross-build plans.
+- Add a versioned `uc.project.v1` manifest with strict validation, explicit
+  user/workspace scopes, legacy YAML/JSON migration, atomic backups, rollback,
+  and recovery support across the CLI and GUI shells.
 
 ## [v0.1.0] - %Y->- (HEAD -> main, origin/main, origin/HEAD)
 

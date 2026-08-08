@@ -25,6 +25,7 @@ from compiler_core import (
     CommandResult,
     CompilerEngine,
     ExecutionPolicy,
+    PROJECT_MANIFEST_SCHEMA_VERSION,
     REQUEST_SCHEMA_VERSION,
     RESULT_SCHEMA_VERSION,
     cli_main,
@@ -33,8 +34,15 @@ from compiler_core import (
     format_size,
     github_actions_template,
     load_profiles,
+    load_project_manifest,
+    default_project_manifest,
+    project_manifest_backup_path,
+    project_manifest_path,
+    rollback_project_manifest,
     run_command,
     save_profiles,
+    save_project_manifest,
+    validate_project_manifest,
     verify_artifact_manifest,
     verify_artifact,
     wrap_msix,
@@ -185,6 +193,96 @@ def test_profiles_round_trip_without_extra_dependency(tmp_path: Path) -> None:
     assert loaded["Release Profile"]["console"] is True
     assert loaded["Default"]["single_file"] is True
     assert loaded["Pinned Profile"]["toolchain_versions"]["pyinstaller"] == "6.20.0"
+
+
+def test_project_manifest_migrates_legacy_yaml_json_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    profiles = tmp_path / "profiles.yaml"
+    profiles.write_text(
+        "Default:\n  Console: true\n  SingleFile: true\n  Backend: pyinstaller\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"Theme": "Light", "MaxHistoryItems": 7}), encoding="utf-8"
+    )
+    (tmp_path / "history.json").write_text(
+        json.dumps(
+            [
+                {
+                    "Timestamp": "2026-08-08T00:00:00Z",
+                    "Source": "main.py",
+                    "Output": "main.exe",
+                    "Type": "py",
+                    "Success": True,
+                    "Profile": "Default",
+                    "Size": 42,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "universal-compiler.json"
+
+    first = load_project_manifest(manifest_path, expected_scope="user")
+    second = load_project_manifest(manifest_path, expected_scope="user")
+
+    assert first.migrated is True
+    assert second.migrated is False
+    assert first.manifest["schema_version"] == PROJECT_MANIFEST_SCHEMA_VERSION
+    assert first.manifest["profiles"]["Default"]["console"] is True
+    assert first.manifest["settings"]["theme"] == "Light"
+    assert first.manifest["settings"]["max_history_items"] == 7
+    assert first.manifest["history"][0]["source"] == "main.py"
+    assert second.manifest == first.manifest
+
+
+def test_project_manifest_strict_validation_scopes_and_forward_error(
+    tmp_path: Path,
+) -> None:
+    manifest = default_project_manifest("workspace", tmp_path)
+    assert project_manifest_path("workspace", tmp_path).parent == tmp_path
+    assert validate_project_manifest(manifest, expected_scope="workspace")["scope"] == "workspace"
+
+    unknown = dict(manifest)
+    unknown["future_field"] = True
+    with pytest.raises(BuildValidationError, match="Unknown manifest field"):
+        validate_project_manifest(unknown)
+
+    future = dict(manifest)
+    future["schema_version"] = "uc.project.v99"
+    with pytest.raises(BuildValidationError, match="Forward-incompatible"):
+        validate_project_manifest(future)
+
+
+def test_project_manifest_backup_recovery_and_rollback(tmp_path: Path) -> None:
+    path = tmp_path / "universal-compiler.json"
+    original = default_project_manifest("user")
+    save_project_manifest(path, original)
+    updated = default_project_manifest("user")
+    updated["settings"]["theme"] = "Light"
+    save_project_manifest(path, updated)
+
+    backup = project_manifest_backup_path(path)
+    assert backup.is_file()
+    path.write_text("{ invalid", encoding="utf-8")
+    recovered = load_project_manifest(path, expected_scope="user")
+    assert recovered.recovered is True
+    assert recovered.manifest["settings"]["theme"] == "Dark"
+
+    rollback_project_manifest(path)
+    rolled_back = load_project_manifest(path, expected_scope="user")
+    assert rolled_back.manifest["settings"]["theme"] == "Dark"
+
+
+def test_manifest_cli_init_and_show(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = tmp_path / "project.json"
+    assert cli_main(["manifest", "init", "--path", str(path), "--json"]) == 0
+    capsys.readouterr()
+    assert cli_main(["manifest", "show", "--path", str(path), "--json"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["schema_version"] == PROJECT_MANIFEST_SCHEMA_VERSION
+    assert shown["profiles"]["Default"]["backend"] == "auto"
 
 
 def test_static_artifact_verification(tmp_path: Path) -> None:

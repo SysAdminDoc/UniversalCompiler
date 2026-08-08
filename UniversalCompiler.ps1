@@ -17,6 +17,7 @@ $script:AppName = "Universal Compiler"
 $script:AppVersion = "2.1.0"
 $script:ConfigDir = Join-Path $env:APPDATA "UniversalCompiler"
 $script:ConfigFile = Join-Path $script:ConfigDir "config.json"
+$script:ManifestFile = Join-Path $script:ConfigDir "universal-compiler.json"
 $script:ProfilesFile = Join-Path $script:ConfigDir "profiles.json"
 $script:HistoryFile = Join-Path $script:ConfigDir "history.json"
 $script:RecentFile = Join-Path $script:ConfigDir "recent.json"
@@ -156,6 +157,89 @@ function Get-CoreCapabilities {
     try { return ($processResult.Output | ConvertFrom-Json -ErrorAction Stop) } catch { return @{} }
 }
 
+function New-CanonicalManifest {
+    return [ordered]@{
+        schema_version = 'uc.project.v1'
+        kind = 'universal-compiler.project'
+        scope = 'user'
+        workspace = [ordered]@{ root = $null; name = $null }
+        settings = [ordered]@{}
+        profiles = [ordered]@{}
+        history = @()
+        analytics = [ordered]@{ enabled = $true; scope = 'user'; database = 'analytics.sqlite3' }
+    }
+}
+
+function Read-CanonicalManifest {
+    if (-not (Test-Path -LiteralPath $script:ManifestFile)) { return $null }
+    try {
+        $manifest = Get-Content -LiteralPath $script:ManifestFile -Raw | ConvertFrom-Json -ErrorAction Stop
+        $allowed = @('schema_version','kind','scope','workspace','settings','profiles','history','analytics')
+        foreach ($property in $manifest.PSObject.Properties) { if ($allowed -notcontains $property.Name) { throw "Unknown manifest field: $($property.Name)" } }
+        if ($manifest.schema_version -ne 'uc.project.v1') { throw "Unsupported project manifest schema: $($manifest.schema_version)" }
+        if ($manifest.kind -ne 'universal-compiler.project') { throw "Unsupported project manifest kind: $($manifest.kind)" }
+        if ($manifest.scope -ne 'user' -and $manifest.scope -ne 'workspace') { throw "Invalid project manifest scope: $($manifest.scope)" }
+        return $manifest
+    } catch {
+        $backup = "$($script:ManifestFile).bak"
+        if (Test-Path -LiteralPath $backup) {
+            try {
+                $candidate = Get-Content -LiteralPath $backup -Raw | ConvertFrom-Json -ErrorAction Stop
+                if ($candidate.schema_version -eq 'uc.project.v1' -and $candidate.kind -eq 'universal-compiler.project' -and ($candidate.scope -eq 'user' -or $candidate.scope -eq 'workspace')) {
+                    $restoreTemp = "$($script:ManifestFile).$PID.restore.tmp"
+                    Copy-Item -LiteralPath $backup -Destination $restoreTemp -Force
+                    Move-Item -LiteralPath $restoreTemp -Destination $script:ManifestFile -Force
+                    return $candidate
+                }
+            } catch { }
+        }
+        throw
+    }
+}
+
+function Get-CanonicalManifestForUpdate {
+    $manifest = $null
+    try { $manifest = Read-CanonicalManifest } catch { $manifest = $null }
+    if (-not $manifest) { $manifest = New-CanonicalManifest }
+    if (-not $manifest.settings) { $manifest.settings = [ordered]@{} }
+    if (-not $manifest.profiles) { $manifest.profiles = [ordered]@{} }
+    if (-not $manifest.history) { $manifest.history = @() }
+    $profileCount = @(Get-ObjectEntries $manifest.profiles).Count
+    if ($profileCount -eq 0 -and (Test-Path -LiteralPath $script:ProfilesFile)) {
+        try { $manifest.profiles = ConvertTo-CanonicalProfiles (Get-Content -LiteralPath $script:ProfilesFile -Raw | ConvertFrom-Json -ErrorAction Stop) } catch { }
+    }
+    if ((@(Get-ObjectEntries $manifest.settings).Count -eq 0) -and (Test-Path -LiteralPath $script:SettingsFile)) {
+        try { $manifest.settings = ConvertTo-CanonicalSettings (Get-Content -LiteralPath $script:SettingsFile -Raw | ConvertFrom-Json -ErrorAction Stop) } catch { }
+    }
+    if ((@($manifest.history).Count -eq 0) -and (Test-Path -LiteralPath $script:HistoryFile)) {
+        try { $manifest.history = ConvertTo-CanonicalHistory (Get-Content -LiteralPath $script:HistoryFile -Raw | ConvertFrom-Json -ErrorAction Stop) } catch { }
+    }
+    return $manifest
+}
+
+function Save-CanonicalManifest {
+    param([Parameter(Mandatory)]$Manifest)
+    if ($Manifest.schema_version -ne 'uc.project.v1' -or $Manifest.kind -ne 'universal-compiler.project') { throw 'Cannot save an invalid project manifest' }
+    if (Test-Path -LiteralPath $script:ManifestFile) {
+        $backupTemp = "$($script:ManifestFile).$PID.backup.tmp"
+        Copy-Item -LiteralPath $script:ManifestFile -Destination $backupTemp -Force
+        Move-Item -LiteralPath $backupTemp -Destination "$($script:ManifestFile).bak" -Force
+    }
+    $temporary = "$($script:ManifestFile).$PID.tmp"
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($temporary, ($Manifest | ConvertTo-Json -Depth 8), $utf8)
+    Move-Item -LiteralPath $temporary -Destination $script:ManifestFile -Force
+}
+
+function Restore-CanonicalManifest {
+    $backup = "$($script:ManifestFile).bak"
+    if (-not (Test-Path -LiteralPath $backup)) { throw 'Project manifest backup is unavailable' }
+    $temporary = "$($script:ManifestFile).$PID.restore.tmp"
+    Copy-Item -LiteralPath $backup -Destination $temporary -Force
+    Move-Item -LiteralPath $temporary -Destination $script:ManifestFile -Force
+    return Read-CanonicalManifest
+}
+
 function Get-PreferredCapability {
     param([Parameter(Mandatory)][string]$Extension)
     if ($null -eq $script:CoreCapabilities) { $script:CoreCapabilities = Get-CoreCapabilities }
@@ -179,8 +263,78 @@ if (-not (Test-Path $script:ConfigDir)) { New-Item -ItemType Directory -Path $sc
 
 $script:DefaultSettings = @{ Theme = 'Dark'; PostBuildAction = 'None'; PostBuildCopyPath = ''; ShowNotifications = $true; AutoCheckUpdates = $true; MaxRecentFiles = 10; MaxHistoryItems = 50; DefaultProfile = 'Default' }
 
-function Get-AppSettings { if (Test-Path $script:SettingsFile) { try { $loaded = Get-Content $script:SettingsFile -Raw | ConvertFrom-Json; $s = $script:DefaultSettings.Clone(); foreach ($p in $loaded.PSObject.Properties) { if ($s.ContainsKey($p.Name)) { $s[$p.Name] = $p.Value } }; return $s } catch { } }; return $script:DefaultSettings.Clone() }
-function Save-AppSettings { param([hashtable]$S); $S | ConvertTo-Json -Depth 3 | Set-Content -Path $script:SettingsFile -Force }
+function Get-ObjectEntries {
+    param($Value)
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [System.Collections.IDictionary]) {
+        return @($Value.GetEnumerator() | ForEach-Object {
+            [pscustomobject]@{ Name = [string]$_.Key; Value = $_.Value }
+        })
+    }
+    return @($Value.PSObject.Properties | ForEach-Object {
+        [pscustomobject]@{ Name = $_.Name; Value = $_.Value }
+    })
+}
+
+function ConvertTo-CanonicalSettings {
+    param($Value)
+    $map = @{ Theme='theme'; PostBuildAction='post_build_action'; PostBuildCopyPath='post_build_copy_path'; ShowNotifications='show_notifications'; AutoCheckUpdates='auto_check_updates'; MaxRecentFiles='max_recent_files'; MaxHistoryItems='max_history_items'; DefaultProfile='default_profile' }
+    $result = [ordered]@{}
+    foreach ($property in Get-ObjectEntries $Value) { if ($map.ContainsKey($property.Name)) { $result[$map[$property.Name]] = $property.Value } }
+    return $result
+}
+
+function ConvertFrom-CanonicalSettings {
+    param($Value)
+    $map = @{ theme='Theme'; post_build_action='PostBuildAction'; post_build_copy_path='PostBuildCopyPath'; show_notifications='ShowNotifications'; auto_check_updates='AutoCheckUpdates'; max_recent_files='MaxRecentFiles'; max_history_items='MaxHistoryItems'; default_profile='DefaultProfile' }
+    $result = @{}
+    foreach ($property in Get-ObjectEntries $Value) { if ($map.ContainsKey($property.Name)) { $result[$map[$property.Name]] = $property.Value } }
+    return $result
+}
+
+function ConvertTo-CanonicalProfiles {
+    param($Value)
+    $map = @{ Console='console'; Admin='admin'; SingleFile='single_file'; Backend='backend'; Target='target'; Architecture='architecture'; Version='version'; Company='company'; Copyright='copyright'; Description='description'; Product='product'; Prefetch='prefetch'; Verify='verify'; Cache='cache'; Force='force'; ExtraArgs='extra_args'; ToolchainVersions='toolchain_versions'; Upx='upx'; TimeoutSeconds='timeout_seconds'; MaxOutputBytes='max_output_bytes'; AllowNetwork='allow_network'; AllowDependencyInstall='allow_dependency_install' }
+    $result = [ordered]@{}
+    foreach ($profile in Get-ObjectEntries $Value) {
+        $entry = [ordered]@{}
+        foreach ($property in Get-ObjectEntries $profile.Value) { if ($map.ContainsKey($property.Name)) { $entry[$map[$property.Name]] = $property.Value } }
+        $result[$profile.Name] = $entry
+    }
+    return $result
+}
+
+function ConvertFrom-CanonicalProfiles {
+    param($Value)
+    $map = @{ console='Console'; admin='Admin'; single_file='SingleFile'; backend='Backend'; target='Target'; architecture='Architecture'; version='Version'; company='Company'; copyright='Copyright'; description='Description'; product='Product'; prefetch='Prefetch'; verify='Verify'; cache='Cache'; force='Force'; extra_args='ExtraArgs'; toolchain_versions='ToolchainVersions'; upx='Upx'; timeout_seconds='TimeoutSeconds'; max_output_bytes='MaxOutputBytes'; allow_network='AllowNetwork'; allow_dependency_install='AllowDependencyInstall' }
+    $result = @{}
+    foreach ($profile in Get-ObjectEntries $Value) {
+        $entry = @{}
+        foreach ($property in Get-ObjectEntries $profile.Value) { if ($map.ContainsKey($property.Name)) { $entry[$map[$property.Name]] = $property.Value } }
+        $result[$profile.Name] = $entry
+    }
+    return $result
+}
+
+function ConvertTo-CanonicalHistory {
+    param($Value)
+    $map = @{ Timestamp='timestamp'; Source='source'; Output='output'; Type='type'; Success='success'; Profile='profile'; Size='size'; Backend='backend'; Message='message'; Manifest='manifest' }
+    $result = @()
+    foreach ($entry in @($Value)) {
+        $normalized = [ordered]@{}
+        foreach ($property in Get-ObjectEntries $entry) { if ($map.ContainsKey($property.Name)) { $normalized[$map[$property.Name]] = $property.Value } }
+        $result += $normalized
+    }
+    Write-Output -NoEnumerate $result
+}
+
+function Get-AppSettings {
+    $s = $script:DefaultSettings.Clone()
+    try { $loaded = ConvertFrom-CanonicalSettings (Read-CanonicalManifest).settings } catch { if (Test-Path $script:SettingsFile) { try { $loaded = Get-Content $script:SettingsFile -Raw | ConvertFrom-Json } catch { $loaded = $null } } }
+    if ($loaded) { foreach ($p in Get-ObjectEntries $loaded) { if ($s.ContainsKey($p.Name)) { $s[$p.Name] = $p.Value } } }
+    return $s
+}
+function Save-AppSettings { param([hashtable]$S); $manifest = Get-CanonicalManifestForUpdate; $manifest.settings = ConvertTo-CanonicalSettings $S; Save-CanonicalManifest $manifest }
 
 $script:Settings = Get-AppSettings
 
@@ -203,12 +357,18 @@ $script:DefaultProfiles = @{
     'GUI Application' = @{ Console=$false; Admin=$false; SingleFile=$true; Version='1.0.0.0'; Company=''; Copyright=''; Description=''; Product='' }
 }
 
-function Get-BuildProfiles { if (Test-Path $script:ProfilesFile) { try { $l = Get-Content $script:ProfilesFile -Raw | ConvertFrom-Json; $p = @{}; foreach ($prop in $l.PSObject.Properties) { $p[$prop.Name] = @{}; foreach ($sp in $prop.Value.PSObject.Properties) { $p[$prop.Name][$sp.Name] = $sp.Value } }; foreach ($k in $script:DefaultProfiles.Keys) { if (-not $p.ContainsKey($k)) { $p[$k] = $script:DefaultProfiles[$k] } }; return $p } catch { } }; return $script:DefaultProfiles.Clone() }
-function Save-BuildProfiles { param([hashtable]$P); $P | ConvertTo-Json -Depth 3 | Set-Content -Path $script:ProfilesFile -Force }
+function Get-BuildProfiles {
+    $p = @{}
+    try { $loaded = ConvertFrom-CanonicalProfiles (Read-CanonicalManifest).profiles } catch { if (Test-Path $script:ProfilesFile) { try { $loaded = ConvertFrom-CanonicalProfiles (Get-Content $script:ProfilesFile -Raw | ConvertFrom-Json) } catch { $loaded = $null } } }
+    if ($loaded) { foreach ($prop in $loaded.Keys) { $p[$prop] = $loaded[$prop] } }
+    foreach ($k in $script:DefaultProfiles.Keys) { if (-not $p.ContainsKey($k)) { $p[$k] = $script:DefaultProfiles[$k] } }
+    return $p
+}
+function Save-BuildProfiles { param([hashtable]$P); $manifest = Get-CanonicalManifestForUpdate; $manifest.profiles = ConvertTo-CanonicalProfiles $P; Save-CanonicalManifest $manifest }
 function Save-BuildProfile { param([string]$N, [hashtable]$P); $profiles = Get-BuildProfiles; $profiles[$N] = $P; Save-BuildProfiles $profiles }
 
-function Get-CompilationHistory { if (Test-Path $script:HistoryFile) { try { return @(Get-Content $script:HistoryFile -Raw | ConvertFrom-Json) } catch { } }; return @() }
-function Add-CompilationHistory { param([string]$Src, [string]$Out, [string]$Type, [bool]$Success, [string]$Prof, [long]$Size); $h = @(Get-CompilationHistory); $e = @{ Timestamp=(Get-Date).ToString("o"); Source=$Src; Output=$Out; Type=$Type; Success=$Success; Profile=$Prof; Size=$Size }; $h = @($e) + $h | Select-Object -First $script:Settings.MaxHistoryItems; $h | ConvertTo-Json -Depth 3 | Set-Content -Path $script:HistoryFile -Force }
+function Get-CompilationHistory { try { return @((Read-CanonicalManifest).history) } catch { if (Test-Path $script:HistoryFile) { try { return @(Get-Content $script:HistoryFile -Raw | ConvertFrom-Json) } catch { } } }; return @() }
+function Add-CompilationHistory { param([string]$Src, [string]$Out, [string]$Type, [bool]$Success, [string]$Prof, [long]$Size); $h = @(Get-CompilationHistory); $e = @{ Timestamp=(Get-Date).ToString("o"); Source=$Src; Output=$Out; Type=$Type; Success=$Success; Profile=$Prof; Size=$Size }; $h = @($e) + $h | Select-Object -First $script:Settings.MaxHistoryItems; $manifest = Get-CanonicalManifestForUpdate; $manifest.history = ConvertTo-CanonicalHistory $h; Save-CanonicalManifest $manifest }
 
 # ============================================================================
 # NOTIFICATIONS & UTILITIES
