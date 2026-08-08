@@ -48,6 +48,9 @@ All notable changes to UniversalCompiler will be documented in this file.
 - Add a pinned Windows CI contract gate with isolated temporary-root cleanup,
   full backend planning coverage, artifact/migration/cancellation tests, and
   lint/type checks; generated workflow actions now use commit SHAs.
+- Add a local `release` dry-run and verification command that emits unsigned
+  artifacts, SHA-256 checksums, CycloneDX SBOM data, SLSA-shaped provenance,
+  and a static verification report without credentials or publishing.
 
 ## [v0.1.0] - %Y->- (HEAD -> main, origin/main, origin/HEAD)
 

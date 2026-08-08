@@ -177,6 +177,10 @@ python .\UniversalCompiler.py obfuscate .\myscript.py --method pyarmor --output 
 # Generate a language-specific workflow template
 python .\UniversalCompiler.py init-actions --language py
 
+# Create and verify a local unsigned release evidence bundle
+python .\UniversalCompiler.py release --artifact .\dist\myscript.exe --output-dir .\release --source-root . --json
+python .\UniversalCompiler.py release verify --path .\release --json
+
 # Initialize, inspect, migrate, or recover canonical project state
 python .\UniversalCompiler.py manifest init --scope user --json
 python .\UniversalCompiler.py manifest show --path .\universal-compiler.json --json
@@ -223,6 +227,12 @@ warnings, and explicit unsigned status. `verify` checks both artifact structure
 and that sidecar when it is present.
 MSIX/APPX output is deliberately unsigned and is intended for packaging or
 internal testing only.
+
+`release` is a local dry-run evidence command. It copies selected artifacts,
+rewrites copied sidecars to their bundle paths, emits `SHA256SUMS`, a CycloneDX
+JSON SBOM, SLSA-shaped provenance metadata, an unsigned release manifest, and
+a static verification report. `release verify` rechecks those hashes and
+artifact structures. It never signs, publishes, uploads, or needs credentials.
 
 The optional `vscode-extension/` package adds a **Universal Compiler: Build
 Active File** command. Point its `universalCompiler.scriptPath` setting at the

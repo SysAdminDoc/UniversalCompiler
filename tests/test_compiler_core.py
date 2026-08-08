@@ -43,6 +43,7 @@ from compiler_core import (
     default_project_manifest,
     project_manifest_backup_path,
     project_manifest_path,
+    release_bundle,
     rollback_project_manifest,
     run_command,
     save_profiles,
@@ -50,6 +51,7 @@ from compiler_core import (
     validate_project_manifest,
     verify_artifact_manifest,
     verify_artifact,
+    verify_release_bundle,
     wrap_msix,
 )
 
@@ -415,6 +417,33 @@ def test_static_artifact_verification(tmp_path: Path) -> None:
 
     artifact.write_bytes(b"not an executable")
     assert verify_artifact(artifact).passed is False
+
+
+def test_release_dry_run_emits_hashes_sbom_provenance_and_report(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "sample.exe"
+    _fake_pe(artifact)
+    source = tmp_path / "source.py"
+    source.write_text("print('release')\n", encoding="utf-8")
+    destination = tmp_path / "release"
+
+    result = release_bundle(
+        [artifact], destination, source_root=tmp_path, version="2.1.0"
+    )
+
+    assert result["passed"] is True
+    assert result["manifest"]["unsigned"] is True
+    assert (destination / "SHA256SUMS").is_file()
+    sbom = json.loads((destination / "sbom.cdx.json").read_text(encoding="utf-8"))
+    provenance = json.loads(
+        (destination / "provenance.json").read_text(encoding="utf-8")
+    )
+    assert sbom["bomFormat"] == "CycloneDX"
+    assert any(component["name"] == "sample.exe" for component in sbom["components"])
+    assert provenance["invocation"]["dry_run"] is True
+    assert provenance["invocation"]["unsigned"] is True
+    assert verify_release_bundle(destination)["passed"] is True
 
 
 def test_wasm_structure_verification_checks_version_and_sections(tmp_path: Path) -> None:

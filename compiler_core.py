@@ -17,6 +17,7 @@ import json
 import math
 import os
 import py_compile
+import platform
 import re
 import shlex
 import shutil
@@ -48,6 +49,10 @@ DEPENDENCY_LOCK_SCHEMA_VERSION = "uc.dependencies.v1"
 DEPENDENCY_LOCK_KIND = "universal-compiler.dependencies"
 DEPENDENCY_LOCK_FILENAME = "universal-compiler.lock.json"
 DEPENDENCY_POLICY_VERSION = "uc.dependency-policy.v1"
+RELEASE_SCHEMA_VERSION = "uc.release.v1"
+RELEASE_KIND = "universal-compiler.release"
+SBOM_SCHEMA_VERSION = "uc.sbom.v1"
+PROVENANCE_SCHEMA_VERSION = "uc.provenance.v1"
 
 
 DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
@@ -3520,6 +3525,271 @@ def verify_artifact(path: os.PathLike[str] | str) -> VerificationResult:
     return structure
 
 
+def _release_source_materials(
+    source_root: Path, excluded_root: Path | None = None
+) -> list[dict[str, Any]]:
+    if not source_root.is_dir():
+        raise BuildValidationError(f"Release source root is not a directory: {source_root}")
+    excluded = excluded_root.resolve() if excluded_root else None
+    ignored_parts = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+    materials: list[dict[str, Any]] = []
+    for candidate in sorted(source_root.rglob("*")):
+        if not candidate.is_file() or any(part in ignored_parts for part in candidate.parts):
+            continue
+        resolved = candidate.resolve()
+        if excluded and _path_is_within(resolved, excluded):
+            continue
+        relative = candidate.relative_to(source_root).as_posix()
+        materials.append(
+            {
+                "uri": f"workspace:{relative}",
+                "digest": {"sha256": sha256_file(candidate)},
+                "size_bytes": candidate.stat().st_size,
+            }
+        )
+        if len(materials) > 8192:
+            raise BuildValidationError("Release source root contains too many files")
+    return materials
+
+
+def _release_file_record(path: Path, kind: str) -> dict[str, Any]:
+    return {
+        "name": path.name,
+        "kind": kind,
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def release_bundle(
+    artifacts: Sequence[os.PathLike[str] | str],
+    output_dir: os.PathLike[str] | str,
+    source_root: os.PathLike[str] | str | None = None,
+    version: str = APP_VERSION,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Create unsigned local release evidence without publishing or signing."""
+
+    if not artifacts:
+        raise BuildValidationError("Release requires at least one --artifact")
+    release_version = str(version).strip()
+    if not release_version:
+        raise BuildValidationError("Release version must not be empty")
+    inputs = [Path(value).expanduser().resolve() for value in artifacts]
+    names = [path.name for path in inputs]
+    if len(set(names)) != len(names):
+        raise BuildValidationError("Release artifacts must have unique file names")
+    for path in inputs:
+        if not path.is_file():
+            raise BuildValidationError(f"Release artifact not found: {path}")
+
+    destination = Path(output_dir).expanduser().resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    artifact_records: list[dict[str, Any]] = []
+    verification_records: list[dict[str, Any]] = []
+    copied_files: list[Path] = []
+    for input_path in inputs:
+        input_verification = verify_artifact(input_path)
+        target = destination / input_path.name
+        if input_path != target:
+            shutil.copy2(input_path, target)
+        else:
+            target = input_path
+        copied_files.append(target)
+        sidecar = artifact_manifest_path(input_path)
+        target_sidecar = artifact_manifest_path(target)
+        if sidecar.is_file():
+            try:
+                sidecar_value = json.loads(sidecar.read_text(encoding="utf-8-sig"))
+                if isinstance(sidecar_value, Mapping):
+                    sidecar_value = copy.deepcopy(dict(sidecar_value))
+                    artifact_value = dict(sidecar_value.get("artifact", {}))
+                    artifact_value["path"] = str(target)
+                    sidecar_value["artifact"] = artifact_value
+                    save_json(target_sidecar, sidecar_value)
+                else:
+                    shutil.copy2(sidecar, target_sidecar)
+            except (OSError, ValueError, TypeError):
+                shutil.copy2(sidecar, target_sidecar)
+            copied_files.append(target_sidecar)
+        bundle_verification = verify_artifact(target)
+        artifact_records.append(
+            {
+                "name": target.name,
+                "sha256": sha256_file(target),
+                "size_bytes": target.stat().st_size,
+                "verification": asdict(bundle_verification),
+                "unsigned": True,
+            }
+        )
+        verification_records.append(
+            {
+                "artifact": target.name,
+                "input": asdict(input_verification),
+                "bundle": asdict(bundle_verification),
+                "passed": input_verification.passed and bundle_verification.passed,
+            }
+        )
+
+    report_path = destination / "verification-report.json"
+    report = {
+        "schema_version": RELEASE_SCHEMA_VERSION,
+        "kind": "universal-compiler.verification-report",
+        "passed": all(record["passed"] for record in verification_records),
+        "artifacts": verification_records,
+    }
+    save_json(report_path, report)
+
+    release_files = [path for path in copied_files if path.is_file()]
+    sbom_components = [
+        {
+            "type": "file",
+            "name": path.name,
+            "hashes": [{"alg": "SHA-256", "content": sha256_file(path)}],
+        }
+        for path in release_files
+    ]
+    sbom_path = destination / "sbom.cdx.json"
+    sbom = {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "serialNumber": f"urn:uuid:{_canonical_hash([item['name'] for item in artifact_records])[:32]}",
+        "version": 1,
+        "schema_version": SBOM_SCHEMA_VERSION,
+        "metadata": {
+            "component": {
+                "type": "application",
+                "name": APP_NAME,
+                "version": release_version,
+            }
+        },
+        "components": sbom_components,
+    }
+    save_json(sbom_path, sbom)
+
+    root = Path(source_root).expanduser().resolve() if source_root else None
+    materials = _release_source_materials(root, destination) if root else []
+    for record in artifact_records:
+        materials.append(
+            {
+                "uri": f"artifact:{record['name']}",
+                "digest": {"sha256": record["sha256"]},
+            }
+        )
+    provenance_path = destination / "provenance.json"
+    provenance = {
+        "schema_version": PROVENANCE_SCHEMA_VERSION,
+        "kind": "https://slsa.dev/provenance/v1",
+        "build_type": "universal-compiler.release-dry-run.v1",
+        "builder": {
+            "name": APP_NAME,
+            "version": APP_VERSION,
+            "python": platform.python_version(),
+            "platform": sys.platform,
+        },
+        "invocation": {
+            "version": release_version,
+            "dry_run": bool(dry_run),
+            "unsigned": True,
+            "artifacts": [record["name"] for record in artifact_records],
+        },
+        "metadata": {
+            "repository_revision": os.environ.get("GITHUB_SHA"),
+            "source_digest": _canonical_hash(materials) if materials else None,
+        },
+        "materials": materials,
+    }
+    save_json(provenance_path, provenance)
+
+    checksummed = release_files + [report_path, sbom_path, provenance_path]
+    checksum_path = destination / "SHA256SUMS"
+    checksum_path.write_text(
+        "".join(f"{sha256_file(path)}  {path.name}\n" for path in sorted(checksummed, key=lambda item: item.name)),
+        encoding="utf-8",
+    )
+    release_files.extend([report_path, sbom_path, provenance_path])
+    release_manifest = {
+        "schema_version": RELEASE_SCHEMA_VERSION,
+        "kind": RELEASE_KIND,
+        "version": release_version,
+        "dry_run": bool(dry_run),
+        "unsigned": True,
+        "signature": {"status": "unsigned", "signed": False},
+        "artifacts": artifact_records,
+        "files": [_release_file_record(path, "evidence") for path in release_files],
+        "checksums": {
+            "file": checksum_path.name,
+            "sha256": sha256_file(checksum_path),
+        },
+        "sbom": sbom_path.name,
+        "provenance": provenance_path.name,
+        "verification_report": report_path.name,
+    }
+    release_path = destination / "release.json"
+    save_json(release_path, release_manifest)
+    return {
+        "passed": bool(report["passed"]),
+        "release": str(release_path),
+        "output_dir": str(destination),
+        "manifest": release_manifest,
+        "verification": report,
+    }
+
+
+def verify_release_bundle(path: os.PathLike[str] | str) -> dict[str, Any]:
+    """Recheck release hashes, unsigned metadata, and static artifact structure."""
+
+    release_path = Path(path).expanduser().resolve()
+    if release_path.is_dir():
+        release_path = release_path / "release.json"
+    try:
+        release = json.loads(release_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as error:
+        raise BuildValidationError(f"Could not read release manifest: {error}") from error
+    if not isinstance(release, Mapping) or release.get("schema_version") != RELEASE_SCHEMA_VERSION:
+        raise BuildValidationError("Unsupported release manifest schema")
+    signature = release.get("signature")
+    if (
+        not isinstance(signature, Mapping)
+        or signature.get("status") != "unsigned"
+        or release.get("unsigned") is not True
+    ):
+        raise BuildValidationError("Release manifest must explicitly declare unsigned status")
+    root = release_path.parent
+    failures: list[str] = []
+    for record in release.get("files", []):
+        file_path = root / str(record.get("name", ""))
+        if not file_path.is_file() or sha256_file(file_path) != record.get("sha256"):
+            failures.append(f"file hash mismatch: {file_path.name}")
+    checksum_record = release.get("checksums", {})
+    checksum_path = root / str(checksum_record.get("file", "SHA256SUMS"))
+    if not checksum_path.is_file() or sha256_file(checksum_path) != checksum_record.get("sha256"):
+        failures.append("checksum file hash mismatch")
+    elif checksum_path.is_file():
+        for line in checksum_path.read_text(encoding="utf-8").splitlines():
+            if "  " not in line:
+                failures.append("malformed checksum record")
+                continue
+            expected, name = line.split("  ", 1)
+            candidate = root / name
+            if not candidate.is_file() or sha256_file(candidate) != expected:
+                failures.append(f"checksum mismatch: {name}")
+    artifact_results: list[dict[str, Any]] = []
+    for artifact in release.get("artifacts", []):
+        artifact_path = root / str(artifact.get("name", ""))
+        result = verify_artifact(artifact_path)
+        artifact_results.append({"artifact": artifact_path.name, **asdict(result)})
+        if not result.passed:
+            failures.append(f"artifact verification failed: {artifact_path.name}")
+    return {
+        "schema_version": RELEASE_SCHEMA_VERSION,
+        "passed": not failures,
+        "release": str(release_path),
+        "failures": failures,
+        "artifacts": artifact_results,
+    }
+
+
 def compile_bytecode(
     source: os.PathLike[str] | str,
     output: os.PathLike[str] | str | None = None,
@@ -4141,6 +4411,22 @@ def create_cli_parser() -> argparse.ArgumentParser:
     manifest_parser.add_argument("--workspace")
     manifest_parser.add_argument("--json", action="store_true")
 
+    release_parser = subparsers.add_parser(
+        "release", help="Create or verify an unsigned local release evidence bundle"
+    )
+    release_parser.add_argument(
+        "action",
+        nargs="?",
+        choices=("dry-run", "verify"),
+        default="dry-run",
+    )
+    release_parser.add_argument("--artifact", action="append", default=[])
+    release_parser.add_argument("--output-dir", default="release")
+    release_parser.add_argument("--source-root")
+    release_parser.add_argument("--version", default=APP_VERSION)
+    release_parser.add_argument("--path")
+    release_parser.add_argument("--json", action="store_true")
+
     actions_parser = subparsers.add_parser(
         "init-actions", help="Create a GitHub Actions workflow for a source type"
     )
@@ -4270,6 +4556,34 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                 f"recovered={manifest_result.recovered}"
             )
         return 0
+    if args.command == "release":
+        try:
+            if args.action == "verify":
+                if not args.path:
+                    raise BuildValidationError(
+                        "release verify requires --path to release.json or its directory"
+                    )
+                release_result = verify_release_bundle(args.path)
+            else:
+                release_result = release_bundle(
+                    args.artifact,
+                    args.output_dir,
+                    source_root=args.source_root,
+                    version=args.version,
+                    dry_run=True,
+                )
+        except (BuildValidationError, OSError, ValueError) as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(release_result, indent=2, default=str)
+            if args.json
+            else (
+                f"{'PASS' if release_result['passed'] else 'FAIL'}: "
+                f"{release_result.get('release', release_result.get('output_dir', ''))}"
+            )
+        )
+        return 0 if release_result["passed"] else 1
     if args.command == "init-profiles":
         destination = Path(args.path).expanduser() if args.path else profiles_path()
         save_profiles(destination, DEFAULT_PROFILES)
@@ -4494,6 +4808,10 @@ __all__ = [
     "CAPABILITY_SCHEMA_VERSION",
     "CommandResult",
     "CompilerEngine",
+    "PROVENANCE_SCHEMA_VERSION",
+    "RELEASE_KIND",
+    "RELEASE_SCHEMA_VERSION",
+    "SBOM_SCHEMA_VERSION",
     "DEPENDENCY_LOCK_FILENAME",
     "DEPENDENCY_LOCK_KIND",
     "DEPENDENCY_LOCK_SCHEMA_VERSION",
@@ -4536,6 +4854,7 @@ __all__ = [
     "REQUEST_SCHEMA_VERSION",
     "redact_command",
     "redact_text",
+    "release_bundle",
     "RESULT_SCHEMA_VERSION",
     "save_json",
     "save_project_manifest",
@@ -4545,5 +4864,6 @@ __all__ = [
     "validate_project_manifest",
     "verify_artifact_manifest",
     "verify_artifact",
+    "verify_release_bundle",
     "wrap_msix",
 ]
