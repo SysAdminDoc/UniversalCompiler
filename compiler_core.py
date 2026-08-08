@@ -34,6 +34,9 @@ from typing import Any
 
 APP_NAME = "Universal Compiler"
 APP_VERSION = "2.1.0"
+REQUEST_SCHEMA_VERSION = "uc.request.v1"
+RESULT_SCHEMA_VERSION = "uc.result.v1"
+CAPABILITY_SCHEMA_VERSION = "uc.capability.v1"
 
 
 DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
@@ -536,7 +539,9 @@ class BuildResult:
 
     def as_dict(self) -> dict[str, Any]:
         result = asdict(self)
+        result["schema_version"] = RESULT_SCHEMA_VERSION
         result["request"]["source"] = str(self.request.source)
+        result["request"]["schema_version"] = REQUEST_SCHEMA_VERSION
         result["request"]["output"] = str(self.request.output)
         result["request"]["icon"] = (
             str(self.request.icon) if self.request.icon else None
@@ -1086,6 +1091,7 @@ def backend_status() -> dict[str, dict[str, Any]]:
     for backend, name in BACKEND_NAMES.items():
         path = resolve_backend_executable(backend)
         status[backend] = {
+            "schema_version": CAPABILITY_SCHEMA_VERSION,
             "backend": backend,
             "name": name,
             "available": path is not None,
@@ -2828,6 +2834,7 @@ __all__ = [
     "BuildRequest",
     "BuildResult",
     "BuildValidationError",
+    "CAPABILITY_SCHEMA_VERSION",
     "CommandResult",
     "CompilerEngine",
     "DEFAULT_PROFILES",
@@ -2852,8 +2859,10 @@ __all__ = [
     "profiles_path",
     "parse_toolchain_versions",
     "run_command",
+    "REQUEST_SCHEMA_VERSION",
     "redact_command",
     "redact_text",
+    "RESULT_SCHEMA_VERSION",
     "save_json",
     "save_profiles",
     "sha256_file",

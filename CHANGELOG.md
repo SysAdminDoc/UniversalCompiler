@@ -10,6 +10,9 @@ All notable changes to UniversalCompiler will be documented in this file.
   Python engine, legacy shells, and VS Code launcher.
 - Make post-build actions unable to launch compiled artifacts and require an
   explicit setup action before downloading or installing toolchains.
+- Make the Python CLI/core the build authority for the Python GUI, PowerShell
+  GUI, and VS Code extension, with versioned request, result, and capability
+  metadata and shared structured error handling.
 - Add a side-effect-free Python build engine and CLI with YAML profiles, backend
   previews, cache-aware builds, dependency prefetching, parallel batch builds,
   watch mode, and static post-build verification.

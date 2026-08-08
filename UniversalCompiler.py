@@ -20,6 +20,7 @@ from typing import Optional, Dict, List, Any
 from compiler_core import (
     BACKEND_NAMES,
     BuildRequest,
+    BuildResult,
     CompilerEngine,
     ExecutionPolicy,
     EXTENSION_BACKENDS,
@@ -708,151 +709,78 @@ class Compiler:
     def compile_ps1(source: str, output: str, icon: Optional[str] = None,
                     admin: bool = False, no_console: bool = True,
                     metadata: Optional[Dict] = None) -> tuple:
-        """Compile PowerShell script using PS2EXE."""
-        cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-Command"]
-        
-        ps_cmd = f'Invoke-PS2EXE -InputFile "{source}" -OutputFile "{output}"'
-        if icon and os.path.exists(icon):
-            ps_cmd += f' -IconFile "{icon}"'
-        if admin:
-            ps_cmd += " -RequireAdmin"
-        if no_console:
-            ps_cmd += " -NoConsole"
-        if metadata:
-            if metadata.get("product"):
-                ps_cmd += f' -Title "{metadata["product"]}"'
-            if metadata.get("version"):
-                ps_cmd += f' -Version "{metadata["version"]}"'
-            if metadata.get("company"):
-                ps_cmd += f' -Company "{metadata["company"]}"'
-            if metadata.get("copyright"):
-                ps_cmd += f' -Copyright "{metadata["copyright"]}"'
-        
-        cmd.append(ps_cmd)
-        return run_command(cmd)
+        """Compile PowerShell through the shared engine."""
+        return Compiler.compile(
+            source,
+            output,
+            "ps1",
+            icon=icon,
+            admin=admin,
+            console=not no_console,
+            metadata=metadata,
+        )
     
     @staticmethod
     def compile_py(source: str, output: str, icon: Optional[str] = None,
                    one_file: bool = True, console: bool = False) -> tuple:
-        """Compile Python script using PyInstaller."""
-        output_dir = os.path.dirname(output)
-        output_name = os.path.splitext(os.path.basename(output))[0]
-        
-        cmd = ["pyinstaller", "--distpath", output_dir, "--name", output_name, "--noconfirm"]
-        if one_file:
-            cmd.append("--onefile")
-        if not console:
-            cmd.append("--noconsole")
-        if icon and os.path.exists(icon):
-            cmd.extend(["--icon", icon])
-        cmd.append(source)
-        
-        return run_command(cmd)
+        """Compile Python through the shared engine."""
+        return Compiler.compile(
+            source,
+            output,
+            "py",
+            icon=icon,
+            console=console,
+            single_file=one_file,
+        )
     
     @staticmethod
     def compile_batch(source: str, output: str) -> tuple:
-        """Compile Batch/VBS script using IExpress."""
-        import tempfile
-        
-        temp_dir = tempfile.mkdtemp()
-        try:
-            # Copy source to temp
-            src_name = os.path.basename(source)
-            shutil.copy(source, os.path.join(temp_dir, src_name))
-            
-            # Create SED file
-            sed_content = f"""[Version]
-Class=IEXPRESS
-SEDVersion=3
-[Options]
-PackagePurpose=InstallApp
-ShowInstallProgramWindow=0
-HideExtractAnimation=1
-UseLongFileName=1
-InsideCompressed=0
-CAB_FixedSize=0
-RebootMode=N
-TargetName={output}
-FriendlyName=App
-AppLaunched=cmd /c "{src_name}"
-PostInstallCmd=<None>
-SourceFiles=SourceFiles
-[Strings]
-[SourceFiles]
-SourceFiles0={temp_dir}\\
-[SourceFiles0]
-%FILE0%={src_name}
-"""
-            sed_file = os.path.join(temp_dir, "config.sed")
-            with open(sed_file, "w") as f:
-                f.write(sed_content)
-            
-            windir = os.environ.get("WINDIR", "C:\\Windows")
-            iexpress = os.path.join(windir, "System32", "iexpress.exe")
-            return run_command([iexpress, "/N", "/Q", sed_file])
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        """Compile Batch/VBS through the shared engine."""
+        file_type = Path(source).suffix.lower().lstrip(".")
+        return Compiler.compile(source, output, file_type if file_type in {"bat", "cmd", "vbs"} else "bat")
     
     @staticmethod
     def compile_js(source: str, output: str) -> tuple:
-        """Compile Node.js script using pkg."""
-        cmd = ["pkg", source, "--target", "node18-win-x64", "--output", output]
-        return run_command(cmd)
+        """Compile JavaScript through the shared engine."""
+        return Compiler.compile(source, output, "js")
     
     @staticmethod
     def compile_cs(source: str, output: str) -> tuple:
-        """Compile C# source using CSC."""
-        windir = os.environ.get("WINDIR", "C:\\Windows")
-        csc_paths = [
-            os.path.join(windir, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe"),
-            os.path.join(windir, "Microsoft.NET", "Framework", "v4.0.30319", "csc.exe"),
-        ]
-        csc = next((p for p in csc_paths if os.path.exists(p)), None)
-        if not csc:
-            return False, "CSC compiler not found"
-        return run_command([csc, f"/out:{output}", source])
+        """Compile C# through the shared engine."""
+        return Compiler.compile(source, output, "cs")
     
     @staticmethod
     def compile_go(source: str, output: str) -> tuple:
-        """Compile Go source using go build."""
-        go_exe = which("go")
-        if not go_exe:
-            go_path = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Go/bin/go.exe"
-            if go_path.exists():
-                go_exe = str(go_path)
-        if not go_exe:
-            return False, "Go compiler not found"
-        return run_command([go_exe, "build", "-o", output, source], cwd=os.path.dirname(source))
+        """Compile Go through the shared engine."""
+        return Compiler.compile(source, output, "go")
     
     @staticmethod
     def compile_ahk(source: str, output: str, icon: Optional[str] = None) -> tuple:
-        """Compile AutoHotkey script using Ahk2Exe."""
-        ahk_paths = [
-            Path(os.environ.get("ProgramFiles", "")) / "AutoHotkey/Compiler/Ahk2Exe.exe",
-            Path(os.environ.get("ProgramFiles", "")) / "AutoHotkey/v2/Compiler/Ahk2Exe.exe",
-        ]
-        ahk = next((str(p) for p in ahk_paths if p.exists()), None)
-        if not ahk:
-            return False, "AutoHotkey compiler not found"
-        
-        cmd = [ahk, "/in", source, "/out", output]
-        if icon and os.path.exists(icon):
-            cmd.extend(["/icon", icon])
-        return run_command(cmd)
+        """Compile AutoHotkey through the shared engine."""
+        return Compiler.compile(source, output, "ahk", icon=icon)
     
     @staticmethod
     def compile_rb(source: str, output: str) -> tuple:
-        """Compile Ruby script using Ocra."""
-        return run_command(["ocra", source, "--output", output])
+        """Compile Ruby through the shared engine."""
+        return Compiler.compile(source, output, "rb")
     
     @classmethod
-    def compile(cls, source: str, output: str, file_type: str,
-                icon: Optional[str] = None, admin: bool = False,
-                console: bool = False, single_file: bool = True,
-                metadata: Optional[Dict] = None, backend: str = "auto",
-                prefetch: bool = False, verify: bool = True,
-                force: bool = False) -> tuple:
-        """Compile through the shared engine used by the CLI."""
+    def build_result(
+        cls,
+        source: str,
+        output: str,
+        file_type: str,
+        icon: Optional[str] = None,
+        admin: bool = False,
+        console: bool = False,
+        single_file: bool = True,
+        metadata: Optional[Dict] = None,
+        backend: str = "auto",
+        prefetch: bool = False,
+        verify: bool = True,
+        force: bool = False,
+    ) -> BuildResult:
+        """Return the canonical structured result used by every Python shell."""
         request = BuildRequest(
             source=Path(source),
             output=Path(output),
@@ -867,7 +795,39 @@ SourceFiles0={temp_dir}\\
             verify=verify,
             force=force,
         )
-        result = CompilerEngine().build(request)
+        return CompilerEngine().build(request)
+
+    @classmethod
+    def compile(
+        cls,
+        source: str,
+        output: str,
+        file_type: str,
+        icon: Optional[str] = None,
+        admin: bool = False,
+        console: bool = False,
+        single_file: bool = True,
+        metadata: Optional[Dict] = None,
+        backend: str = "auto",
+        prefetch: bool = False,
+        verify: bool = True,
+        force: bool = False,
+    ) -> tuple:
+        """Keep the legacy tuple API while delegating to the canonical result."""
+        result = cls.build_result(
+            source,
+            output,
+            file_type,
+            icon=icon,
+            admin=admin,
+            console=console,
+            single_file=single_file,
+            metadata=metadata,
+            backend=backend,
+            prefetch=prefetch,
+            verify=verify,
+            force=force,
+        )
         details = [result.message]
         for command in result.commands:
             if command.output:

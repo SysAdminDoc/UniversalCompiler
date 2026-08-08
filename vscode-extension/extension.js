@@ -75,7 +75,7 @@ function activate(context) {
       if (backend && backend !== "auto") {
         args.push("--backend", String(backend));
       }
-      args.push("--no-analytics");
+      args.push("--json", "--no-analytics");
 
       const output = vscode.window.createOutputChannel("Universal Compiler");
       const child = spawn(String(python), args, {
@@ -85,12 +85,28 @@ function activate(context) {
         windowsHide: true,
       });
       output.appendLine(`$ ${String(python)} ${args.join(" ")}`);
-      child.stdout.on("data", (data) => output.append(data.toString()));
+      const stdout = [];
+      child.stdout.on("data", (data) => stdout.push(data.toString()));
       child.stderr.on("data", (data) => output.append(data.toString()));
       child.on("error", (error) => {
         output.appendLine(`Universal Compiler failed to start: ${error.message}`);
       });
       child.on("close", (code, signal) => {
+        const serialized = stdout.join("");
+        try {
+          const result = JSON.parse(serialized);
+          if (!String(result.schema_version || "").startsWith("uc.result.")) {
+            throw new Error("unsupported result schema");
+          }
+          output.appendLine(
+            `Build ${result.success ? "succeeded" : "failed"}: ${result.message || result.status}.`
+          );
+        } catch (error) {
+          if (serialized) {
+            output.append(serialized);
+          }
+          output.appendLine(`Could not parse build result: ${error.message}`);
+        }
         output.appendLine(
           `Universal Compiler finished with ${signal ? `signal ${signal}` : `exit code ${code}`}.`
         );

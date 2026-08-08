@@ -140,6 +140,22 @@ function Invoke-PolicyCommand {
     }
 }
 
+function Get-CorePythonCommand {
+    $command = Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $command) { $command = Get-Command py -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 }
+    return $command
+}
+
+function Get-CoreCapabilities {
+    $pythonCommand = Get-CorePythonCommand
+    $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+    $coreScript = Join-Path $root 'UniversalCompiler.py'
+    if (-not $pythonCommand -or -not (Test-Path -LiteralPath $coreScript)) { return @{} }
+    $processResult = Invoke-PolicyCommand -FilePath $pythonCommand.Source -Arguments @($coreScript, 'list-toolchains', '--json') -WorkingDirectory $root
+    if (-not $processResult.Success -or -not $processResult.Output) { return @{} }
+    try { return ($processResult.Output | ConvertFrom-Json -ErrorAction Stop) } catch { return @{} }
+}
+
 # Ensure config directory
 if (-not (Test-Path $script:ConfigDir)) { New-Item -ItemType Directory -Path $script:ConfigDir -Force | Out-Null }
 
@@ -296,25 +312,27 @@ function Install-AutoHotkeyDirect {
 }
 
 function Get-DependencyStatus {
-    $deps = [ordered]@{
-        'PS2EXE' = @{ Name='PS2EXE'; Desc='PowerShell (.ps1)'; Installed=(Test-PS2EXEInstalled); Size='~2 MB'; Func='Install-PS2EXE' }
-        'PyInstaller' = @{ Name='PyInstaller'; Desc='Python (.py)'; Installed=$false; Size='~15 MB'; Func='Install-PyInstaller'; Req='Python' }
-        'pkg' = @{ Name='pkg'; Desc='Node.js (.js)'; Installed=$false; Size='~50 MB'; Func='Install-Pkg'; Req='Node.js' }
-        'Go' = @{ Name='Go'; Desc='Go (.go)'; Installed=$false; Size='~150 MB'; Func='Install-Go' }
-        'Ruby' = @{ Name='Ruby+Ocra'; Desc='Ruby (.rb)'; Installed=$false; Size='~120 MB'; Func='Install-Ruby' }
-        'AutoHotkey' = @{ Name='AutoHotkey'; Desc='AHK (.ahk)'; Installed=$false; Size='~5 MB'; Func='Install-AutoHotkey' }
-        'CSC' = @{ Name='CSC'; Desc='C# (.cs)'; Installed=$false; Size='Built-in'; BuiltIn=$true }
-        'IExpress' = @{ Name='IExpress'; Desc='Batch/VBS'; Installed=$false; Size='Built-in'; BuiltIn=$true }
+    $caps = Get-CoreCapabilities
+    $definitions = @(
+        @{ Backend='ps2exe'; Key='PS2EXE'; Func='Install-PS2EXE'; Size='~2 MB' },
+        @{ Backend='pyinstaller'; Key='PyInstaller'; Func='Install-PyInstaller'; Size='~15 MB' },
+        @{ Backend='pkg'; Key='pkg'; Func='Install-Pkg'; Size='~50 MB' },
+        @{ Backend='go'; Key='Go'; Func='Install-Go'; Size='~150 MB' },
+        @{ Backend='ocra'; Key='Ruby+Ocra'; Func='Install-Ruby'; Size='~120 MB' },
+        @{ Backend='ahk2exe'; Key='AutoHotkey'; Func='Install-AutoHotkey'; Size='~5 MB' },
+        @{ Backend='csc'; Key='CSC'; Func=$null; Size='Built-in'; BuiltIn=$true },
+        @{ Backend='iexpress'; Key='IExpress'; Func=$null; Size='Built-in'; BuiltIn=$true }
+    )
+    $deps = [ordered]@{}
+    foreach ($definition in $definitions) {
+        $property = $caps.PSObject.Properties | Where-Object { $_.Name -eq $definition.Backend } | Select-Object -First 1
+        $capability = if ($property) { $property.Value } else { $null }
+        $extensions = if ($capability) { @($capability.extensions) -join ', ' } else { '' }
+        $entry = @{ Name=$definition.Key; Desc=$extensions; Installed=[bool]($capability -and $capability.available); Size=$definition.Size }
+        if ($definition.Func) { $entry.Func = $definition.Func }
+        if ($definition.BuiltIn) { $entry.BuiltIn = $true }
+        $deps[$definition.Key] = $entry
     }
-    # Check each
-    $pyCmd = Get-Command python -EA SilentlyContinue; if ($pyCmd) { $deps['PyInstaller'].BaseOK=$true; $pipChk = Invoke-PolicyCommand -FilePath 'pip' -Arguments @('show', 'pyinstaller'); $deps['PyInstaller'].Installed = ($pipChk.Output -match "Name: pyinstaller") }
-    $nodeCmd = Get-Command node -EA SilentlyContinue; if ($nodeCmd) { $deps['pkg'].BaseOK=$true; $pkgChk = Invoke-PolicyCommand -FilePath 'npm' -Arguments @('list', '-g', 'pkg'); $deps['pkg'].Installed = ($pkgChk.Output -match "pkg@") }
-    $goCmd = Get-Command go -EA SilentlyContinue; if (-not $goCmd) { if (Test-Path "$env:LOCALAPPDATA\Programs\Go\bin\go.exe") { $goCmd = $true } }; $deps['Go'].Installed = ($null -ne $goCmd)
-    $rubyCmd = Get-Command ruby -EA SilentlyContinue; if (-not $rubyCmd) { @("C:\Ruby32-x64\bin\ruby.exe","C:\Ruby31-x64\bin\ruby.exe") | ForEach-Object { if (Test-Path $_) { $rubyCmd = $_ } } }
-    if ($rubyCmd) { $ocraChk = Invoke-PolicyCommand -FilePath 'gem' -Arguments @('list', 'ocra'); $deps['Ruby'].Installed = ($ocraChk.Output -match "ocra \(") }
-    @("${env:ProgramFiles}\AutoHotkey\Compiler\Ahk2Exe.exe","${env:ProgramFiles}\AutoHotkey\v2\Compiler\Ahk2Exe.exe") | ForEach-Object { if (Test-Path $_) { $deps['AutoHotkey'].Installed = $true } }
-    @("${env:WINDIR}\Microsoft.NET\Framework64\v4.0.30319\csc.exe","${env:WINDIR}\Microsoft.NET\Framework\v4.0.30319\csc.exe") | ForEach-Object { if (Test-Path $_) { $deps['CSC'].Installed = $true } }
-    $deps['IExpress'].Installed = (Test-Path "$env:WINDIR\System32\iexpress.exe")
     return $deps
 }
 
@@ -705,12 +723,21 @@ $script:compilers = @{
     'go' = @{ Name='Go'; Compiler='go build'; Desc='Go Source'; Admin=$false; Console=$true; Check={ (Get-Command go -EA SilentlyContinue) -or (Test-Path "$env:LOCALAPPDATA\Programs\Go\bin\go.exe") } }
     'rb' = @{ Name='Ruby'; Compiler='Ocra'; Desc='Ruby Script'; Admin=$false; Console=$true; Check={ (Get-Command ocra -EA SilentlyContinue) -ne $null } }
 }
+$script:CoreCapabilities = $null
 
 # Helper functions
 function Log { param([string]$M, [string]$L='Info'); $t = Get-Date -Format "HH:mm:ss"; $p = switch ($L) { 'Info'{'[*]'} 'Success'{'[OK]'} 'Warning'{'[!]'} 'Error'{'[X]'} default{'[*]'} }; $txtLog.Dispatcher.Invoke([Action]{ $txtLog.Text += "$t $p $M`r`n"; $logScroll.ScrollToEnd() }) }
 function Status { param([string]$M); $lblStatusBar.Dispatcher.Invoke([Action]{ $lblStatusBar.Text = $M }) }
 function Progress { param([int]$V, [bool]$Show=$true); $progress.Dispatcher.Invoke([Action]{ $progress.Value = $V; $progress.Visibility = if ($Show) { 'Visible' } else { 'Collapsed' } }) }
-function TestCompiler { param([string]$T); $c = $script:compilers[$T]; if (-not $c) { return $false }; try { return [bool](& $c.Check) } catch { return $false } }
+function TestCompiler {
+    param([string]$T)
+    if ($null -eq $script:CoreCapabilities) { $script:CoreCapabilities = Get-CoreCapabilities }
+    foreach ($property in $script:CoreCapabilities.PSObject.Properties) {
+        $capability = $property.Value
+        if ($capability.extensions -contains $T -and [bool]$capability.available) { return $true }
+    }
+    return $false
+}
 
 # Load profiles into combo
 $profiles = Get-BuildProfiles
@@ -836,54 +863,50 @@ $btnSettings.Add_Click({ [System.Windows.MessageBox]::Show("Settings: Theme=$($s
 # COMPILATION
 # ============================================================================
 
-function Compile-PS1 { param($Src, $Out, $Ico, $Admin, $NoConsole, $Meta)
-    Log "Compiling PowerShell..." -L Info; Progress -V 20
-    try {
-        $modPath = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "WindowsPowerShell\Modules\ps2exe"
-        $module = if (Test-Path (Join-Path $modPath "ps2exe.psm1")) { ConvertTo-PowerShellLiteral (Join-Path $modPath "ps2exe.psm1") } else { 'ps2exe' }
-        $psCommand = "`$ErrorActionPreference='Stop'; Import-Module $module -Force; Invoke-PS2EXE -InputFile $(ConvertTo-PowerShellLiteral $Src) -OutputFile $(ConvertTo-PowerShellLiteral $Out)"
-        if ($Ico -and (Test-Path $Ico)) { $psCommand += " -IconFile $(ConvertTo-PowerShellLiteral $Ico)" }
-        if ($Admin) { $psCommand += ' -RequireAdmin' }
-        if ($NoConsole) { $psCommand += ' -NoConsole' }
-        if ($Meta.Title) { $psCommand += " -Title $(ConvertTo-PowerShellLiteral $Meta.Title)" }
-        if ($Meta.Version) { $psCommand += " -Version $(ConvertTo-PowerShellLiteral $Meta.Version)" }
-        if ($Meta.Company) { $psCommand += " -Company $(ConvertTo-PowerShellLiteral $Meta.Company)" }
-        Progress -V 60
-        $result = Invoke-PolicyCommand -FilePath 'powershell' -Arguments @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', $psCommand) -WorkingDirectory (Split-Path $Src)
-        if (-not $result.Success -and $result.Output) { Log $result.Output -L Error }
-        Progress -V 90; return ($result.Success -and (Test-Path $Out))
-    } catch { Log "Error: $($_.Exception.Message)" -L Error; return $false }
-}
-
-function Compile-Generic { param($Src, $Out, $Type)
-    Log "Compiling $Type..." -L Info; Progress -V 30
-    $filePath = $null; $arguments = @(); $workingDirectory = Split-Path $Src
-    switch ($Type) {
-        'py' { $pyi = (Get-Command pyinstaller -EA SilentlyContinue).Source; if (-not $pyi) { return $false }; $filePath = $pyi; $dir = Split-Path $Out; $name = [IO.Path]::GetFileNameWithoutExtension($Out); $arguments = @('--distpath', $dir, '--name', $name, '--onefile', '--noconfirm', $Src) }
-        'bat' { return Compile-BAT $Src $Out $null $false }
-        'cmd' { return Compile-BAT $Src $Out $null $false }
-        'js' { $filePath = 'pkg'; $arguments = @($Src, '--target', 'node18-win-x64', '--output', $Out) }
-        'cs' { $filePath = "${env:WINDIR}\Microsoft.NET\Framework64\v4.0.30319\csc.exe"; $arguments = @("/out:$Out", $Src) }
-        'go' { $filePath = if (Get-Command go -EA SilentlyContinue) { 'go' } else { "$env:LOCALAPPDATA\Programs\Go\bin\go.exe" }; $arguments = @('build', '-o', $Out, $Src) }
-        'ahk' { $filePath = @("${env:ProgramFiles}\AutoHotkey\Compiler\Ahk2Exe.exe","${env:ProgramFiles}\AutoHotkey\v2\Compiler\Ahk2Exe.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1; if (-not $filePath) { return $false }; $arguments = @('/in', $Src, '/out', $Out) }
-        'rb' { $filePath = 'ocra'; $arguments = @($Src, '--output', $Out) }
-        'vbs' { return Compile-BAT $Src $Out $null $false }
+function Invoke-CoreBuild {
+    param(
+        [Parameter(Mandatory)][string]$Src,
+        [Parameter(Mandatory)][string]$Out,
+        [string]$Ico,
+        [bool]$Admin = $false,
+        [bool]$Console = $false,
+        [bool]$SingleFile = $true,
+        [hashtable]$Meta = @{}
+    )
+    $pythonCommand = Get-CorePythonCommand
+    $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+    $coreScript = Join-Path $root 'UniversalCompiler.py'
+    if (-not $pythonCommand -or -not (Test-Path -LiteralPath $coreScript)) {
+        return [pscustomobject]@{ Success=$false; Output='Python core entry point was not found'; Result=$null }
     }
-    if (-not $filePath) { return $false }
-    $result = Invoke-PolicyCommand -FilePath $filePath -Arguments $arguments -WorkingDirectory $workingDirectory
-    if (-not $result.Success -and $result.Output) { Log $result.Output -L Error }
-    Progress -V 90; return ($result.Success -and (Test-Path $Out))
-}
-
-function Compile-BAT { param($Src, $Out, $Ico, $Admin)
-    $tmp = Join-Path $env:TEMP "uc_$(Get-Random)"; New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-    $bn = [IO.Path]::GetFileName($Src); Copy-Item $Src (Join-Path $tmp $bn) -Force
-    $sed = "[Version]`r`nClass=IEXPRESS`r`nSEDVersion=3`r`n[Options]`r`nPackagePurpose=InstallApp`r`nShowInstallProgramWindow=0`r`nHideExtractAnimation=1`r`nUseLongFileName=1`r`nInsideCompressed=0`r`nCAB_FixedSize=0`r`nRebootMode=N`r`nTargetName=$Out`r`nFriendlyName=App`r`nAppLaunched=cmd /c `"$bn`"`r`nPostInstallCmd=<None>`r`nSourceFiles=SourceFiles`r`n[Strings]`r`n[SourceFiles]`r`nSourceFiles0=$tmp\`r`n[SourceFiles0]`r`n%FILE0%=$bn"
-    Set-Content (Join-Path $tmp "c.sed") $sed -Encoding ASCII
-    $result = Invoke-PolicyCommand -FilePath "$env:WINDIR\System32\iexpress.exe" -Arguments @('/N', '/Q', (Join-Path $tmp "c.sed")) -WorkingDirectory $tmp
-    Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
-    if (-not $result.Success -and $result.Output) { Log $result.Output -L Error }
-    return ($result.Success -and (Test-Path $Out))
+    $arguments = @($coreScript, 'build', $Src, '--output', $Out, '--backend', 'auto', '--json', '--no-analytics')
+    if ($Console) { $arguments += '--console' } else { $arguments += '--no-console' }
+    if ($Admin) { $arguments += '--admin' } else { $arguments += '--no-admin' }
+    if (-not $SingleFile) { $arguments += '--no-single-file' }
+    if ($Ico -and (Test-Path -LiteralPath $Ico)) { $arguments += @('--icon', $Ico) }
+    foreach ($entry in @(
+        @{ Name='product'; Value=$Meta.Title },
+        @{ Name='version'; Value=$Meta.Version },
+        @{ Name='company'; Value=$Meta.Company },
+        @{ Name='copyright'; Value=$Meta.Copyright },
+        @{ Name='description'; Value=$Meta.Description }
+    )) {
+        if ($entry.Value) { $arguments += @('--metadata', "$($entry.Name)=$($entry.Value)") }
+    }
+    $processResult = Invoke-PolicyCommand -FilePath $pythonCommand.Source -Arguments $arguments -WorkingDirectory $root
+    $payload = $null
+    if ($processResult.Output) {
+        try { $payload = $processResult.Output | ConvertFrom-Json -ErrorAction Stop } catch { }
+    }
+    $success = [bool]($processResult.Success -and $payload -and $payload.success)
+    $message = if ($payload -and $payload.message) { [string]$payload.message } else { [string]$processResult.Output }
+    if ($payload -and $payload.verification) { $message += "`n$($payload.verification.details)" }
+    return [pscustomobject]@{
+        Success = $success
+        Output = $message
+        Result = $payload
+        SchemaVersion = if ($payload) { $payload.schema_version } else { $null }
+    }
 }
 
 function Start-Compile {
@@ -898,11 +921,9 @@ function Start-Compile {
         $meta = @{ Title=$txtProduct.Text; Version=$txtVersion.Text; Company=$txtCompany.Text; Copyright=$txtCopyright.Text; Description=$txtDesc.Text }
         Log "========================================" -L Info; Log "Source: $($script:srcFile)" -L Info; Log "Output: $($script:outPath)" -L Info
         Status "Compiling..."; Progress -V 10
-        $ok = $false
-        switch ($script:fileType) {
-            'ps1' { $ok = Compile-PS1 -Src $script:srcFile -Out $script:outPath -Ico $ico -Admin $chkAdmin.IsChecked -NoConsole (-not $chkConsole.IsChecked) -Meta $meta }
-            default { $ok = Compile-Generic -Src $script:srcFile -Out $script:outPath -Type $script:fileType }
-        }
+        $coreResult = Invoke-CoreBuild -Src $script:srcFile -Out $script:outPath -Ico $ico -Admin ([bool]$chkAdmin.IsChecked) -Console ([bool]$chkConsole.IsChecked) -SingleFile ([bool]$chkSingle.IsChecked) -Meta $meta
+        $ok = $coreResult.Success
+        if (-not $ok -and $coreResult.Output) { Log $coreResult.Output -L Error }
         if ($ok -and (Test-Path $script:outPath)) {
             Progress -V 95
             Progress -V 100; $fi = Get-Item $script:outPath
@@ -948,7 +969,7 @@ $btnCompileAll.Add_Click({
 
 Log "Universal Compiler v$($script:AppVersion) ready" -L Success
 Log "Drag files here or click Browse" -L Info
-if (Test-PS2EXEInstalled) { Log "PS2EXE: Ready" -L Success } else { Log "PS2EXE: Not installed" -L Warning }
+if (TestCompiler 'ps1') { Log "PS2EXE: Ready" -L Success } else { Log "PS2EXE: Not installed" -L Warning }
 Status "Ready"
 
 $window.ShowDialog() | Out-Null

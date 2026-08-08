@@ -186,6 +186,9 @@ internal testing only.
 The optional `vscode-extension/` package adds a **Universal Compiler: Build
 Active File** command. Point its `universalCompiler.scriptPath` setting at the
 repository's `UniversalCompiler.py` when the extension is installed locally.
+The PowerShell GUI also delegates builds to this Python CLI and consumes its
+versioned JSON request/result contract; it remains useful as a Windows shell
+and explicit toolchain setup surface.
 
 ### Drag & Drop
 

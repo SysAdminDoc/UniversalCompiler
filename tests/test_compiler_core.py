@@ -15,11 +15,14 @@ import compiler_core
 from compiler_core import (
     BuildAnalytics,
     BuildValidationError,
+    CAPABILITY_SCHEMA_VERSION,
     DEFAULT_PROFILES,
     BuildRequest,
     CommandResult,
     CompilerEngine,
     ExecutionPolicy,
+    REQUEST_SCHEMA_VERSION,
+    RESULT_SCHEMA_VERSION,
     cli_main,
     compile_bytecode,
     detect_file_type,
@@ -132,6 +135,19 @@ def test_prefetch_requires_explicit_network_and_install_permissions(tmp_path: Pa
         CompilerEngine(require_available=False).prefetch_dependencies(request)
 
 
+def test_shells_delegate_to_versioned_core_contract() -> None:
+    root = Path(__file__).resolve().parents[1]
+    powershell = (root / "UniversalCompiler.ps1").read_text(encoding="utf-8")
+    extension = (root / "vscode-extension" / "extension.js").read_text(encoding="utf-8")
+
+    assert "Invoke-CoreBuild" in powershell
+    assert "UniversalCompiler.py" in powershell
+    assert "Invoke-PS2EXE" not in powershell
+    assert "spawn(" in extension
+    assert "terminal.sendText" not in extension
+    assert 'args.push("--json", "--no-analytics")' in extension
+
+
 def test_profiles_round_trip_without_extra_dependency(tmp_path: Path) -> None:
     path = tmp_path / "profiles.yaml"
     profiles = dict(DEFAULT_PROFILES)
@@ -242,6 +258,9 @@ def test_engine_builds_and_uses_cache(tmp_path: Path) -> None:
     assert second.status == "cache-hit"
     assert len(calls) == 1
     assert (tmp_path / "out.exe.uc-cache.json").is_file()
+    serialized = first.as_dict()
+    assert serialized["schema_version"] == RESULT_SCHEMA_VERSION
+    assert serialized["request"]["schema_version"] == REQUEST_SCHEMA_VERSION
 
 
 def test_engine_batch_preserves_input_order(tmp_path: Path) -> None:
@@ -328,6 +347,7 @@ def test_cli_list_toolchains_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert "nuitka" in output
     assert "rs" in output["rust"]["extensions"]
     assert "wat" in output["wat2wasm"]["extensions"]
+    assert output["pyinstaller"]["schema_version"] == CAPABILITY_SCHEMA_VERSION
 
 
 def test_github_actions_template_is_language_specific(tmp_path: Path) -> None:
