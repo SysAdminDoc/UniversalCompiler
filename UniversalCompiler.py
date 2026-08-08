@@ -12,11 +12,12 @@ import sys
 import json
 import shutil
 import threading
+import queue
 import ctypes
 import re
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Callable
 from compiler_core import (
     BACKEND_NAMES,
     BuildRequest,
@@ -879,6 +880,29 @@ class SetupWindow(ctk.CTkToplevel):
         # Make modal
         self.transient(parent)
         self.grab_set()
+        self._ui_events: queue.Queue[Callable[[], None]] = queue.Queue(maxsize=64)
+        self.after(50, self._drain_ui_events)
+
+    def _post_ui(self, callback: Callable[[], None]) -> None:
+        try:
+            self._ui_events.put_nowait(callback)
+        except queue.Full:
+            pass
+
+    def _drain_ui_events(self) -> None:
+        while True:
+            try:
+                callback = self._ui_events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception as error:
+                print(f"Setup UI update failed: {error}")
+        try:
+            self.after(50, self._drain_ui_events)
+        except tk.TclError:
+            pass
     
     def _create_ui(self):
         # Header
@@ -1045,9 +1069,12 @@ class SetupWindow(ctk.CTkToplevel):
         
         def install_thread():
             for i, dep in enumerate(selected):
-                self.progress_label.configure(text=f"Installing {dep}...")
-                self.progress_bar.set((i + 1) / len(selected))
-                self.update()
+                self._post_ui(
+                    lambda dep=dep, i=i: (
+                        self.progress_label.configure(text=f"Installing {dep}..."),
+                        self.progress_bar.set((i + 1) / len(selected)),
+                    )
+                )
                 
                 # Install logic here (placeholder)
                 if dep == "PS2EXE":
@@ -1062,8 +1089,8 @@ class SetupWindow(ctk.CTkToplevel):
                         allow_dependency_install=True,
                     )
                 
-            self.progress_label.configure(text="Complete!")
-            self.after(1000, self._finish)
+            self._post_ui(lambda: self.progress_label.configure(text="Complete!"))
+            self._post_ui(self._finish)
         
         threading.Thread(target=install_thread, daemon=True).start()
     
@@ -1103,6 +1130,7 @@ class UniversalCompiler:
         self.compiling = False
         self.batch_queue: List[str] = []
         self.engine = CompilerEngine()
+        self._ui_events: queue.Queue[Callable[[], None]] = queue.Queue(maxsize=128)
         
         # Initialize templates
         initialize_templates()
@@ -1155,6 +1183,32 @@ class UniversalCompiler:
         
         self._create_ui()
         self._setup_drag_drop()
+        self.root.after(50, self._drain_ui_events)
+
+    def _post_ui(self, callback: Callable[[], None]) -> None:
+        """Queue worker results for execution by Tk's event loop."""
+
+        try:
+            self._ui_events.put_nowait(callback)
+        except queue.Full:
+            pass
+
+    def _drain_ui_events(self) -> None:
+        """Apply queued worker results without touching Tk from a worker."""
+
+        while True:
+            try:
+                callback = self._ui_events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception as error:
+                self.log(f"UI update failed: {error}", "error")
+        try:
+            self.root.after(50, self._drain_ui_events)
+        except tk.TclError:
+            pass
     
     def _create_ui(self):
         """Create all UI elements."""
@@ -2326,66 +2380,122 @@ Source: {self.source_file}
             "copyright": self.copyright_entry.get(),
             "description": self.desc_entry.get("1.0", "end-1c"),
         }
-        
-        # Start compilation in thread
+        source_file = self.source_file
+        file_type = self.file_type
+        profile_name = self.profile_combo.get()
+        postbuild = self.postbuild_combo.get()
+        copy_path = self.postbuild_path_entry.get()
+        notify = self.notify_var.get()
+
+        self.log("=" * 40)
+        self.log(f"Source: {source_file}")
+        self.log(f"Output: {output_path}")
+        self.status_label.configure(text="Compiling...")
+        self.progress_bar.pack(fill="x", pady=(0, 8))
+        self.progress_bar.set(0.3)
+
         def compile_thread():
-            self.log("=" * 40)
-            self.log(f"Source: {self.source_file}")
-            self.log(f"Output: {output_path}")
-            self.status_label.configure(text="Compiling...")
-            self.progress_bar.pack(fill="x", pady=(0, 8))
-            self.progress_bar.set(0.3)
-            
-            success, output = Compiler.compile(
-                self.source_file, output_path, self.file_type,
-                icon, admin, console, single_file, metadata, backend=backend
+            try:
+                result = Compiler.build_result(
+                    source_file,
+                    output_path,
+                    file_type,
+                    icon,
+                    admin,
+                    console,
+                    single_file,
+                    metadata,
+                    backend=backend,
+                )
+                error_text = None
+            except Exception as error:
+                result = None
+                error_text = str(error)
+            self._post_ui(
+                lambda result=result, error_text=error_text: self._finish_compile(
+                    result,
+                    error_text,
+                    source_file,
+                    file_type,
+                    output_path,
+                    output_name,
+                    output_dir,
+                    profile_name,
+                    postbuild,
+                    copy_path,
+                    notify,
+                )
             )
-            
+
+        threading.Thread(target=compile_thread, daemon=True).start()
+
+    def _finish_compile(
+        self,
+        result: Optional[BuildResult],
+        error_text: Optional[str],
+        source_file: str,
+        file_type: str,
+        output_path: str,
+        output_name: str,
+        output_dir: str,
+        profile_name: str,
+        postbuild: str,
+        copy_path: str,
+        notify: bool,
+    ) -> None:
+        """Apply a worker result on Tk's event-loop thread."""
+
+        try:
             self.progress_bar.set(0.9)
-            
-            if success and os.path.exists(output_path):
+            success = bool(result and result.success and os.path.isfile(output_path))
+            if success:
                 file_size = os.path.getsize(output_path)
                 self.log("=" * 40, "success")
                 self.log("BUILD SUCCESSFUL", "success")
                 self.log(f"Size: {format_size(file_size)}", "success")
-                
+                if result and result.message:
+                    self.log(result.message)
                 self.history.add(
-                    self.source_file, output_path, self.file_type,
-                    True, self.profile_combo.get(), file_size
+                    source_file,
+                    output_path,
+                    file_type,
+                    True,
+                    profile_name,
+                    file_size,
                 )
-                
-                # Post-build action
-                postbuild = self.postbuild_combo.get()
                 if postbuild == "Open Output Folder":
                     os.startfile(output_dir)
-                elif postbuild == "Copy to Folder...":
-                    copy_path = self.postbuild_path_entry.get()
-                    if copy_path:
-                        shutil.copy(output_path, copy_path)
-                        self.log(f"Copied to {copy_path}")
-                
-                # Notification
-                if self.notify_var.get():
-                    show_notification("Build Complete", f"{output_name} compiled successfully")
+                elif postbuild == "Copy to Folder..." and copy_path:
+                    shutil.copy(output_path, copy_path)
+                    self.log(f"Copied to {copy_path}")
+                if notify:
+                    show_notification(
+                        "Build Complete", f"{output_name} compiled successfully"
+                    )
             else:
                 self.log("BUILD FAILED", "error")
-                self.log(output, "error")
-                
+                details = error_text or (result.message if result else "Unknown build error")
+                if result:
+                    for command in result.commands:
+                        if command.output:
+                            details += f"\n{command.output}"
+                self.log(details, "error")
                 self.history.add(
-                    self.source_file, output_path, self.file_type,
-                    False, self.profile_combo.get(), 0
+                    source_file,
+                    output_path,
+                    file_type,
+                    False,
+                    profile_name,
+                    0,
                 )
-                
-                if self.notify_var.get():
+                if notify:
                     show_notification("Build Failed", "Compilation failed")
-            
+        finally:
             self.progress_bar.set(1.0)
             self.root.after(500, lambda: self.progress_bar.pack_forget())
             self.status_label.configure(text="Ready")
             self.compiling = False
             self.compile_btn.configure(state="normal")
-        
-        threading.Thread(target=compile_thread, daemon=True).start()
     
     def _compile_all(self):
         """Compile all files in queue."""

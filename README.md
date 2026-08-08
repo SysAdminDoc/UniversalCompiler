@@ -157,6 +157,9 @@ python .\UniversalCompiler.py build .\myscript.go --matrix x86 x64 arm64 --jobs 
 # Cross-target Go/Rust/Bun builds when the installed SDK has that target
 python .\UniversalCompiler.py build .\main.go --target linux --arch x64 --output .\dist\main
 
+# Coalesce watch changes; Ctrl+C cancels the active process tree
+python .\UniversalCompiler.py build .\myscript.py --watch --watch-debounce 0.35
+
 # Compile Python bytecode only, or inspect local build analytics
 python .\UniversalCompiler.py bytecode .\module.py
 python .\UniversalCompiler.py analytics --recent 10
@@ -184,6 +187,11 @@ inherited environment, and redacted diagnostics. Static verification checks
 the produced container or PE header without launching the artifact, so a GUI
 build cannot steal focus or alter the active desktop. Post-build actions never
 launch the compiled artifact.
+Builds use an isolated staging directory and publish atomically only after
+static verification; concurrent requests targeting the same output are locked,
+and duplicate batch outputs are rejected before any compiler starts. Watch mode
+debounces rapid source changes, and its stop event is passed through to the
+compiler process tree.
 Successful builds also emit a versioned `*.manifest.json` sidecar containing
 source/config/toolchain identities, artifact SHA-256 and size, verification,
 warnings, and explicit unsigned status. `verify` checks both artifact structure

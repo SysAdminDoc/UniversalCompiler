@@ -21,6 +21,7 @@ from compiler_core import (
     CAPABILITY_SCHEMA_VERSION,
     DEFAULT_PROFILES,
     BuildRequest,
+    BuildResult,
     CommandResult,
     CompilerEngine,
     ExecutionPolicy,
@@ -50,6 +51,12 @@ def _fake_pe(path: Path) -> None:
     data[0x178:0x17E] = b".text\0"
     struct.pack_into("<IIII", data, 0x180, 0x100, 0x1000, 0x200, 0x200)
     path.write_bytes(data)
+
+
+def _planned_pyinstaller_output(command: tuple[str, ...] | list[str]) -> Path:
+    return Path(command[command.index("--distpath") + 1]) / (
+        Path(command[command.index("--name") + 1]).stem + ".exe"
+    )
 
 
 def test_detect_file_type_and_size() -> None:
@@ -236,7 +243,7 @@ def test_local_analytics_records_summary(tmp_path: Path) -> None:
     output = tmp_path / "analytics.exe"
 
     def fake_runner(command, cwd=None, environment=None, timeout=None):
-        _fake_pe(output)
+        _fake_pe(_planned_pyinstaller_output(command))
         return CommandResult(tuple(command), 0)
 
     result = CompilerEngine(
@@ -260,7 +267,7 @@ def test_engine_builds_and_uses_cache(tmp_path: Path) -> None:
 
     def fake_runner(command, cwd=None, environment=None, timeout=None):
         calls.append(tuple(command))
-        _fake_pe(output)
+        _fake_pe(_planned_pyinstaller_output(command))
         return CommandResult(tuple(command), 0, stdout="built")
 
     engine = CompilerEngine(runner=fake_runner, require_available=False)
@@ -289,6 +296,137 @@ def test_engine_builds_and_uses_cache(tmp_path: Path) -> None:
     assert verify_artifact_manifest(first.manifest, output).passed is False
 
 
+def test_build_publishes_verified_staging_output_atomically(tmp_path: Path) -> None:
+    source = tmp_path / "atomic.py"
+    source.write_text("print(1)\n", encoding="utf-8")
+    output = tmp_path / "atomic.exe"
+    calls: list[tuple[str, ...]] = []
+
+    def fake_runner(command, cwd=None, environment=None, timeout=None):
+        calls.append(tuple(command))
+        _fake_pe(_planned_pyinstaller_output(command))
+        return CommandResult(tuple(command), 0)
+
+    result = CompilerEngine(runner=fake_runner, require_available=False).build(
+        BuildRequest(source=source, output=output, backend="pyinstaller")
+    )
+
+    assert result.success is True
+    assert output.is_file()
+    assert any(".uc-stage-" in argument for argument in calls[0])
+    assert list(tmp_path.glob(".uc-stage-*")) == []
+
+
+def test_failed_staged_verification_does_not_replace_existing_output(tmp_path: Path) -> None:
+    source = tmp_path / "atomic-failure.py"
+    source.write_text("print(1)\n", encoding="utf-8")
+    output = tmp_path / "atomic-failure.exe"
+    original = b"previous artifact"
+    output.write_bytes(original)
+
+    def fake_runner(command, cwd=None, environment=None, timeout=None):
+        _planned_pyinstaller_output(command).write_bytes(b"invalid artifact")
+        return CommandResult(tuple(command), 0)
+
+    result = CompilerEngine(runner=fake_runner, require_available=False).build(
+        BuildRequest(source=source, output=output, backend="pyinstaller")
+    )
+
+    assert result.success is False
+    assert result.verification is not None
+    assert output.read_bytes() == original
+    assert list(tmp_path.glob(".uc-stage-*")) == []
+
+
+def test_build_cancellation_token_prevents_execution_and_serializes_cleanly(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cancel.py"
+    source.write_text("print(1)\n", encoding="utf-8")
+    event = threading.Event()
+    event.set()
+    calls: list[tuple[str, ...]] = []
+
+    def fake_runner(command, cwd=None, environment=None, timeout=None):
+        calls.append(tuple(command))
+        return CommandResult(tuple(command), 0)
+
+    request = BuildRequest(
+        source=source,
+        output=tmp_path / "cancel.exe",
+        backend="pyinstaller",
+        cancel_event=event,
+    )
+    result = CompilerEngine(runner=fake_runner, require_available=False).build(request)
+
+    assert result.status == "cancelled"
+    assert calls == []
+    assert "cancel_event" not in result.as_dict()["request"]
+
+
+def test_batch_rejects_duplicate_outputs_before_execution(tmp_path: Path) -> None:
+    requests = []
+    for index in range(2):
+        source = tmp_path / f"duplicate-{index}.py"
+        source.write_text("print(1)\n", encoding="utf-8")
+        requests.append(
+            BuildRequest(
+                source=source,
+                output=tmp_path / "same.exe",
+                backend="pyinstaller",
+            )
+        )
+    calls: list[tuple[str, ...]] = []
+
+    def fake_runner(command, cwd=None, environment=None, timeout=None):
+        calls.append(tuple(command))
+        return CommandResult(tuple(command), 0)
+
+    results = CompilerEngine(runner=fake_runner, require_available=False).build_batch(
+        requests, workers=2
+    )
+
+    assert [result.status for result in results] == ["collision", "collision"]
+    assert all("collision" in result.message.lower() for result in results)
+    assert calls == []
+
+
+def test_watch_coalesces_quick_source_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "watch.py"
+    source.write_text("one\n", encoding="utf-8")
+    event = threading.Event()
+    request = BuildRequest(
+        source=source,
+        output=tmp_path / "watch.exe",
+        backend="pyinstaller",
+    )
+    engine = CompilerEngine(require_available=False)
+    builds: list[str] = []
+
+    def fake_build(build_request: BuildRequest) -> BuildResult:
+        builds.append(source.read_text(encoding="utf-8"))
+        return BuildResult(
+            True,
+            "built",
+            build_request,
+            build_request.output,
+            backend="pyinstaller",
+        )
+
+    monkeypatch.setattr(engine, "build", fake_build)
+    watcher = engine.watch(request, interval=0.02, debounce=0.08, stop_event=event)
+    first = next(watcher)
+    source.write_text("two\n", encoding="utf-8")
+    source.write_text("three\n", encoding="utf-8")
+    second = next(watcher)
+    event.set()
+    watcher.close()
+
+    assert first.success is True
+    assert second.success is True
+    assert builds == ["one\n", "three\n"]
+
+
 def test_engine_batch_preserves_input_order(tmp_path: Path) -> None:
     requests = []
     for name in ("one.py", "two.py", "three.py"):
@@ -303,10 +441,7 @@ def test_engine_batch_preserves_input_order(tmp_path: Path) -> None:
         )
 
     def fake_runner(command, cwd=None, environment=None, timeout=None):
-        output = Path(command[command.index("--distpath") + 1]) / (
-            Path(command[command.index("--name") + 1]).stem + ".exe"
-        )
-        _fake_pe(output)
+        _fake_pe(_planned_pyinstaller_output(command))
         return CommandResult(tuple(command), 0)
 
     results = CompilerEngine(runner=fake_runner, require_available=False).build_batch(
@@ -325,10 +460,7 @@ def test_engine_matrix_suffixes_outputs(tmp_path: Path) -> None:
     source.write_text("print(1)\n", encoding="utf-8")
 
     def fake_runner(command, cwd=None, environment=None, timeout=None):
-        output = Path(command[command.index("--distpath") + 1]) / (
-            Path(command[command.index("--name") + 1]).stem + ".exe"
-        )
-        _fake_pe(output)
+        _fake_pe(_planned_pyinstaller_output(command))
         return CommandResult(tuple(command), 0)
 
     request = BuildRequest(

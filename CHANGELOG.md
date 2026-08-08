@@ -20,6 +20,11 @@ All notable changes to UniversalCompiler will be documented in this file.
   GUI shells, and the VS Code extension, with lifecycle, host/target/
   architecture constraints, SDK requirements, and verified tool versions;
   deprecated pkg is no longer selected automatically.
+- Add per-output build locking, isolated staging, atomic post-verification
+  publication, duplicate-output rejection, cancellation propagation, bounded
+  cleanup, and debounced watch rebuilds.
+- Route Python GUI and setup-worker results through bounded queues drained by
+  the Tk event loop so background threads no longer mutate widgets directly.
 - Add a side-effect-free Python build engine and CLI with YAML profiles, backend
   previews, cache-aware builds, dependency prefetching, parallel batch builds,
   watch mode, and static post-build verification.

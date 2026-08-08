@@ -234,6 +234,7 @@ class BuildValidationError(ValueError):
 
 DEFAULT_EXECUTION_TIMEOUT_SECONDS = 15 * 60
 DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+MAX_CLEANUP_PATHS = 32
 DEFAULT_INHERITED_ENVIRONMENT = (
     "APPDATA",
     "COMSPEC",
@@ -258,6 +259,57 @@ DEFAULT_INHERITED_ENVIRONMENT = (
     "VIRTUAL_ENV",
     "WINDIR",
 )
+
+_BUILD_LOCKS: dict[str, threading.RLock] = {}
+_BUILD_LOCKS_GUARD = threading.Lock()
+
+
+def _output_lock_key(path: os.PathLike[str] | str) -> str:
+    """Return a case-insensitive identity for a build output path."""
+
+    candidate = Path(path).expanduser()
+    try:
+        candidate = candidate.resolve()
+    except OSError:
+        candidate = Path(os.path.abspath(candidate))
+    return os.path.normcase(str(candidate))
+
+
+def _output_lock(path: os.PathLike[str] | str) -> threading.RLock:
+    """Return a process-wide lock so separate engines cannot publish together."""
+
+    key = _output_lock_key(path)
+    with _BUILD_LOCKS_GUARD:
+        lock = _BUILD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _BUILD_LOCKS[key] = lock
+        return lock
+
+
+def _cleanup_paths(paths: Iterable[Path]) -> None:
+    """Remove only bounded, build-owned temporary paths."""
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for raw_path in paths:
+        path = Path(raw_path)
+        key = _output_lock_key(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+        if len(unique) >= MAX_CLEANUP_PATHS:
+            break
+    for path in reversed(unique):
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+
 _SENSITIVE_ARGUMENT_NAMES = frozenset(
     {
         "--api-key",
@@ -499,6 +551,9 @@ class BuildRequest:
     max_output_bytes: int | None = None
     allow_network: bool = False
     allow_dependency_install: bool = False
+    cancel_event: threading.Event | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def normalized(self) -> BuildRequest:
         source = Path(self.source).expanduser()
@@ -543,6 +598,7 @@ class BuildRequest:
             ),
             allow_network=bool(self.allow_network),
             allow_dependency_install=bool(self.allow_dependency_install),
+            cancel_event=self.cancel_event,
         )
 
 
@@ -602,11 +658,13 @@ class BuildResult:
     manifest: Path | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        result = asdict(self)
+        serializable_request = replace(self.request, cancel_event=None)
+        result = asdict(replace(self, request=serializable_request))
         result["schema_version"] = RESULT_SCHEMA_VERSION
         result["request"]["source"] = str(self.request.source)
         result["request"]["schema_version"] = REQUEST_SCHEMA_VERSION
         result["request"]["output"] = str(self.request.output)
+        result["request"].pop("cancel_event", None)
         result["request"]["icon"] = (
             str(self.request.icon) if self.request.icon else None
         )
@@ -1359,6 +1417,7 @@ class CompilerEngine:
         }
         if self.runner is run_command:
             kwargs["policy"] = policy
+            kwargs["stop_event"] = request.cancel_event
         return self.runner(command, **kwargs)
 
     def choose_backend(self, file_type: str, requested: str = "auto") -> str | None:
@@ -1461,7 +1520,7 @@ class CompilerEngine:
             raise BuildValidationError(f"No backend supports .{normalized.file_type}")
         self._validate_capability(normalized, backend)
         if normalized.backend == "auto" or normalized.backend != backend:
-            normalized = BuildRequest(**{**asdict(normalized), "backend": backend})
+            normalized = replace(normalized, backend=backend)
         if self.require_available and not resolve_backend_executable(backend):
             raise BuildValidationError(f"Compiler backend is not installed: {backend}")
         if not allow_missing_source and normalized.toolchain_versions:
@@ -1931,24 +1990,56 @@ class CompilerEngine:
             commands.append(((bundle, "install"), root))
         return [self._run(request, command, cwd=cwd) for command, cwd in commands]
 
-    def build(self, request: BuildRequest) -> BuildResult:
-        started = time.monotonic()
+    def _staged_request(self, request: BuildRequest) -> tuple[BuildRequest, Path]:
+        """Create a per-build staging directory on the output volume."""
+
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", request.output.stem)[:32] or "artifact"
+        stage_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".uc-stage-{stem}-",
+                dir=str(request.output.parent),
+            )
+        )
+        return replace(request, output=stage_root / request.output.name), stage_root
+
+    def _build_locked(self, request: BuildRequest, started: float) -> BuildResult:
+        plan: BuildPlan | None = None
+        stage_root: Path | None = None
         try:
             normalized = self._validate(request)
+            normalized = replace(
+                normalized,
+                source=normalized.source.resolve(),
+                output=normalized.output.resolve(),
+            )
             normalized.output.parent.mkdir(parents=True, exist_ok=True)
+            if normalized.cancel_event and normalized.cancel_event.is_set():
+                return BuildResult(
+                    False,
+                    "cancelled",
+                    normalized,
+                    normalized.output,
+                    normalized.backend,
+                    message="Build cancelled before execution",
+                    duration_seconds=time.monotonic() - started,
+                )
             source_hash = sha256_file(normalized.source)
-            plan = self.plan(normalized)
-            cache_key = self._cache_key(normalized, source_hash, plan.backend)
+            cache_key = self._cache_key(normalized, source_hash, normalized.backend)
             if self._cache_hit(normalized, cache_key):
                 verification = (
                     verify_artifact(normalized.output) if normalized.verify else None
                 )
                 if verification is None or verification.passed:
-                    manifest_path = artifact_manifest_path(normalized.output.resolve())
+                    manifest_path = artifact_manifest_path(normalized.output)
                     if not manifest_path.is_file():
+                        cache_plan = BuildPlan(
+                            command=(),
+                            cwd=normalized.source.parent,
+                            backend=normalized.backend,
+                        )
                         manifest_path = self._write_artifact_manifest(
                             normalized,
-                            plan,
+                            cache_plan,
                             source_hash,
                             cache_key,
                             verification,
@@ -1958,7 +2049,7 @@ class CompilerEngine:
                         "cache-hit",
                         normalized,
                         normalized.output,
-                        plan.backend,
+                        normalized.backend,
                         verification=verification,
                         source_hash=source_hash,
                         cache_key=cache_key,
@@ -1966,6 +2057,9 @@ class CompilerEngine:
                         duration_seconds=time.monotonic() - started,
                         manifest=manifest_path,
                     )
+
+            staged_request, stage_root = self._staged_request(normalized)
+            plan = self.plan(staged_request)
             commands: list[CommandResult] = []
             if normalized.prefetch:
                 commands.extend(self.prefetch_dependencies(normalized))
@@ -1973,26 +2067,68 @@ class CompilerEngine:
                     (result for result in commands if not result.success), None
                 )
                 if failed_prefetch:
+                    status = "cancelled" if failed_prefetch.cancelled else "failed"
                     return BuildResult(
                         False,
-                        "failed",
+                        status,
                         normalized,
                         normalized.output,
                         plan.backend,
                         commands=commands,
                         source_hash=source_hash,
                         cache_key=cache_key,
-                        message=f"Dependency prefetch failed: {failed_prefetch.output}",
+                        message=(
+                            "Build cancelled during dependency prefetch"
+                            if failed_prefetch.cancelled
+                            else f"Dependency prefetch failed: {failed_prefetch.output}"
+                        ),
                         duration_seconds=time.monotonic() - started,
                     )
             result = self._run(
-                normalized,
+                staged_request,
                 plan.command,
                 cwd=plan.cwd,
                 environment=plan.environment,
             )
             commands.append(result)
             if not result.success:
+                status = "cancelled" if result.cancelled else "failed"
+                return BuildResult(
+                    False,
+                    status,
+                    normalized,
+                    normalized.output,
+                    plan.backend,
+                    commands=commands,
+                    source_hash=source_hash,
+                    cache_key=cache_key,
+                    message=(
+                        "Build cancelled"
+                        if result.cancelled
+                        else result.output or "Compiler command failed"
+                    ),
+                    duration_seconds=time.monotonic() - started,
+                )
+            if normalized.cancel_event and normalized.cancel_event.is_set():
+                return BuildResult(
+                    False,
+                    "cancelled",
+                    normalized,
+                    normalized.output,
+                    plan.backend,
+                    commands=commands,
+                    source_hash=source_hash,
+                    cache_key=cache_key,
+                    message="Build cancelled before publication",
+                    duration_seconds=time.monotonic() - started,
+                )
+            if not staged_request.output.exists():
+                candidate = next(
+                    (path for path in plan.artifact_candidates if path.is_file()), None
+                )
+                if candidate and candidate != staged_request.output:
+                    shutil.copy2(candidate, staged_request.output)
+            if not staged_request.output.is_file():
                 return BuildResult(
                     False,
                     "failed",
@@ -2002,16 +2138,9 @@ class CompilerEngine:
                     commands=commands,
                     source_hash=source_hash,
                     cache_key=cache_key,
-                    message=result.output or "Compiler command failed",
+                    message="Compiler completed without producing an artifact",
                     duration_seconds=time.monotonic() - started,
                 )
-            if not normalized.output.exists():
-                candidate = next(
-                    (path for path in plan.artifact_candidates if path.is_file()), None
-                )
-                if candidate and candidate != normalized.output:
-                    normalized.output.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(candidate, normalized.output)
             if normalized.upx:
                 upx = resolve_backend_executable("upx")
                 if not upx:
@@ -2028,33 +2157,32 @@ class CompilerEngine:
                         duration_seconds=time.monotonic() - started,
                     )
                 compression = self._run(
-                    normalized,
-                    (upx, "--best", "--lzma", str(normalized.output)),
-                    cwd=normalized.output.parent,
+                    staged_request,
+                    (upx, "--best", "--lzma", str(staged_request.output)),
+                    cwd=staged_request.output.parent,
                 )
                 commands.append(compression)
                 if not compression.success:
+                    status = "cancelled" if compression.cancelled else "failed"
                     return BuildResult(
                         False,
-                        "failed",
+                        status,
                         normalized,
                         normalized.output,
                         plan.backend,
                         commands=commands,
                         source_hash=source_hash,
                         cache_key=cache_key,
-                        message=f"UPX compression failed: {compression.output}",
+                        message=(
+                            "Build cancelled during UPX compression"
+                            if compression.cancelled
+                            else f"UPX compression failed: {compression.output}"
+                        ),
                         duration_seconds=time.monotonic() - started,
                     )
-            verification = (
-                verify_artifact(normalized.output) if normalized.verify else None
-            )
-            if normalized.verify and (verification is None or not verification.passed):
-                detail = (
-                    verification.details
-                    if verification
-                    else "No artifact verification result"
-                )
+
+            publication_verification = verify_artifact(staged_request.output)
+            if not publication_verification.passed:
                 return BuildResult(
                     False,
                     "failed",
@@ -2062,12 +2190,31 @@ class CompilerEngine:
                     normalized.output,
                     plan.backend,
                     commands=commands,
-                    verification=verification,
+                    verification=publication_verification,
                     source_hash=source_hash,
                     cache_key=cache_key,
-                    message=f"Post-build verification failed: {detail}",
+                    message=(
+                        "Artifact verification failed before publication: "
+                        f"{publication_verification.details}"
+                    ),
                     duration_seconds=time.monotonic() - started,
                 )
+            if normalized.cancel_event and normalized.cancel_event.is_set():
+                return BuildResult(
+                    False,
+                    "cancelled",
+                    normalized,
+                    normalized.output,
+                    plan.backend,
+                    commands=commands,
+                    verification=publication_verification,
+                    source_hash=source_hash,
+                    cache_key=cache_key,
+                    message="Build cancelled before publication",
+                    duration_seconds=time.monotonic() - started,
+                )
+            os.replace(staged_request.output, normalized.output)
+            verification = publication_verification if normalized.verify else None
             self._save_cache(
                 normalized, cache_key, source_hash, plan.backend, verification
             )
@@ -2093,7 +2240,7 @@ class CompilerEngine:
                 manifest=manifest_path,
             )
         except (BuildValidationError, OSError, ValueError) as error:
-            output = Path(request.output)
+            output = Path(request.output).expanduser()
             return BuildResult(
                 False,
                 "failed",
@@ -2104,21 +2251,47 @@ class CompilerEngine:
                 duration_seconds=time.monotonic() - started,
             )
         finally:
-            if "plan" in locals():
-                for path in plan.cleanup_paths:
-                    try:
-                        if path.is_dir():
-                            shutil.rmtree(path, ignore_errors=True)
-                        elif path.exists():
-                            path.unlink()
-                    except OSError:
-                        pass
+            cleanup = list(plan.cleanup_paths) if plan else []
+            if stage_root:
+                cleanup.append(stage_root)
+            _cleanup_paths(cleanup)
+
+    def build(self, request: BuildRequest) -> BuildResult:
+        """Build under an output lock and publish only a verified staged artifact."""
+
+        started = time.monotonic()
+        normalized = request.normalized()
+        with _output_lock(normalized.output):
+            return self._build_locked(request, started)
 
     def build_batch(
         self, requests: Sequence[BuildRequest], workers: int = 1
     ) -> list[BuildResult]:
         """Compile independent requests in parallel while retaining input order."""
 
+        normalized_requests = [request.normalized() for request in requests]
+        output_groups: dict[str, list[int]] = {}
+        for index, request in enumerate(normalized_requests):
+            output_groups.setdefault(_output_lock_key(request.output), []).append(index)
+        collisions = [
+            (key, indexes) for key, indexes in output_groups.items() if len(indexes) > 1
+        ]
+        if collisions:
+            details = "; ".join(
+                f"{normalized_requests[indexes[0]].output} ({len(indexes)} requests)"
+                for _, indexes in collisions
+            )
+            return [
+                BuildResult(
+                    False,
+                    "collision",
+                    request,
+                    request.output,
+                    request.backend,
+                    message=f"Output collision detected before execution: {details}",
+                )
+                for request in normalized_requests
+            ]
         if workers <= 1 or len(requests) <= 1:
             return [self.build(request) for request in requests]
         worker_count = max(1, min(int(workers), len(requests)))
@@ -2136,6 +2309,18 @@ class CompilerEngine:
     ) -> list[BuildResult]:
         """Build one source for each requested architecture."""
 
+        return self.build_batch(
+            self.matrix_requests(request, architectures),
+            workers=workers,
+        )
+
+    def matrix_requests(
+        self,
+        request: BuildRequest,
+        architectures: Sequence[str],
+    ) -> list[BuildRequest]:
+        """Expand a matrix without executing it, preserving collision checks."""
+
         values: list[str] = []
         for architecture in architectures:
             normalized = str(architecture).lower()
@@ -2150,27 +2335,46 @@ class CompilerEngine:
                 f"{request.output.stem}{suffix}{request.output.suffix}"
             )
             requests.append(replace(request, output=output, architecture=architecture))
-        return self.build_batch(requests, workers=workers)
+        return requests
 
     def watch(
         self,
         request: BuildRequest,
         interval: float = 1.0,
         stop_event: threading.Event | None = None,
+        debounce: float = 0.35,
     ) -> Iterable[BuildResult]:
-        """Yield an initial build and subsequent builds when the source changes."""
+        """Yield an initial build and coalesced, cancellable source changes."""
 
-        event = stop_event or threading.Event()
+        poll_interval = max(0.05, float(interval))
+        debounce_seconds = max(0.05, float(debounce))
+        event = stop_event or request.cancel_event or threading.Event()
+        watched_request = replace(request, cancel_event=event)
         previous: str | None = None
+        observed: str | None = None
+        pending_since: float | None = None
         while not event.is_set():
             try:
-                current = sha256_file(request.source)
+                current = sha256_file(watched_request.source)
             except OSError:
                 current = None
-            if current and current != previous:
+            now = time.monotonic()
+            if current != observed:
+                observed = current
+                pending_since = (
+                    now - debounce_seconds if previous is None else now
+                )
+            if (
+                current
+                and current != previous
+                and pending_since is not None
+                and now - pending_since >= debounce_seconds
+            ):
+                result = self.build(watched_request)
                 previous = current
-                yield self.build(request)
-            event.wait(max(0.1, interval))
+                pending_since = None
+                yield result
+            event.wait(poll_interval)
 
 
 def artifact_manifest_path(path: os.PathLike[str] | str) -> Path:
@@ -2927,6 +3131,7 @@ def create_cli_parser() -> argparse.ArgumentParser:
     )
     build_parser.add_argument("--watch", action="store_true")
     build_parser.add_argument("--watch-interval", type=float, default=1.0)
+    build_parser.add_argument("--watch-debounce", type=float, default=0.35)
     build_parser.add_argument("--json", action="store_true")
 
     batch_parser = subparsers.add_parser("batch", help="Build multiple source files")
@@ -3170,7 +3375,11 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.watch:
             try:
-                for result in engine.watch(request, interval=args.watch_interval):
+                for result in engine.watch(
+                    request,
+                    interval=args.watch_interval,
+                    debounce=args.watch_debounce,
+                ):
                     if build_analytics:
                         build_analytics.record(result)
                     print(
@@ -3219,15 +3428,12 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             )
             requests.append(_profile_request(profile, args, source, output))
         if args.matrix:
-            results = [
-                result
+            matrix_requests = [
+                matrix_request
                 for request in requests
-                for result in engine.build_matrix(
-                    request,
-                    args.matrix,
-                    workers=args.jobs,
-                )
+                for matrix_request in engine.matrix_requests(request, args.matrix)
             ]
+            results = engine.build_batch(matrix_requests, workers=args.jobs)
         else:
             results = engine.build_batch(requests, workers=args.jobs)
         if build_analytics:
