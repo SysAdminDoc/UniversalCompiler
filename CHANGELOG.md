@@ -4,6 +4,12 @@ All notable changes to UniversalCompiler will be documented in this file.
 
 ## [v2.1.0] - 2026-08-03
 
+- Add a bounded, offline-by-default execution policy with executable-root
+  validation, minimal environments, timeouts, cancellation, process cleanup,
+  output caps, dependency-install gates, and redacted diagnostics across the
+  Python engine, legacy shells, and VS Code launcher.
+- Make post-build actions unable to launch compiled artifacts and require an
+  explicit setup action before downloading or installing toolchains.
 - Add a side-effect-free Python build engine and CLI with YAML profiles, backend
   previews, cache-aware builds, dependency prefetching, parallel batch builds,
   watch mode, and static post-build verification.

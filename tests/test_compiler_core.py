@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -12,16 +14,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import compiler_core
 from compiler_core import (
     BuildAnalytics,
+    BuildValidationError,
     DEFAULT_PROFILES,
     BuildRequest,
     CommandResult,
     CompilerEngine,
+    ExecutionPolicy,
     cli_main,
     compile_bytecode,
     detect_file_type,
     format_size,
     github_actions_template,
     load_profiles,
+    run_command,
     save_profiles,
     verify_artifact,
     wrap_msix,
@@ -40,6 +45,91 @@ def test_detect_file_type_and_size() -> None:
     assert detect_file_type("script.TS") == "ts"
     assert detect_file_type("README.md") is None
     assert format_size(1024) == "1.0 KB"
+
+
+def test_execution_policy_bounds_output_redacts_secrets_and_preserves_environment() -> None:
+    result = run_command(
+        (
+            sys.executable,
+            "-c",
+            "import os, sys; sys.stdout.reconfigure(encoding='utf-8'); "
+            "print(os.environ['UC_HOSTILE']); print('token=super-secret')",
+        ),
+        environment={"UC_HOSTILE": "spaces & quotes Ω"},
+        policy=ExecutionPolicy(max_output_bytes=1024),
+    )
+
+    assert result.success is True
+    assert "spaces & quotes Ω" in result.output
+    assert "token=[REDACTED]" in result.output
+    assert "super-secret" not in result.output
+
+
+def test_execution_policy_rejects_unapproved_tools_and_caps_output(tmp_path: Path) -> None:
+    with pytest.raises(BuildValidationError):
+        run_command(
+            (sys.executable, "-c", "print('not allowed')"),
+            policy=ExecutionPolicy(allowed_executable_roots=(tmp_path,)),
+        )
+
+    result = run_command(
+        (sys.executable, "-c", "print('x' * 1000)"),
+        policy=ExecutionPolicy(max_output_bytes=64),
+    )
+
+    assert result.success is True
+    assert result.output_truncated is True
+    assert "[output truncated by execution policy]" in result.stderr
+    assert len(result.stdout.encode("utf-8")) <= 64
+
+    with pytest.raises(BuildValidationError, match="network and install permission"):
+        run_command((sys.executable, "-m", "pip", "install", "example-package"))
+
+
+def test_execution_policy_times_out_and_cancels_processes() -> None:
+    timed_out = run_command(
+        (sys.executable, "-c", "import time; time.sleep(2)"),
+        policy=ExecutionPolicy(timeout_seconds=0.2),
+    )
+    assert timed_out.timed_out is True
+    assert timed_out.success is False
+    assert timed_out.returncode == 124
+
+    stop_event = threading.Event()
+    holder: dict[str, CommandResult] = {}
+
+    def run_cancellable() -> None:
+        holder["result"] = run_command(
+            (sys.executable, "-c", "import time; time.sleep(2)"),
+            policy=ExecutionPolicy(timeout_seconds=5),
+            stop_event=stop_event,
+        )
+
+    thread = threading.Thread(target=run_cancellable)
+    thread.start()
+    time.sleep(0.15)
+    stop_event.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert holder["result"].cancelled is True
+    assert holder["result"].returncode == 130
+
+
+def test_prefetch_requires_explicit_network_and_install_permissions(tmp_path: Path) -> None:
+    source = tmp_path / "script.py"
+    source.write_text("print('hello')\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("example-package\n", encoding="utf-8")
+    request = BuildRequest(
+        source=source,
+        output=tmp_path / "script.exe",
+        file_type="py",
+        backend="pyinstaller",
+        prefetch=True,
+    )
+
+    with pytest.raises(BuildValidationError, match="allow-network"):
+        CompilerEngine(require_available=False).prefetch_dependencies(request)
 
 
 def test_profiles_round_trip_without_extra_dependency(tmp_path: Path) -> None:

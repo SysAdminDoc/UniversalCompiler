@@ -94,17 +94,18 @@
 
 1. **Download** `UniversalCompiler.ps1`
 2. **Right-click** → "Run with PowerShell"
-3. **First Run**: The setup wizard will guide you through installing compilers
+3. **Install compilers explicitly** with `-ForceSetup` when you want the setup wizard; normal launches never download or install tools
 
 ### Requirements
 
 - **Windows 10/11** (Windows 7/8 may work with limitations)
 - **PowerShell 5.1+** (included with Windows 10+)
 - **.NET Framework 4.5+** (included with Windows 10+)
+- Python CLI builds do not install packages implicitly; install `customtkinter` explicitly only when launching the Python GUI
 
 ### Optional Dependencies
 
-The setup wizard can automatically install these for you:
+The explicitly launched setup wizard can install these for you:
 
 | Compiler | For | Auto-Install |
 |----------|-----|--------------|
@@ -140,6 +141,12 @@ python .\UniversalCompiler.py build .\myscript.py --backend nuitka --preview
 # Build with a named YAML profile and static artifact verification
 python .\UniversalCompiler.py build .\myscript.py --profile Release --verify
 
+# Keep the bounded default policy, or tune its per-command limits
+python .\UniversalCompiler.py build .\myscript.py --timeout 900 --max-output-bytes 4194304
+
+# Dependency installation is never implicit; both permissions are required
+python .\UniversalCompiler.py build .\myscript.py --prefetch --allow-network --allow-dependency-install
+
 # Build a queue in parallel
 python .\UniversalCompiler.py batch .\src\*.py --jobs 4 --output-dir .\dist
 
@@ -166,9 +173,13 @@ python .\UniversalCompiler.py init-actions --language py
 
 Profiles are stored in `%APPDATA%\UniversalCompiler\profiles.yaml`; use
 `init-profiles` to create a starter file. Builds use a content/toolchain cache
-next to the output and opt-in dependency prefetching (`--prefetch`). Static
-verification checks the produced container or PE header without launching the
-artifact, so a GUI build cannot steal focus or alter the active desktop.
+next to the output and opt-in dependency prefetching (`--prefetch
+--allow-network --allow-dependency-install`). Every compiler command is
+launched without a shell with bounded timeout/output capture, a minimal
+inherited environment, and redacted diagnostics. Static verification checks
+the produced container or PE header without launching the artifact, so a GUI
+build cannot steal focus or alter the active desktop. Post-build actions never
+launch the compiled artifact.
 MSIX/APPX output is deliberately unsigned and is intended for packaging or
 internal testing only.
 
@@ -198,7 +209,6 @@ Save your favorite settings as profiles:
 |--------|-------------|
 | None | Just compile |
 | Open Output Folder | Opens Explorer to the EXE location |
-| Run Executable | Launches the compiled EXE |
 | Copy to Folder | Copies EXE to a specified directory |
 
 ## ⌨️ Keyboard Shortcuts

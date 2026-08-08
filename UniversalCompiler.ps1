@@ -26,6 +26,120 @@ $script:TemplatesDir = Join-Path $script:ConfigDir "Templates"
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# External compiler and setup commands use a bounded, offline-by-default policy.
+$script:ExecutionTimeoutSeconds = 900
+$script:ExecutionMaxOutputBytes = 4MB
+$script:ExecutionInheritedEnvironment = @(
+    'APPDATA', 'COMSPEC', 'HOME', 'HOMEDRIVE', 'HOMEPATH', 'LOCALAPPDATA',
+    'NUMBER_OF_PROCESSORS', 'PATH', 'PATHEXT', 'PROCESSOR_ARCHITECTURE',
+    'PROGRAMDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'SYSTEMDRIVE',
+    'SYSTEMROOT', 'TEMP', 'TMP', 'USERDOMAIN', 'USERNAME', 'USERPROFILE',
+    'VIRTUAL_ENV', 'WINDIR'
+)
+$script:ExecutionAllowedRoots = @($PSHOME, (Join-Path $env:WINDIR 'System32')) + @($env:PATH -split ';' | Where-Object { $_ })
+
+function ConvertTo-ProcessArgument {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value -or $Value.Length -eq 0) { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+    $result = '"'; $slashes = 0
+    foreach ($char in $Value.ToCharArray()) {
+        if ($char -eq '\') { $slashes++; continue }
+        if ($char -eq '"') {
+            if ($slashes -gt 0) { $result += (('\' * ($slashes * 2 + 1)) -join '') }
+            $result += '"'; $slashes = 0; continue
+        }
+        if ($slashes -gt 0) { $result += (('\' * $slashes) -join ''); $slashes = 0 }
+        $result += $char
+    }
+    if ($slashes -gt 0) { $result += (('\' * ($slashes * 2)) -join '') }
+    return $result + '"'
+}
+
+function ConvertTo-PowerShellLiteral {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return "''" }
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
+function Test-ExecutionPathAllowed {
+    param([string]$Path)
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    foreach ($root in $script:ExecutionAllowedRoots) {
+        if (-not $root) { continue }
+        try {
+            $rootFull = [IO.Path]::GetFullPath($root).TrimEnd('\')
+            if ($full.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -or
+                $full.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        } catch { }
+    }
+    return $false
+}
+
+function Redact-ExecutionText {
+    param([AllowNull()][string]$Text)
+    if ($null -eq $Text) { return '' }
+    return [regex]::Replace($Text, '(?i)(\b(?:api[_-]?key|password|secret|token)\b\s*[=:]\s*)[^\s,;]+', '$1[REDACTED]')
+}
+
+function Invoke-PolicyCommand {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [string]$WorkingDirectory = (Get-Location).Path,
+        [switch]$AllowNetwork,
+        [switch]$AllowDependencyInstall,
+        [switch]$AllowTemporaryExecutable
+    )
+    if ($AllowDependencyInstall -and -not $AllowNetwork) {
+        return [pscustomobject]@{ Success=$false; Output='Dependency installation requires explicit network permission'; ReturnCode=2; TimedOut=$false }
+    }
+    try {
+        $command = Get-Command -Name $FilePath -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        $resolved = if ($command) { $command.Source } elseif (Test-Path -LiteralPath $FilePath -PathType Leaf) { (Resolve-Path -LiteralPath $FilePath).Path } else { throw "Executable not found: $FilePath" }
+        $temporaryRoot = [IO.Path]::GetTempPath()
+        if (-not (Test-ExecutionPathAllowed $resolved) -and
+            -not ($AllowTemporaryExecutable -and $AllowNetwork -and $AllowDependencyInstall -and
+                $resolved.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase))) {
+            throw "Executable is outside the execution policy roots: $resolved"
+        }
+        if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) { throw "Working directory not found: $WorkingDirectory" }
+        $psi = [Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $resolved
+        $psi.Arguments = (($Arguments | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) }) -join ' ')
+        $psi.WorkingDirectory = (Resolve-Path -LiteralPath $WorkingDirectory).Path
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.EnvironmentVariables.Clear()
+        foreach ($key in $script:ExecutionInheritedEnvironment) {
+            $value = [Environment]::GetEnvironmentVariable($key)
+            if ($null -ne $value) { $psi.EnvironmentVariables[$key] = $value }
+        }
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $psi
+        if (-not $process.Start()) { throw "Could not start executable: $resolved" }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $timedOut = -not $process.WaitForExit($script:ExecutionTimeoutSeconds * 1000)
+        if ($timedOut) { try { $process.Kill() } catch { }; $process.WaitForExit() }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $output = Redact-ExecutionText (($stdout + $stderr).Trim())
+        $bytes = [Text.Encoding]::UTF8.GetByteCount($output)
+        if ($bytes -gt $script:ExecutionMaxOutputBytes) {
+            $encoded = [Text.Encoding]::UTF8.GetBytes($output)
+            $output = [Text.Encoding]::UTF8.GetString($encoded, 0, $script:ExecutionMaxOutputBytes) + "`n[output truncated by execution policy]"
+        }
+        return [pscustomobject]@{ Success=($process.ExitCode -eq 0 -and -not $timedOut); Output=$output; ReturnCode=$(if ($timedOut) { 124 } else { $process.ExitCode }); TimedOut=$timedOut }
+    } catch {
+        return [pscustomobject]@{ Success=$false; Output=(Redact-ExecutionText $_.Exception.Message); ReturnCode=127; TimedOut=$false }
+    }
+}
+
 # Ensure config directory
 if (-not (Test-Path $script:ConfigDir)) { New-Item -ItemType Directory -Path $script:ConfigDir -Force | Out-Null }
 
@@ -163,7 +277,8 @@ function Install-RubyDirect {
     try {
         $url = "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-3.2.4-1/rubyinstaller-3.2.4-1-x64.exe"; $inst = Join-Path $env:TEMP "ruby_$(Get-Random).exe"
         $wc = New-Object System.Net.WebClient; $wc.Headers.Add("User-Agent", "PowerShell"); $wc.DownloadFile($url, $inst)
-        Start-Process -FilePath $inst -ArgumentList "/verysilent /norestart /tasks=modpath" -Wait; Remove-Item $inst -Force -EA SilentlyContinue
+        $installResult = Invoke-PolicyCommand -FilePath $inst -Arguments @('/verysilent', '/norestart', '/tasks=modpath') -AllowNetwork -AllowDependencyInstall -AllowTemporaryExecutable
+        Remove-Item $inst -Force -EA SilentlyContinue; if (-not $installResult.Success) { return $false }
         $rubyPaths = @("C:\Ruby32-x64\bin", "C:\Ruby31-x64\bin"); foreach ($rp in $rubyPaths) { if (Test-Path (Join-Path $rp "ruby.exe")) { $env:PATH = "$rp;$env:PATH"; return $true } }
         return $false
     } catch { return $false }
@@ -173,7 +288,8 @@ function Install-AutoHotkeyDirect {
     try {
         $url = "https://www.autohotkey.com/download/ahk-v2.exe"; $inst = Join-Path $env:TEMP "ahk_$(Get-Random).exe"
         $wc = New-Object System.Net.WebClient; $wc.Headers.Add("User-Agent", "PowerShell"); $wc.DownloadFile($url, $inst)
-        Start-Process -FilePath $inst -ArgumentList "/silent" -Wait; Remove-Item $inst -Force -EA SilentlyContinue
+        $installResult = Invoke-PolicyCommand -FilePath $inst -Arguments @('/silent') -AllowNetwork -AllowDependencyInstall -AllowTemporaryExecutable
+        Remove-Item $inst -Force -EA SilentlyContinue; if (-not $installResult.Success) { return $false }
         $ahkPaths = @("${env:ProgramFiles}\AutoHotkey\Compiler\Ahk2Exe.exe", "${env:ProgramFiles}\AutoHotkey\v2\Compiler\Ahk2Exe.exe")
         foreach ($ap in $ahkPaths) { if (Test-Path $ap) { return $true } }; return $false
     } catch { return $false }
@@ -191,22 +307,22 @@ function Get-DependencyStatus {
         'IExpress' = @{ Name='IExpress'; Desc='Batch/VBS'; Installed=$false; Size='Built-in'; BuiltIn=$true }
     }
     # Check each
-    $pyCmd = Get-Command python -EA SilentlyContinue; if ($pyCmd) { $deps['PyInstaller'].BaseOK=$true; $pipChk = & pip show pyinstaller 2>&1; $deps['PyInstaller'].Installed = ($pipChk -match "Name: pyinstaller") }
-    $nodeCmd = Get-Command node -EA SilentlyContinue; if ($nodeCmd) { $deps['pkg'].BaseOK=$true; $pkgChk = & npm list -g pkg 2>&1; $deps['pkg'].Installed = ($pkgChk -match "pkg@") }
+    $pyCmd = Get-Command python -EA SilentlyContinue; if ($pyCmd) { $deps['PyInstaller'].BaseOK=$true; $pipChk = Invoke-PolicyCommand -FilePath 'pip' -Arguments @('show', 'pyinstaller'); $deps['PyInstaller'].Installed = ($pipChk.Output -match "Name: pyinstaller") }
+    $nodeCmd = Get-Command node -EA SilentlyContinue; if ($nodeCmd) { $deps['pkg'].BaseOK=$true; $pkgChk = Invoke-PolicyCommand -FilePath 'npm' -Arguments @('list', '-g', 'pkg'); $deps['pkg'].Installed = ($pkgChk.Output -match "pkg@") }
     $goCmd = Get-Command go -EA SilentlyContinue; if (-not $goCmd) { if (Test-Path "$env:LOCALAPPDATA\Programs\Go\bin\go.exe") { $goCmd = $true } }; $deps['Go'].Installed = ($null -ne $goCmd)
     $rubyCmd = Get-Command ruby -EA SilentlyContinue; if (-not $rubyCmd) { @("C:\Ruby32-x64\bin\ruby.exe","C:\Ruby31-x64\bin\ruby.exe") | ForEach-Object { if (Test-Path $_) { $rubyCmd = $_ } } }
-    if ($rubyCmd) { $ocraChk = & gem list ocra 2>&1; $deps['Ruby'].Installed = ($ocraChk -match "ocra \(") }
+    if ($rubyCmd) { $ocraChk = Invoke-PolicyCommand -FilePath 'gem' -Arguments @('list', 'ocra'); $deps['Ruby'].Installed = ($ocraChk.Output -match "ocra \(") }
     @("${env:ProgramFiles}\AutoHotkey\Compiler\Ahk2Exe.exe","${env:ProgramFiles}\AutoHotkey\v2\Compiler\Ahk2Exe.exe") | ForEach-Object { if (Test-Path $_) { $deps['AutoHotkey'].Installed = $true } }
     @("${env:WINDIR}\Microsoft.NET\Framework64\v4.0.30319\csc.exe","${env:WINDIR}\Microsoft.NET\Framework\v4.0.30319\csc.exe") | ForEach-Object { if (Test-Path $_) { $deps['CSC'].Installed = $true } }
     $deps['IExpress'].Installed = (Test-Path "$env:WINDIR\System32\iexpress.exe")
     return $deps
 }
 
-function Install-PS2EXE { $ok = Install-PS2EXEDirect; if (-not $ok) { try { Install-Module ps2exe -Scope CurrentUser -Force -EA Stop; $ok = $true } catch { } }; return $ok }
-function Install-PyInstaller { try { & pip install pyinstaller --quiet 2>&1 | Out-Null; return ((& pip show pyinstaller 2>&1) -match "Name: pyinstaller") } catch { return $false } }
-function Install-Pkg { try { & npm install -g pkg 2>&1 | Out-Null; return ((& npm list -g pkg 2>&1) -match "pkg@") } catch { return $false } }
+function Install-PS2EXE { $ok = Install-PS2EXEDirect; if (-not $ok) { $result = Invoke-PolicyCommand -FilePath 'powershell' -Arguments @('-NoProfile', '-NonInteractive', '-Command', 'Install-Module ps2exe -Scope CurrentUser -Force') -AllowNetwork -AllowDependencyInstall; $ok = $result.Success }; return $ok }
+function Install-PyInstaller { $result = Invoke-PolicyCommand -FilePath 'pip' -Arguments @('install', 'pyinstaller', '--quiet') -AllowNetwork -AllowDependencyInstall; if (-not $result.Success) { return $false }; return ((Invoke-PolicyCommand -FilePath 'pip' -Arguments @('show', 'pyinstaller')).Output -match "Name: pyinstaller") }
+function Install-Pkg { $result = Invoke-PolicyCommand -FilePath 'npm' -Arguments @('install', '-g', 'pkg') -AllowNetwork -AllowDependencyInstall; if (-not $result.Success) { return $false }; return ((Invoke-PolicyCommand -FilePath 'npm' -Arguments @('list', '-g', 'pkg')).Output -match "pkg@") }
 function Install-Go { return Install-GoDirect }
-function Install-Ruby { $ok = Install-RubyDirect; if ($ok) { Start-Sleep -Seconds 2; & gem install ocra --no-document 2>&1 | Out-Null }; return $ok }
+function Install-Ruby { $ok = Install-RubyDirect; if ($ok) { Start-Sleep -Seconds 2; [void](Invoke-PolicyCommand -FilePath 'gem' -Arguments @('install', 'ocra', '--no-document') -AllowNetwork -AllowDependencyInstall) }; return $ok }
 function Install-AutoHotkey { return Install-AutoHotkeyDirect }
 
 # ============================================================================
@@ -305,7 +421,8 @@ public class SetupDpiAwareness {
 # Check for first run
 $needSetup = $true
 if (Test-Path $script:ConfigFile) { try { $cfg = Get-Content $script:ConfigFile -Raw | ConvertFrom-Json; if ($cfg.DependenciesInstalled) { $needSetup = $false } } catch { } }
-if (($needSetup -or $ForceSetup) -and -not $SkipSetup) { Show-SetupWindow | Out-Null }
+# Setup is an explicit operator action; normal launches never download/install tools.
+if ($ForceSetup -and -not $SkipSetup) { Show-SetupWindow | Out-Null }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
 
@@ -484,7 +601,7 @@ $mainXaml = @"
                             <TextBlock Text="⚡ Post-Build Action" FontSize="13" FontWeight="SemiBold" Foreground="$($th.T1)" Margin="0,0,0,10"/>
                             <StackPanel Orientation="Horizontal">
                                 <ComboBox x:Name="cmbPostBuild" Style="{StaticResource Cmb}" Width="180">
-                                    <ComboBoxItem Content="None" IsSelected="True"/><ComboBoxItem Content="Open Output Folder"/><ComboBoxItem Content="Run Executable"/><ComboBoxItem Content="Copy to Folder..."/>
+                                    <ComboBoxItem Content="None" IsSelected="True"/><ComboBoxItem Content="Open Output Folder"/><ComboBoxItem Content="Copy to Folder..."/>
                                 </ComboBox>
                                 <TextBox x:Name="txtPostBuildPath" Style="{StaticResource Txt}" Width="200" Margin="8,0,0,0" Visibility="Collapsed"/>
                                 <Button x:Name="btnPostBuildPath" Content="..." Style="{StaticResource BtnS}" Margin="4,0,0,0" Visibility="Collapsed"/>
@@ -666,7 +783,7 @@ $btnIconClear.Add_Click({ $txtIcon.Text = ""; $iconPreview.Visibility = 'Collaps
 $btnOutDir.Add_Click({ $dlg = New-Object System.Windows.Forms.FolderBrowserDialog; if ($dlg.ShowDialog() -eq 'OK') { $txtOutDir.Text = $dlg.SelectedPath } })
 
 # Post-build
-$cmbPostBuild.Add_SelectionChanged({ $show = ($cmbPostBuild.SelectedIndex -eq 3); $txtPostBuildPath.Visibility = if ($show) { 'Visible' } else { 'Collapsed' }; $btnPostBuildPath.Visibility = $txtPostBuildPath.Visibility })
+$cmbPostBuild.Add_SelectionChanged({ $show = ($cmbPostBuild.SelectedIndex -eq 2); $txtPostBuildPath.Visibility = if ($show) { 'Visible' } else { 'Collapsed' }; $btnPostBuildPath.Visibility = $txtPostBuildPath.Visibility })
 $btnPostBuildPath.Add_Click({ $dlg = New-Object System.Windows.Forms.FolderBrowserDialog; if ($dlg.ShowDialog() -eq 'OK') { $txtPostBuildPath.Text = $dlg.SelectedPath } })
 
 # Profile selection
@@ -723,33 +840,39 @@ function Compile-PS1 { param($Src, $Out, $Ico, $Admin, $NoConsole, $Meta)
     Log "Compiling PowerShell..." -L Info; Progress -V 20
     try {
         $modPath = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "WindowsPowerShell\Modules\ps2exe"
-        if (Test-Path (Join-Path $modPath "ps2exe.psm1")) { Import-Module (Join-Path $modPath "ps2exe.psm1") -Force } else { Import-Module ps2exe -Force }
-        $params = @{ InputFile=$Src; OutputFile=$Out }
-        if ($Ico -and (Test-Path $Ico)) { $params.IconFile = $Ico }
-        if ($Admin) { $params.RequireAdmin = $true }
-        if ($NoConsole) { $params.NoConsole = $true }
-        if ($Meta.Title) { $params.Title = $Meta.Title }
-        if ($Meta.Version) { $params.Version = $Meta.Version }
-        if ($Meta.Company) { $params.Company = $Meta.Company }
-        Progress -V 60; Invoke-PS2EXE @params 2>&1 | Out-Null; Progress -V 90
-        return (Test-Path $Out)
+        $module = if (Test-Path (Join-Path $modPath "ps2exe.psm1")) { ConvertTo-PowerShellLiteral (Join-Path $modPath "ps2exe.psm1") } else { 'ps2exe' }
+        $psCommand = "`$ErrorActionPreference='Stop'; Import-Module $module -Force; Invoke-PS2EXE -InputFile $(ConvertTo-PowerShellLiteral $Src) -OutputFile $(ConvertTo-PowerShellLiteral $Out)"
+        if ($Ico -and (Test-Path $Ico)) { $psCommand += " -IconFile $(ConvertTo-PowerShellLiteral $Ico)" }
+        if ($Admin) { $psCommand += ' -RequireAdmin' }
+        if ($NoConsole) { $psCommand += ' -NoConsole' }
+        if ($Meta.Title) { $psCommand += " -Title $(ConvertTo-PowerShellLiteral $Meta.Title)" }
+        if ($Meta.Version) { $psCommand += " -Version $(ConvertTo-PowerShellLiteral $Meta.Version)" }
+        if ($Meta.Company) { $psCommand += " -Company $(ConvertTo-PowerShellLiteral $Meta.Company)" }
+        Progress -V 60
+        $result = Invoke-PolicyCommand -FilePath 'powershell' -Arguments @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', $psCommand) -WorkingDirectory (Split-Path $Src)
+        if (-not $result.Success -and $result.Output) { Log $result.Output -L Error }
+        Progress -V 90; return ($result.Success -and (Test-Path $Out))
     } catch { Log "Error: $($_.Exception.Message)" -L Error; return $false }
 }
 
 function Compile-Generic { param($Src, $Out, $Type)
     Log "Compiling $Type..." -L Info; Progress -V 30
+    $filePath = $null; $arguments = @(); $workingDirectory = Split-Path $Src
     switch ($Type) {
-        'py' { $pyi = (Get-Command pyinstaller -EA SilentlyContinue).Source; $dir = Split-Path $Out; $name = [IO.Path]::GetFileNameWithoutExtension($Out); & $pyi --distpath $dir --name $name --onefile --noconfirm $Src 2>&1 | Out-Null }
+        'py' { $pyi = (Get-Command pyinstaller -EA SilentlyContinue).Source; if (-not $pyi) { return $false }; $filePath = $pyi; $dir = Split-Path $Out; $name = [IO.Path]::GetFileNameWithoutExtension($Out); $arguments = @('--distpath', $dir, '--name', $name, '--onefile', '--noconfirm', $Src) }
         'bat' { return Compile-BAT $Src $Out $null $false }
         'cmd' { return Compile-BAT $Src $Out $null $false }
-        'js' { & pkg $Src --target node18-win-x64 --output $Out 2>&1 | Out-Null }
-        'cs' { $csc = "${env:WINDIR}\Microsoft.NET\Framework64\v4.0.30319\csc.exe"; & $csc /out:$Out $Src 2>&1 | Out-Null }
-        'go' { $goExe = if (Get-Command go -EA SilentlyContinue) { "go" } else { "$env:LOCALAPPDATA\Programs\Go\bin\go.exe" }; & $goExe build -o $Out $Src 2>&1 | Out-Null }
-        'ahk' { $ahk = @("${env:ProgramFiles}\AutoHotkey\Compiler\Ahk2Exe.exe","${env:ProgramFiles}\AutoHotkey\v2\Compiler\Ahk2Exe.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1; & $ahk /in $Src /out $Out 2>&1 | Out-Null }
-        'rb' { & ocra $Src --output $Out 2>&1 | Out-Null }
+        'js' { $filePath = 'pkg'; $arguments = @($Src, '--target', 'node18-win-x64', '--output', $Out) }
+        'cs' { $filePath = "${env:WINDIR}\Microsoft.NET\Framework64\v4.0.30319\csc.exe"; $arguments = @("/out:$Out", $Src) }
+        'go' { $filePath = if (Get-Command go -EA SilentlyContinue) { 'go' } else { "$env:LOCALAPPDATA\Programs\Go\bin\go.exe" }; $arguments = @('build', '-o', $Out, $Src) }
+        'ahk' { $filePath = @("${env:ProgramFiles}\AutoHotkey\Compiler\Ahk2Exe.exe","${env:ProgramFiles}\AutoHotkey\v2\Compiler\Ahk2Exe.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1; if (-not $filePath) { return $false }; $arguments = @('/in', $Src, '/out', $Out) }
+        'rb' { $filePath = 'ocra'; $arguments = @($Src, '--output', $Out) }
         'vbs' { return Compile-BAT $Src $Out $null $false }
     }
-    Progress -V 90; return (Test-Path $Out)
+    if (-not $filePath) { return $false }
+    $result = Invoke-PolicyCommand -FilePath $filePath -Arguments $arguments -WorkingDirectory $workingDirectory
+    if (-not $result.Success -and $result.Output) { Log $result.Output -L Error }
+    Progress -V 90; return ($result.Success -and (Test-Path $Out))
 }
 
 function Compile-BAT { param($Src, $Out, $Ico, $Admin)
@@ -757,9 +880,10 @@ function Compile-BAT { param($Src, $Out, $Ico, $Admin)
     $bn = [IO.Path]::GetFileName($Src); Copy-Item $Src (Join-Path $tmp $bn) -Force
     $sed = "[Version]`r`nClass=IEXPRESS`r`nSEDVersion=3`r`n[Options]`r`nPackagePurpose=InstallApp`r`nShowInstallProgramWindow=0`r`nHideExtractAnimation=1`r`nUseLongFileName=1`r`nInsideCompressed=0`r`nCAB_FixedSize=0`r`nRebootMode=N`r`nTargetName=$Out`r`nFriendlyName=App`r`nAppLaunched=cmd /c `"$bn`"`r`nPostInstallCmd=<None>`r`nSourceFiles=SourceFiles`r`n[Strings]`r`n[SourceFiles]`r`nSourceFiles0=$tmp\`r`n[SourceFiles0]`r`n%FILE0%=$bn"
     Set-Content (Join-Path $tmp "c.sed") $sed -Encoding ASCII
-    & "$env:WINDIR\System32\iexpress.exe" /N /Q (Join-Path $tmp "c.sed") 2>&1 | Out-Null
+    $result = Invoke-PolicyCommand -FilePath "$env:WINDIR\System32\iexpress.exe" -Arguments @('/N', '/Q', (Join-Path $tmp "c.sed")) -WorkingDirectory $tmp
     Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
-    return (Test-Path $Out)
+    if (-not $result.Success -and $result.Output) { Log $result.Output -L Error }
+    return ($result.Success -and (Test-Path $Out))
 }
 
 function Start-Compile {
@@ -788,8 +912,7 @@ function Start-Compile {
             # Post-build
             switch ($cmbPostBuild.SelectedIndex) {
                 1 { Start-Process explorer.exe "/select,`"$($script:outPath)`"" }
-                2 { Start-Process $script:outPath }
-                3 { if ($txtPostBuildPath.Text) { Copy-Item $script:outPath $txtPostBuildPath.Text -Force; Log "Copied to $($txtPostBuildPath.Text)" -L Info } }
+                2 { if ($txtPostBuildPath.Text) { Copy-Item $script:outPath $txtPostBuildPath.Text -Force; Log "Copied to $($txtPostBuildPath.Text)" -L Info } }
             }
             # Notification
             if ($chkNotify.IsChecked) { Show-ToastNotification "Build Complete" "$(Split-Path $script:outPath -Leaf) compiled successfully" "Success" }

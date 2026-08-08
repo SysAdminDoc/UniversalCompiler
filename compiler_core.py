@@ -13,6 +13,7 @@ import concurrent.futures
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import py_compile
 import re
@@ -165,6 +166,246 @@ class BuildValidationError(ValueError):
     """Raised when a build request cannot be safely planned."""
 
 
+DEFAULT_EXECUTION_TIMEOUT_SECONDS = 15 * 60
+DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+DEFAULT_INHERITED_ENVIRONMENT = (
+    "APPDATA",
+    "COMSPEC",
+    "HOME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "PATH",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERDOMAIN",
+    "USERNAME",
+    "USERPROFILE",
+    "VIRTUAL_ENV",
+    "WINDIR",
+)
+_SENSITIVE_ARGUMENT_NAMES = frozenset(
+    {
+        "--api-key",
+        "--apikey",
+        "--password",
+        "--secret",
+        "--token",
+        "--access-token",
+        "--client-secret",
+    }
+)
+_SENSITIVE_TEXT_PATTERN = re.compile(
+    r"(?i)(\b(?:api[_-]?key|password|secret|token)\b\s*[=:]\s*)([^\s,;]+)"
+)
+
+
+def _default_executable_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    try:
+        roots.append(Path(sys.executable).resolve().parent)
+    except OSError:
+        pass
+    path_value = os.environ.get("PATH") or os.environ.get("Path") or ""
+    for value in path_value.split(os.pathsep):
+        if value:
+            try:
+                roots.append(Path(value).expanduser().resolve())
+            except OSError:
+                continue
+    unique: dict[str, Path] = {}
+    for root in roots:
+        unique.setdefault(os.path.normcase(str(root)), root)
+    return tuple(unique.values())
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _dependency_install_requested(command: Sequence[str]) -> bool:
+    """Recognize common package-manager mutations before process creation."""
+
+    values = [str(item).strip().lower() for item in command]
+    if not values:
+        return False
+    executable = Path(values[0]).stem
+    if executable in {"pip", "pip3", "pipx"}:
+        return any(value in {"install", "download", "wheel"} for value in values[1:])
+    if executable in {"npm", "pnpm", "yarn", "bun", "gem"}:
+        return any(value in {"install", "i", "add", "update", "upgrade", "fetch"} for value in values[1:])
+    if executable == "go":
+        return len(values) > 1 and values[1] == "mod" and any(
+            value in {"download", "tidy", "vendor"} for value in values[2:]
+        )
+    if executable == "cargo":
+        return len(values) > 1 and values[1] in {"fetch", "update"}
+    if executable in {"python", "python3", "py", "pwsh", "powershell"}:
+        command_text = " ".join(values)
+        return bool(
+            re.search(
+                r"(?:-m\s+pip\s+(?:install|download|wheel)|"
+                r"install-module|invoke-(?:webrequest|restmethod)|downloadfile|"
+                r"start-bitstransfer)",
+                command_text,
+            )
+        )
+    return False
+
+
+@dataclass(frozen=True)
+class ExecutionPolicy:
+    """Boundaries applied to every compiler/tool subprocess.
+
+    The policy is intentionally restrictive by default: it inherits only a
+    small, toolchain-relevant environment, caps runtime/output, and does not
+    authorize network access or dependency installation.  Network/install
+    permissions are checked by dependency-prefetch callers; this class does
+    not pretend to sandbox arbitrary compiler behavior.
+    """
+
+    timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+    allow_network: bool = False
+    allow_dependency_install: bool = False
+    inherited_environment: tuple[str, ...] = DEFAULT_INHERITED_ENVIRONMENT
+    allowed_executable_roots: tuple[Path, ...] = field(
+        default_factory=_default_executable_roots
+    )
+
+    def __post_init__(self) -> None:
+        timeout = float(self.timeout_seconds)
+        output_limit = int(self.max_output_bytes)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Execution timeout must be a finite positive number")
+        if output_limit <= 0:
+            raise ValueError("Maximum command output must be positive")
+        if self.allow_dependency_install and not self.allow_network:
+            raise ValueError(
+                "Dependency installation requires explicit network permission"
+            )
+        object.__setattr__(self, "timeout_seconds", timeout)
+        object.__setattr__(self, "max_output_bytes", output_limit)
+        object.__setattr__(
+            self,
+            "inherited_environment",
+            tuple(str(key).upper() for key in self.inherited_environment),
+        )
+        object.__setattr__(
+            self,
+            "allowed_executable_roots",
+            tuple(Path(root).expanduser() for root in self.allowed_executable_roots),
+        )
+
+    def for_request(self, request: BuildRequest) -> ExecutionPolicy:
+        """Return this policy with request-scoped limits and permissions."""
+
+        return replace(
+            self,
+            timeout_seconds=(
+                self.timeout_seconds
+                if request.timeout_seconds is None
+                else request.timeout_seconds
+            ),
+            max_output_bytes=(
+                self.max_output_bytes
+                if request.max_output_bytes is None
+                else request.max_output_bytes
+            ),
+            allow_network=self.allow_network or request.allow_network,
+            allow_dependency_install=(
+                self.allow_dependency_install or request.allow_dependency_install
+            ),
+        )
+
+    def environment(self, overrides: Mapping[str, str] | None = None) -> dict[str, str]:
+        """Build a minimal inherited environment plus explicit overrides."""
+
+        allowed = set(self.inherited_environment)
+        result = {
+            key: value
+            for key, value in os.environ.items()
+            if key.upper() in allowed
+        }
+        for key, value in (overrides or {}).items():
+            normalized_key = str(key)
+            normalized_value = str(value)
+            if "\x00" in normalized_key or "\x00" in normalized_value:
+                raise BuildValidationError("Environment values cannot contain NUL bytes")
+            result[normalized_key] = normalized_value
+        return result
+
+    def validate_command(
+        self,
+        command: Sequence[str],
+        cwd: os.PathLike[str] | str | None = None,
+    ) -> tuple[str, ...]:
+        """Validate argv/cwd and return the normalized command tuple."""
+
+        normalized = tuple(str(item) for item in command)
+        if not normalized:
+            raise BuildValidationError("Cannot execute an empty command")
+        if any("\x00" in item for item in normalized):
+            raise BuildValidationError("Command arguments cannot contain NUL bytes")
+        executable = Path(normalized[0]).expanduser()
+        if not executable.is_absolute():
+            resolved = shutil.which(normalized[0])
+            if not resolved:
+                raise BuildValidationError(f"Executable not found: {normalized[0]}")
+            executable = Path(resolved)
+        if self.allowed_executable_roots and not any(
+            _path_is_within(executable, root)
+            for root in self.allowed_executable_roots
+        ):
+            roots = ", ".join(str(root) for root in self.allowed_executable_roots)
+            raise BuildValidationError(
+                f"Executable is outside the execution policy roots: {executable} ({roots})"
+            )
+        if cwd is not None and not Path(cwd).is_dir():
+            raise BuildValidationError(f"Working directory not found: {cwd}")
+        return normalized
+
+
+def redact_command(command: Sequence[str]) -> tuple[str, ...]:
+    """Mask values following common secret-bearing command options."""
+
+    redacted: list[str] = []
+    mask_next = False
+    for raw_value in command:
+        value = str(raw_value)
+        option = value.split("=", 1)[0].lower()
+        if mask_next:
+            redacted.append("[REDACTED]")
+            mask_next = False
+        elif option in _SENSITIVE_ARGUMENT_NAMES:
+            if "=" in value:
+                redacted.append(f"{option}=[REDACTED]")
+            else:
+                redacted.append(value)
+                mask_next = True
+        else:
+            redacted.append(value)
+    return tuple(redacted)
+
+
+def redact_text(value: str) -> str:
+    """Mask simple key/value secrets in captured diagnostics."""
+
+    return _SENSITIVE_TEXT_PATTERN.sub(r"\1[REDACTED]", value)
+
+
 @dataclass(frozen=True)
 class BuildRequest:
     """All inputs that affect a reproducible build."""
@@ -188,6 +429,10 @@ class BuildRequest:
     extra_args: tuple[str, ...] = ()
     toolchain_versions: Mapping[str, str] = field(default_factory=dict)
     upx: bool = False
+    timeout_seconds: float | None = None
+    max_output_bytes: int | None = None
+    allow_network: bool = False
+    allow_dependency_install: bool = False
 
     def normalized(self) -> BuildRequest:
         source = Path(self.source).expanduser()
@@ -220,6 +465,18 @@ class BuildRequest:
                 for key, value in dict(self.toolchain_versions).items()
             },
             upx=bool(self.upx),
+            timeout_seconds=(
+                float(self.timeout_seconds)
+                if self.timeout_seconds is not None
+                else None
+            ),
+            max_output_bytes=(
+                int(self.max_output_bytes)
+                if self.max_output_bytes is not None
+                else None
+            ),
+            allow_network=bool(self.allow_network),
+            allow_dependency_install=bool(self.allow_dependency_install),
         )
 
 
@@ -233,10 +490,12 @@ class CommandResult:
     stderr: str = ""
     duration_seconds: float = 0.0
     timed_out: bool = False
+    cancelled: bool = False
+    output_truncated: bool = False
 
     @property
     def success(self) -> bool:
-        return self.returncode == 0 and not self.timed_out
+        return self.returncode == 0 and not self.timed_out and not self.cancelled
 
     @property
     def output(self) -> str:
@@ -283,7 +542,18 @@ class BuildResult:
             str(self.request.icon) if self.request.icon else None
         )
         result["request"]["metadata"] = dict(self.request.metadata)
+        result["request"]["extra_args"] = list(redact_command(self.request.extra_args))
         result["output"] = str(self.output)
+        result["message"] = redact_text(str(result.get("message", "")))
+        result["commands"] = [
+            {
+                **asdict(command),
+                "command": list(redact_command(command.command)),
+                "stdout": redact_text(command.stdout),
+                "stderr": redact_text(command.stderr),
+            }
+            for command in self.commands
+        ]
         return result
 
 
@@ -545,12 +815,66 @@ def _ps_quote(value: os.PathLike[str] | str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def command_display(command: Sequence[str]) -> str:
+def command_display(command: Sequence[str], redact: bool = False) -> str:
     """Return a copy/paste-friendly display form without using a shell."""
 
+    values = redact_command(command) if redact else tuple(str(item) for item in command)
     if os.name == "nt":
-        return subprocess.list2cmdline([str(item) for item in command])
-    return shlex.join([str(item) for item in command])
+        return subprocess.list2cmdline(list(values))
+    return shlex.join(list(values))
+
+
+def _capture_output(
+    stream: Any,
+    limit: int,
+    buffer: bytearray,
+    truncated: list[bool],
+    budget: list[int],
+    budget_lock: threading.Lock,
+) -> None:
+    """Drain one process stream without allowing unbounded memory growth."""
+
+    try:
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                return
+            with budget_lock:
+                remaining = max(limit - budget[0], 0)
+                if remaining > 0:
+                    accepted = chunk[:remaining]
+                    buffer.extend(accepted)
+                    budget[0] += len(accepted)
+                if len(chunk) > remaining:
+                    truncated[0] = True
+    except (OSError, ValueError):
+        return
+
+
+def _terminate_process_tree(process: subprocess.Popen[Any]) -> None:
+    """Terminate a process and its Windows descendants without a shell."""
+
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        taskkill = shutil.which("taskkill")
+        if taskkill:
+            try:
+                subprocess.run(
+                    (taskkill, "/PID", str(process.pid), "/T", "/F"),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    try:
+        process.kill()
+    except OSError:
+        pass
 
 
 def run_command(
@@ -558,53 +882,107 @@ def run_command(
     cwd: os.PathLike[str] | str | None = None,
     environment: Mapping[str, str] | None = None,
     timeout: float | None = None,
+    policy: ExecutionPolicy | None = None,
+    stop_event: threading.Event | None = None,
 ) -> CommandResult:
-    """Run one executable directly, with no shell and no visible console window."""
+    """Run one bounded executable directly, with no shell or console window."""
 
-    normalized = tuple(str(item) for item in command)
+    effective_policy = policy or ExecutionPolicy()
+    normalized = effective_policy.validate_command(command, cwd)
+    if _dependency_install_requested(normalized) and not (
+        effective_policy.allow_network and effective_policy.allow_dependency_install
+    ):
+        raise BuildValidationError(
+            "Dependency installation requires both network and install permission"
+        )
+    effective_timeout = effective_policy.timeout_seconds
+    if timeout is not None:
+        effective_timeout = min(float(timeout), effective_timeout)
+    if not math.isfinite(effective_timeout) or effective_timeout <= 0:
+        raise BuildValidationError("Execution timeout must be a finite positive number")
     started = time.monotonic()
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    env = os.environ.copy()
-    if environment:
-        env.update({str(key): str(value) for key, value in environment.items()})
+    creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    env = effective_policy.environment(environment)
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             normalized,
             cwd=str(cwd) if cwd else None,
             env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
             creationflags=creationflags,
-            check=False,
         )
+        stdout_buffer = bytearray()
+        stderr_buffer = bytearray()
+        stdout_truncated = [False]
+        stderr_truncated = [False]
+        output_budget = [0]
+        output_budget_lock = threading.Lock()
+        readers = [
+            threading.Thread(
+                target=_capture_output,
+                args=(
+                    process.stdout,
+                    effective_policy.max_output_bytes,
+                    stdout_buffer,
+                    stdout_truncated,
+                    output_budget,
+                    output_budget_lock,
+                ),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_capture_output,
+                args=(
+                    process.stderr,
+                    effective_policy.max_output_bytes,
+                    stderr_buffer,
+                    stderr_truncated,
+                    output_budget,
+                    output_budget_lock,
+                ),
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+        timed_out = False
+        cancelled = False
+        deadline = started + effective_timeout
+        while process.poll() is None:
+            if stop_event is not None and stop_event.is_set():
+                cancelled = True
+                _terminate_process_tree(process)
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                _terminate_process_tree(process)
+                break
+            time.sleep(0.05)
+        returncode = process.wait()
+        for reader in readers:
+            reader.join(timeout=5)
+        stdout = bytes(stdout_buffer).decode("utf-8", errors="replace")
+        stderr = bytes(stderr_buffer).decode("utf-8", errors="replace")
+        output_truncated = stdout_truncated[0] or stderr_truncated[0]
+        if output_truncated:
+            stderr = f"{stderr}\n[output truncated by execution policy]".strip()
+        if timed_out:
+            returncode = 124
+        elif cancelled:
+            returncode = 130
         return CommandResult(
             command=normalized,
-            returncode=completed.returncode,
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
+            returncode=returncode,
+            stdout=redact_text(stdout),
+            stderr=redact_text(stderr),
             duration_seconds=time.monotonic() - started,
-        )
-    except subprocess.TimeoutExpired as error:
-        stdout = (
-            error.stdout.decode("utf-8", errors="replace")
-            if isinstance(error.stdout, bytes)
-            else (error.stdout or "")
-        )
-        stderr = (
-            error.stderr.decode("utf-8", errors="replace")
-            if isinstance(error.stderr, bytes)
-            else (error.stderr or "")
-        )
-        return CommandResult(
-            command=normalized,
-            returncode=124,
-            stdout=stdout,
-            stderr=stderr,
-            duration_seconds=time.monotonic() - started,
-            timed_out=True,
+            timed_out=timed_out,
+            cancelled=cancelled,
+            output_truncated=output_truncated,
         )
     except OSError as error:
         return CommandResult(
@@ -848,9 +1226,33 @@ class CompilerEngine:
         self,
         runner: Callable[..., CommandResult] = run_command,
         require_available: bool = True,
+        policy: ExecutionPolicy | None = None,
     ) -> None:
         self.runner = runner
         self.require_available = require_available
+        self.policy = policy or ExecutionPolicy()
+
+    def _policy_for_request(self, request: BuildRequest) -> ExecutionPolicy:
+        return self.policy.for_request(request)
+
+    def _run(
+        self,
+        request: BuildRequest,
+        command: Sequence[str],
+        cwd: os.PathLike[str] | str | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> CommandResult:
+        """Run a compiler command through the configured execution policy."""
+
+        policy = self._policy_for_request(request)
+        kwargs: dict[str, Any] = {
+            "cwd": cwd,
+            "environment": environment,
+            "timeout": policy.timeout_seconds,
+        }
+        if self.runner is run_command:
+            kwargs["policy"] = policy
+        return self.runner(command, **kwargs)
 
     def choose_backend(self, file_type: str, requested: str = "auto") -> str | None:
         choices = EXTENSION_BACKENDS.get(file_type.lower(), ())
@@ -890,7 +1292,7 @@ class CompilerEngine:
                 raise BuildValidationError(
                     f"Pinned toolchain is not installed: {backend} ({expected})"
                 )
-            result = self.runner(command)
+            result = self._run(request, command)
             if not result.success or str(expected) not in result.output:
                 actual = result.output.splitlines()[0] if result.output else "unknown"
                 raise BuildValidationError(
@@ -1256,6 +1658,12 @@ class CompilerEngine:
     def prefetch_dependencies(self, request: BuildRequest) -> list[CommandResult]:
         """Run opt-in dependency prefetch commands discovered beside the source."""
 
+        if not request.allow_network or not request.allow_dependency_install:
+            raise BuildValidationError(
+                "Dependency prefetch requires both --allow-network and "
+                "--allow-dependency-install"
+            )
+
         source = request.source.resolve()
         root = source.parent
         commands: list[tuple[Sequence[str], Path]] = []
@@ -1286,7 +1694,7 @@ class CompilerEngine:
         bundle = _find_first(("bundle",))
         if gemfile.exists() and bundle and request.file_type == "rb":
             commands.append(((bundle, "install"), root))
-        return [self.runner(command, cwd=cwd) for command, cwd in commands]
+        return [self._run(request, command, cwd=cwd) for command, cwd in commands]
 
     def build(self, request: BuildRequest) -> BuildResult:
         started = time.monotonic()
@@ -1332,8 +1740,11 @@ class CompilerEngine:
                         message=f"Dependency prefetch failed: {failed_prefetch.output}",
                         duration_seconds=time.monotonic() - started,
                     )
-            result = self.runner(
-                plan.command, cwd=plan.cwd, environment=plan.environment
+            result = self._run(
+                normalized,
+                plan.command,
+                cwd=plan.cwd,
+                environment=plan.environment,
             )
             commands.append(result)
             if not result.success:
@@ -1371,7 +1782,8 @@ class CompilerEngine:
                         message="UPX was requested but is not installed",
                         duration_seconds=time.monotonic() - started,
                     )
-                compression = self.runner(
+                compression = self._run(
+                    normalized,
                     (upx, "--best", "--lzma", str(normalized.output)),
                     cwd=normalized.output.parent,
                 )
@@ -1985,6 +2397,21 @@ def _profile_request(
         extra_args=tuple(args.extra_arg or []),
         toolchain_versions=toolchain_versions,
         upx=args.upx or bool(profile.get("upx", False)),
+        timeout_seconds=(
+            args.timeout_seconds
+            if args.timeout_seconds is not None
+            else profile.get("timeout_seconds")
+        ),
+        max_output_bytes=(
+            args.max_output_bytes
+            if args.max_output_bytes is not None
+            else profile.get("max_output_bytes")
+        ),
+        allow_network=args.allow_network or bool(profile.get("allow_network", False)),
+        allow_dependency_install=(
+            args.allow_dependency_install
+            or bool(profile.get("allow_dependency_install", False))
+        ),
     )
 
 
@@ -2010,6 +2437,28 @@ def _add_build_options(parser: argparse.ArgumentParser) -> None:
         "--prefetch",
         action="store_true",
         help="Install/fetch manifest dependencies before building",
+    )
+    parser.add_argument(
+        "--timeout",
+        dest="timeout_seconds",
+        type=float,
+        metavar="SECONDS",
+        help=f"Maximum time per external command (default: {DEFAULT_EXECUTION_TIMEOUT_SECONDS:g})",
+    )
+    parser.add_argument(
+        "--max-output-bytes",
+        type=int,
+        help=f"Maximum captured stdout/stderr per command (default: {DEFAULT_MAX_OUTPUT_BYTES})",
+    )
+    parser.add_argument(
+        "--allow-network",
+        action="store_true",
+        help="Allow network-capable dependency prefetch when explicitly requested",
+    )
+    parser.add_argument(
+        "--allow-dependency-install",
+        action="store_true",
+        help="Allow dependency installation during --prefetch",
     )
     parser.add_argument(
         "--verify",
@@ -2149,11 +2598,11 @@ def _result_text(result: BuildResult) -> str:
     if result.backend:
         lines.append(f"backend: {result.backend}")
     if result.message:
-        lines.append(result.message)
+        lines.append(redact_text(result.message))
     for command in result.commands:
-        lines.append(f"$ {command_display(command.command)}")
+        lines.append(f"$ {command_display(command.command, redact=True)}")
         if command.output:
-            lines.append(command.output)
+            lines.append(redact_text(command.output))
     if result.verification:
         lines.append(
             "verification: "
@@ -2382,6 +2831,9 @@ __all__ = [
     "CommandResult",
     "CompilerEngine",
     "DEFAULT_PROFILES",
+    "DEFAULT_EXECUTION_TIMEOUT_SECONDS",
+    "DEFAULT_MAX_OUTPUT_BYTES",
+    "ExecutionPolicy",
     "EXTENSION_BACKENDS",
     "VerificationResult",
     "backend_status",
@@ -2400,6 +2852,8 @@ __all__ = [
     "profiles_path",
     "parse_toolchain_versions",
     "run_command",
+    "redact_command",
+    "redact_text",
     "save_json",
     "save_profiles",
     "sha256_file",

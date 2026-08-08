@@ -11,7 +11,6 @@ import os
 import sys
 import json
 import shutil
-import subprocess
 import threading
 import ctypes
 import re
@@ -22,11 +21,13 @@ from compiler_core import (
     BACKEND_NAMES,
     BuildRequest,
     CompilerEngine,
+    ExecutionPolicy,
     EXTENSION_BACKENDS,
     backend_status,
     estimate_output_size as core_estimate_output_size,
     extract_icon,
     load_profiles,
+    run_command as core_run_command,
     save_profiles,
 )
 
@@ -56,9 +57,10 @@ except ImportError:
 try:
     import customtkinter as ctk  # type: ignore[import-untyped]
 except ImportError:
-    print("Installing customtkinter...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "customtkinter"])
-    import customtkinter as ctk  # type: ignore[import-untyped]
+    raise RuntimeError(
+        "customtkinter is not installed. Install it explicitly before launching "
+        "the GUI; Universal Compiler will not install dependencies implicitly."
+    )
 
 # ============================================================================
 # CONSTANTS & CONFIGURATION
@@ -299,17 +301,24 @@ def log_message(message: str) -> None:
         pass
 
 
-def run_command(cmd: List[str], cwd: Optional[str] = None) -> tuple:
-    """Run a command and return (success, output)."""
+def run_command(
+    cmd: List[str],
+    cwd: Optional[str] = None,
+    *,
+    allow_network: bool = False,
+    allow_dependency_install: bool = False,
+) -> tuple:
+    """Run a command through the shared bounded policy and return its tuple."""
     try:
-        result = subprocess.run(
+        result = core_run_command(
             cmd,
-            capture_output=True,
-            text=True,
             cwd=cwd,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            policy=ExecutionPolicy(
+                allow_network=allow_network,
+                allow_dependency_install=allow_dependency_install,
+            ),
         )
-        return result.returncode == 0, result.stdout + result.stderr
+        return result.success, result.output
     except Exception as e:
         return False, str(e)
 
@@ -582,12 +591,10 @@ class DependencyChecker:
     def check_ps2exe() -> bool:
         """Check if PS2EXE is available."""
         try:
-            result = subprocess.run(
+            result = core_run_command(
                 ["powershell", "-Command", "Get-Module -ListAvailable ps2exe"],
-                capture_output=True, text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
             )
-            return "ps2exe" in result.stdout.lower()
+            return result.success and "ps2exe" in result.output.lower()
         except Exception:
             return False
     
@@ -1072,9 +1079,15 @@ class SetupWindow(ctk.CTkToplevel):
                 # Install logic here (placeholder)
                 if dep == "PS2EXE":
                     run_command(["powershell", "-Command", 
-                                "Install-Module ps2exe -Scope CurrentUser -Force"])
+                                "Install-Module ps2exe -Scope CurrentUser -Force"],
+                                allow_network=True,
+                                allow_dependency_install=True)
                 elif dep == "PyInstaller":
-                    run_command([sys.executable, "-m", "pip", "install", "pyinstaller"])
+                    run_command(
+                        [sys.executable, "-m", "pip", "install", "pyinstaller"],
+                        allow_network=True,
+                        allow_dependency_install=True,
+                    )
                 
             self.progress_label.configure(text="Complete!")
             self.after(1000, self._finish)
@@ -1612,7 +1625,7 @@ class UniversalCompiler:
         
         self.postbuild_combo = ctk.CTkComboBox(
             row, width=180,
-            values=["None", "Open Output Folder", "Run Executable", "Copy to Folder..."],
+            values=["None", "Open Output Folder", "Copy to Folder..."],
             fg_color=self.theme["input"],
             border_color=self.theme["border"],
             button_color=self.theme["border"],
@@ -2372,8 +2385,6 @@ Source: {self.source_file}
                 postbuild = self.postbuild_combo.get()
                 if postbuild == "Open Output Folder":
                     os.startfile(output_dir)
-                elif postbuild == "Run Executable":
-                    os.startfile(output_path)
                 elif postbuild == "Copy to Folder...":
                     copy_path = self.postbuild_path_entry.get()
                     if copy_path:
