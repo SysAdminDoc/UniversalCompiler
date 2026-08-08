@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import sys
 import threading
 import time
@@ -15,6 +16,7 @@ import compiler_core
 from compiler_core import (
     BuildAnalytics,
     BuildValidationError,
+    ARTIFACT_MANIFEST_SCHEMA_VERSION,
     CAPABILITY_SCHEMA_VERSION,
     DEFAULT_PROFILES,
     BuildRequest,
@@ -31,16 +33,21 @@ from compiler_core import (
     load_profiles,
     run_command,
     save_profiles,
+    verify_artifact_manifest,
     verify_artifact,
     wrap_msix,
 )
 
 
 def _fake_pe(path: Path) -> None:
-    data = bytearray(256)
+    data = bytearray(0x400)
     data[:2] = b"MZ"
     data[0x3C:0x40] = (0x80).to_bytes(4, "little")
     data[0x80:0x84] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", data, 0x84, 0x14C, 1, 0, 0, 0, 0xE0, 0x010F)
+    struct.pack_into("<H", data, 0x98, 0x10B)
+    data[0x178:0x17E] = b".text\0"
+    struct.pack_into("<IIII", data, 0x180, 0x100, 0x1000, 0x200, 0x200)
     path.write_bytes(data)
 
 
@@ -181,6 +188,15 @@ def test_static_artifact_verification(tmp_path: Path) -> None:
     assert verify_artifact(artifact).passed is False
 
 
+def test_wasm_structure_verification_checks_version_and_sections(tmp_path: Path) -> None:
+    artifact = tmp_path / "module.wasm"
+    artifact.write_bytes(b"\x00asm\x01\x00\x00\x00\x00\x01\x00")
+    assert verify_artifact(artifact).passed is True
+
+    artifact.write_bytes(b"\x00asm\x01\x00\x00\x00\x01\x05\x00")
+    assert verify_artifact(artifact).passed is False
+
+
 def test_unsigned_msix_contains_manifest_and_artifact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -261,6 +277,13 @@ def test_engine_builds_and_uses_cache(tmp_path: Path) -> None:
     serialized = first.as_dict()
     assert serialized["schema_version"] == RESULT_SCHEMA_VERSION
     assert serialized["request"]["schema_version"] == REQUEST_SCHEMA_VERSION
+    assert first.manifest is not None and first.manifest.is_file()
+    manifest = json.loads(first.manifest.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == ARTIFACT_MANIFEST_SCHEMA_VERSION
+    assert manifest["signature"]["status"] == "unsigned"
+    assert verify_artifact_manifest(first.manifest, output).passed is True
+    output.write_bytes(b"tampered")
+    assert verify_artifact_manifest(first.manifest, output).passed is False
 
 
 def test_engine_batch_preserves_input_order(tmp_path: Path) -> None:

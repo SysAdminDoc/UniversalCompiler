@@ -20,12 +20,14 @@ import re
 import shlex
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import zipfile
+import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -37,6 +39,7 @@ APP_VERSION = "2.1.0"
 REQUEST_SCHEMA_VERSION = "uc.request.v1"
 RESULT_SCHEMA_VERSION = "uc.result.v1"
 CAPABILITY_SCHEMA_VERSION = "uc.capability.v1"
+ARTIFACT_MANIFEST_SCHEMA_VERSION = "uc.artifact-manifest.v1"
 
 
 DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
@@ -536,6 +539,7 @@ class BuildResult:
     cache_key: str = ""
     message: str = ""
     duration_seconds: float = 0.0
+    manifest: Path | None = None
 
     def as_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -549,6 +553,7 @@ class BuildResult:
         result["request"]["metadata"] = dict(self.request.metadata)
         result["request"]["extra_args"] = list(redact_command(self.request.extra_args))
         result["output"] = str(self.output)
+        result["manifest"] = str(self.manifest) if self.manifest else None
         result["message"] = redact_text(str(result.get("message", "")))
         result["commands"] = [
             {
@@ -1375,7 +1380,14 @@ class CompilerEngine:
         if request.force or not request.cache or not request.output.is_file():
             return False
         saved = load_json(self._cache_path(request.output), {})
-        return isinstance(saved, Mapping) and saved.get("key") == key
+        if not isinstance(saved, Mapping) or saved.get("key") != key:
+            return False
+        manifest = artifact_manifest_path(request.output)
+        return not (
+            request.verify
+            and manifest.is_file()
+            and not verify_artifact_manifest(manifest, request.output).passed
+        )
 
     def _save_cache(
         self,
@@ -1396,6 +1408,88 @@ class CompilerEngine:
                 "verification": asdict(verification) if verification else None,
             },
         )
+
+    def _write_artifact_manifest(
+        self,
+        request: BuildRequest,
+        plan: BuildPlan,
+        source_hash: str,
+        cache_key: str,
+        verification: VerificationResult | None,
+    ) -> Path:
+        """Atomically emit the identity and verification record for a build."""
+
+        output = request.output.resolve()
+        stat = output.stat()
+        warnings: list[str] = []
+        if not request.verify:
+            warnings.append("Static artifact verification was disabled")
+        policy = self._policy_for_request(request)
+        manifest = {
+            "schema_version": ARTIFACT_MANIFEST_SCHEMA_VERSION,
+            "created_at": datetime.now(UTC).isoformat(),
+            "source": {
+                "path": str(request.source.resolve()),
+                "sha256": source_hash,
+                "file_type": request.file_type,
+            },
+            "request": {
+                "schema_version": REQUEST_SCHEMA_VERSION,
+                "backend": plan.backend,
+                "target": request.target,
+                "architecture": request.architecture,
+                "console": request.console,
+                "admin": request.admin,
+                "single_file": request.single_file,
+                "profile": request.profile_name,
+                "icon": str(request.icon.resolve()) if request.icon else None,
+                "metadata": {
+                    str(key): redact_text(str(value))
+                    for key, value in request.metadata.items()
+                },
+                "extra_args": list(redact_command(request.extra_args)),
+                "toolchain_versions": dict(request.toolchain_versions),
+                "upx": request.upx,
+            },
+            "toolchain": {
+                "backend": self._tool_identity(plan.backend),
+                "pins": dict(request.toolchain_versions),
+            },
+            "policy": {
+                "timeout_seconds": policy.timeout_seconds,
+                "max_output_bytes": policy.max_output_bytes,
+                "allow_network": request.allow_network,
+                "allow_dependency_install": request.allow_dependency_install,
+            },
+            "artifact": {
+                "path": str(output),
+                "output_type": verification.kind
+                if verification
+                else output.suffix.lower().lstrip(".") or "file",
+                "sha256": sha256_file(output),
+                "size_bytes": stat.st_size,
+            },
+            "verification": (
+                {
+                    "passed": verification.passed,
+                    "kind": verification.kind,
+                    "details": redact_text(verification.details),
+                }
+                if verification
+                else {"passed": False, "kind": "disabled", "details": "Not requested"}
+            ),
+            "signature": {
+                "status": "unsigned",
+                "signed": False,
+                "signing_implemented": False,
+            },
+            "warnings": warnings,
+            "result": {"schema_version": RESULT_SCHEMA_VERSION, "status": "built"},
+            "cache_key": cache_key,
+        }
+        destination = artifact_manifest_path(output)
+        save_json(destination, manifest)
+        return destination
 
     def plan(
         self, request: BuildRequest, allow_missing_source: bool = False
@@ -1715,6 +1809,15 @@ class CompilerEngine:
                     verify_artifact(normalized.output) if normalized.verify else None
                 )
                 if verification is None or verification.passed:
+                    manifest_path = artifact_manifest_path(normalized.output.resolve())
+                    if not manifest_path.is_file():
+                        manifest_path = self._write_artifact_manifest(
+                            normalized,
+                            plan,
+                            source_hash,
+                            cache_key,
+                            verification,
+                        )
                     return BuildResult(
                         True,
                         "cache-hit",
@@ -1726,6 +1829,7 @@ class CompilerEngine:
                         cache_key=cache_key,
                         message="Build cache hit",
                         duration_seconds=time.monotonic() - started,
+                        manifest=manifest_path,
                     )
             commands: list[CommandResult] = []
             if normalized.prefetch:
@@ -1832,6 +1936,13 @@ class CompilerEngine:
             self._save_cache(
                 normalized, cache_key, source_hash, plan.backend, verification
             )
+            manifest_path = self._write_artifact_manifest(
+                normalized,
+                plan,
+                source_hash,
+                cache_key,
+                verification,
+            )
             return BuildResult(
                 True,
                 "built",
@@ -1844,6 +1955,7 @@ class CompilerEngine:
                 cache_key=cache_key,
                 message="Build completed",
                 duration_seconds=time.monotonic() - started,
+                manifest=manifest_path,
             )
         except (BuildValidationError, OSError, ValueError) as error:
             output = Path(request.output)
@@ -1926,10 +2038,121 @@ class CompilerEngine:
             event.wait(max(0.1, interval))
 
 
-def verify_artifact(path: os.PathLike[str] | str) -> VerificationResult:
-    """Verify the file/container signature without executing the artifact."""
+def artifact_manifest_path(path: os.PathLike[str] | str) -> Path:
+    """Return the sidecar manifest path for an artifact."""
 
-    artifact = Path(path)
+    artifact = Path(path).expanduser()
+    return artifact.with_name(f"{artifact.name}.manifest.json")
+
+
+def _verify_pe_structure(artifact: Path, header: bytes) -> VerificationResult:
+    size = artifact.stat().st_size
+    if len(header) < 64 or header[:2] != b"MZ":
+        return VerificationResult(False, "pe", "Executable does not have an MZ header")
+    pe_offset = int.from_bytes(header[0x3C:0x40], "little")
+    if pe_offset < 64 or pe_offset + 24 > size:
+        return VerificationResult(False, "pe", "PE header offset is outside the artifact")
+    try:
+        with artifact.open("rb") as handle:
+            handle.seek(pe_offset)
+            signature = handle.read(4)
+            coff = handle.read(20)
+            if signature != b"PE\0\0" or len(coff) != 20:
+                return VerificationResult(False, "pe", "Executable does not have a valid PE signature")
+            machine, sections, _, _, _, optional_size, _ = struct.unpack(
+                "<HHIIIHH", coff
+            )
+            if machine == 0 or sections < 1 or sections > 96:
+                return VerificationResult(False, "pe", "PE COFF header has invalid machine or section count")
+            if optional_size < 64 or optional_size > 4096:
+                return VerificationResult(False, "pe", "PE optional header size is invalid")
+            optional = handle.read(optional_size)
+            if len(optional) != optional_size or struct.unpack_from("<H", optional)[0] not in {0x10B, 0x20B}:
+                return VerificationResult(False, "pe", "PE optional header is invalid")
+            section_table_end = pe_offset + 4 + 20 + optional_size + sections * 40
+            if section_table_end > size:
+                return VerificationResult(False, "pe", "PE section table exceeds artifact size")
+            section_table = handle.read(sections * 40)
+            for index in range(sections):
+                section = section_table[index * 40 : (index + 1) * 40]
+                raw_size, raw_offset = struct.unpack_from("<II", section, 16)
+                if raw_size and (raw_offset < section_table_end or raw_offset + raw_size > size):
+                    return VerificationResult(False, "pe", f"PE section {index + 1} exceeds artifact bounds")
+    except (OSError, struct.error) as error:
+        return VerificationResult(False, "pe", f"Could not read PE structure: {error}")
+    return VerificationResult(True, "pe", f"Valid PE artifact ({format_size(size)})")
+
+
+def _verify_zip_structure(artifact: Path) -> VerificationResult:
+    try:
+        with zipfile.ZipFile(artifact) as archive:
+            names = archive.namelist()
+            if not names or archive.testzip() is not None:
+                return VerificationResult(False, "zip", "Archive is empty or contains a corrupt member")
+            if any(
+                name.startswith(("/", "\\")) or ".." in Path(name).parts
+                for name in names
+            ):
+                return VerificationResult(False, "zip", "Archive contains an unsafe member path")
+            suffix = artifact.suffix.lower()
+            if suffix in {".msix", ".appx"}:
+                required = {"AppxManifest.xml", "App.exe"}
+                if not required.issubset(names):
+                    return VerificationResult(False, "msix", "MSIX/APPX is missing its manifest or application")
+                root = ET.fromstring(archive.read("AppxManifest.xml"))
+                if not root.tag.endswith("Package") or not any(
+                    element.tag.endswith("Identity") for element in root.iter()
+                ):
+                    return VerificationResult(False, "msix", "MSIX/APPX manifest has no Package/Identity structure")
+                return VerificationResult(True, "msix", "Valid unsigned MSIX/APPX structure")
+    except (OSError, zipfile.BadZipFile, ET.ParseError) as error:
+        return VerificationResult(False, "zip", f"Invalid archive structure: {error}")
+    return VerificationResult(True, "zip", "Valid ZIP/JAR archive structure")
+
+
+def _read_wasm_unsigned_leb(handle: Any, remaining: int) -> tuple[int, int] | None:
+    value = 0
+    shift = 0
+    for count in range(5):
+        byte = handle.read(1)
+        if not byte:
+            return None
+        remaining -= 1
+        value |= (byte[0] & 0x7F) << shift
+        if not byte[0] & 0x80:
+            return value, count + 1
+        shift += 7
+    return None
+
+
+def _verify_wasm_structure(artifact: Path) -> VerificationResult:
+    try:
+        size = artifact.stat().st_size
+        with artifact.open("rb") as handle:
+            if handle.read(8) != b"\x00asm\x01\x00\x00\x00":
+                return VerificationResult(False, "wasm", "Invalid WebAssembly magic or version")
+            consumed = 8
+            while consumed < size:
+                section_id = handle.read(1)
+                if not section_id or section_id[0] > 12:
+                    return VerificationResult(False, "wasm", "Invalid WebAssembly section identifier")
+                consumed += 1
+                length = _read_wasm_unsigned_leb(handle, size - consumed)
+                if length is None:
+                    return VerificationResult(False, "wasm", "Invalid WebAssembly section length")
+                section_size, length_bytes = length
+                consumed += length_bytes
+                if section_size > size - consumed:
+                    return VerificationResult(False, "wasm", "WebAssembly section exceeds artifact bounds")
+                handle.seek(section_size, os.SEEK_CUR)
+                consumed += section_size
+    except OSError as error:
+        return VerificationResult(False, "wasm", f"Could not read WebAssembly structure: {error}")
+    return VerificationResult(True, "wasm", "Valid WebAssembly module structure")
+
+
+def _verify_artifact_structure(path: os.PathLike[str] | str) -> VerificationResult:
+    artifact = Path(path).expanduser()
     if not artifact.is_file():
         return VerificationResult(False, "missing", f"Artifact not found: {artifact}")
     try:
@@ -1937,45 +2160,101 @@ def verify_artifact(path: os.PathLike[str] | str) -> VerificationResult:
             header = handle.read(4096)
     except OSError as error:
         return VerificationResult(False, "unreadable", str(error))
-    if artifact.suffix.lower() == ".exe":
-        if len(header) < 64 or header[:2] != b"MZ":
-            return VerificationResult(
-                False, "pe", "Executable does not have an MZ header"
-            )
-        pe_offset = int.from_bytes(header[0x3C:0x40], "little")
-        if (
-            pe_offset + 4 > len(header)
-            or header[pe_offset : pe_offset + 4] != b"PE\0\0"
-        ):
-            return VerificationResult(
-                False, "pe", "Executable does not have a valid PE signature"
-            )
-        return VerificationResult(
-            True, "pe", f"Valid PE artifact ({format_size(artifact.stat().st_size)})"
-        )
-    if artifact.suffix.lower() in {".jar", ".zip", ".msix", ".appx"}:
-        try:
-            import zipfile
+    suffix = artifact.suffix.lower()
+    if suffix == ".exe":
+        return _verify_pe_structure(artifact, header)
+    if suffix in {".jar", ".zip", ".msix", ".appx"}:
+        return _verify_zip_structure(artifact)
+    if suffix == ".wasm":
+        return _verify_wasm_structure(artifact)
+    size = artifact.stat().st_size
+    return VerificationResult(True, "file", "Non-empty artifact" if size > 0 else "Empty artifact") if size > 0 else VerificationResult(False, "file", "Empty artifact")
 
-            passed = zipfile.is_zipfile(artifact)
-        except OSError:
-            passed = False
-        return VerificationResult(
-            passed,
-            "zip",
-            "Valid ZIP/JAR archive" if passed else "Invalid ZIP/JAR archive",
-        )
-    if artifact.suffix.lower() == ".wasm":
-        passed = header[:4] == b"\x00asm"
-        return VerificationResult(
-            passed,
-            "wasm",
-            "Valid WebAssembly header" if passed else "Invalid WebAssembly header",
-        )
-    passed = artifact.stat().st_size > 0
-    return VerificationResult(
-        passed, "file", "Non-empty artifact" if passed else "Empty artifact"
-    )
+
+def verify_artifact_manifest(
+    path: os.PathLike[str] | str,
+    artifact: os.PathLike[str] | str | None = None,
+) -> VerificationResult:
+    """Validate a versioned sidecar manifest and the artifact it identifies."""
+
+    manifest_path = Path(path).expanduser()
+    try:
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError) as error:
+        return VerificationResult(False, "manifest", f"Could not read artifact manifest: {error}")
+    if not isinstance(manifest, Mapping) or manifest.get("schema_version") != ARTIFACT_MANIFEST_SCHEMA_VERSION:
+        return VerificationResult(False, "manifest", "Unsupported artifact manifest schema")
+    for field_name in (
+        "source",
+        "request",
+        "toolchain",
+        "artifact",
+        "verification",
+        "signature",
+        "warnings",
+    ):
+        if field_name not in manifest:
+            return VerificationResult(False, "manifest", f"Manifest is missing {field_name}")
+    source_record = manifest.get("source")
+    request_record = manifest.get("request")
+    toolchain_record = manifest.get("toolchain")
+    verification_record = manifest.get("verification")
+    if (
+        not isinstance(source_record, Mapping)
+        or not isinstance(request_record, Mapping)
+        or not isinstance(toolchain_record, Mapping)
+        or not isinstance(verification_record, Mapping)
+        or not isinstance(manifest.get("warnings"), list)
+    ):
+        return VerificationResult(False, "manifest", "Manifest sections have invalid types")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("sha256", ""))):
+        return VerificationResult(False, "manifest", "Manifest source identity is invalid")
+    if request_record.get("schema_version") != REQUEST_SCHEMA_VERSION:
+        return VerificationResult(False, "manifest", "Manifest request schema is unsupported")
+    artifact_record = manifest.get("artifact")
+    if not isinstance(artifact_record, Mapping):
+        return VerificationResult(False, "manifest", "Manifest has no artifact record")
+    recorded_path = Path(str(artifact_record.get("path", "")))
+    if not recorded_path.is_absolute():
+        recorded_path = manifest_path.parent / recorded_path
+    actual_path = Path(artifact).expanduser() if artifact is not None else recorded_path
+    try:
+        if recorded_path.resolve() != actual_path.resolve():
+            return VerificationResult(False, "manifest", "Manifest artifact path does not match the requested artifact")
+    except OSError as error:
+        return VerificationResult(False, "manifest", f"Could not resolve manifest artifact path: {error}")
+    if not actual_path.is_file():
+        return VerificationResult(False, "manifest", "Manifest artifact is missing")
+    expected_size = artifact_record.get("size_bytes")
+    expected_hash = str(artifact_record.get("sha256", ""))
+    if not isinstance(expected_size, int) or expected_size != actual_path.stat().st_size:
+        return VerificationResult(False, "manifest", "Manifest artifact size does not match")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_hash) or sha256_file(actual_path) != expected_hash:
+        return VerificationResult(False, "manifest", "Manifest artifact SHA-256 does not match")
+    signature = manifest.get("signature")
+    if not isinstance(signature, Mapping) or signature.get("status") != "unsigned" or signature.get("signed") is not False:
+        return VerificationResult(False, "manifest", "Manifest does not explicitly declare unsigned status")
+    structure = _verify_artifact_structure(actual_path)
+    if not structure.passed:
+        return VerificationResult(False, "manifest", f"Manifest artifact structure failed: {structure.details}")
+    return VerificationResult(True, "manifest", "Artifact manifest, hash, and structure verified")
+
+
+def verify_artifact(path: os.PathLike[str] | str) -> VerificationResult:
+    """Verify artifact structure and any adjacent versioned manifest."""
+
+    artifact = Path(path).expanduser()
+    structure = _verify_artifact_structure(artifact)
+    if not structure.passed:
+        return structure
+    manifest = artifact_manifest_path(artifact)
+    if manifest.is_file():
+        manifest_result = verify_artifact_manifest(manifest, artifact)
+        if not manifest_result.passed:
+            return VerificationResult(False, structure.kind, manifest_result.details)
+        return VerificationResult(True, structure.kind, f"{structure.details}; manifest verified")
+    return structure
 
 
 def compile_bytecode(
@@ -2111,6 +2390,9 @@ def wrap_msix(
                 archive.write(package_dir / "App.exe", "App.exe")
                 archive.write(package_dir / "AppxManifest.xml", "AppxManifest.xml")
                 archive.write(assets / "StoreLogo.png", "Assets/StoreLogo.png")
+    verification = _verify_artifact_structure(output_path)
+    if not verification.passed:
+        raise BuildValidationError(f"Unsigned MSIX/APPX validation failed: {verification.details}")
     return output_path
 
 
@@ -2697,7 +2979,11 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     if args.command == "verify":
-        verification_result = verify_artifact(args.artifact)
+        verification_result = (
+            verify_artifact_manifest(args.artifact)
+            if Path(args.artifact).name.endswith(".manifest.json")
+            else verify_artifact(args.artifact)
+        )
         print(
             json.dumps(asdict(verification_result), indent=2, default=str)
             if args.json
@@ -2828,6 +3114,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "APP_NAME",
     "APP_VERSION",
+    "ARTIFACT_MANIFEST_SCHEMA_VERSION",
     "BACKEND_NAMES",
     "BuildAnalytics",
     "BuildPlan",
@@ -2844,6 +3131,7 @@ __all__ = [
     "EXTENSION_BACKENDS",
     "VerificationResult",
     "backend_status",
+    "artifact_manifest_path",
     "cli_main",
     "command_display",
     "compile_bytecode",
@@ -2866,6 +3154,7 @@ __all__ = [
     "save_json",
     "save_profiles",
     "sha256_file",
+    "verify_artifact_manifest",
     "verify_artifact",
     "wrap_msix",
 ]

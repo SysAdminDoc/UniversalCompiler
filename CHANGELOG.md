@@ -13,6 +13,9 @@ All notable changes to UniversalCompiler will be documented in this file.
 - Make the Python CLI/core the build authority for the Python GUI, PowerShell
   GUI, and VS Code extension, with versioned request, result, and capability
   metadata and shared structured error handling.
+- Emit versioned artifact manifests with source/toolchain/config identities,
+  hashes, sizes, verification results, warnings, and explicit unsigned status;
+  strengthen PE, archive, MSIX/APPX, and WebAssembly structural validation.
 - Add a side-effect-free Python build engine and CLI with YAML profiles, backend
   previews, cache-aware builds, dependency prefetching, parallel batch builds,
   watch mode, and static post-build verification.

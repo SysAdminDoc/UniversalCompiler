@@ -163,6 +163,7 @@ python .\UniversalCompiler.py analytics --recent 10
 # Inspect available toolchains or verify an artifact without running it
 python .\UniversalCompiler.py list-toolchains
 python .\UniversalCompiler.py verify .\dist\myscript.exe
+python .\UniversalCompiler.py verify .\dist\myscript.exe.manifest.json
 python .\UniversalCompiler.py extract-icon .\existing.exe --output .\icon.ico
 python .\UniversalCompiler.py wrap-msix .\dist\myscript.exe --output .\dist\myscript.msix
 python .\UniversalCompiler.py obfuscate .\myscript.py --method pyarmor --output .\obfuscated
@@ -180,6 +181,10 @@ inherited environment, and redacted diagnostics. Static verification checks
 the produced container or PE header without launching the artifact, so a GUI
 build cannot steal focus or alter the active desktop. Post-build actions never
 launch the compiled artifact.
+Successful builds also emit a versioned `*.manifest.json` sidecar containing
+source/config/toolchain identities, artifact SHA-256 and size, verification,
+warnings, and explicit unsigned status. `verify` checks both artifact structure
+and that sidecar when it is present.
 MSIX/APPX output is deliberately unsigned and is intended for packaging or
 internal testing only.
 
