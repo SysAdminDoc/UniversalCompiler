@@ -25,7 +25,7 @@
 | PowerShell | `.ps1` | PS2EXE | ✅ Full Support |
 | Python | `.py` | PyInstaller / Nuitka | ✅ Full Support |
 | Batch | `.bat`, `.cmd` | IExpress | ✅ Full Support |
-| Node.js | `.js` | pkg | ✅ Full Support |
+| Node.js | `.js` | Bun compile / Deno compile | Capability-gated; legacy pkg is explicit-only |
 | TypeScript | `.ts` | Bun `build --compile` | ✅ Full Support |
 | C# | `.cs` | CSC (.NET) | ✅ Full Support |
 | Go | `.go` | go build | ✅ Full Support |
@@ -111,7 +111,8 @@ The explicitly launched setup wizard can install these for you:
 |----------|-----|--------------|
 | PS2EXE | PowerShell scripts | ✅ Yes |
 | PyInstaller | Python scripts | ✅ Yes (requires Python) |
-| pkg | Node.js scripts | ✅ Yes (requires Node.js) |
+| Bun / Deno | JavaScript and TypeScript scripts | Manual/SDK-managed; capability-gated |
+| pkg (legacy) | JavaScript scripts | ✅ Yes when explicitly requested |
 | Go | Go scripts | ✅ Yes |
 | Ruby + Ocra | Ruby scripts | ✅ Yes |
 | AutoHotkey | AHK scripts | ✅ Yes |
@@ -162,6 +163,8 @@ python .\UniversalCompiler.py analytics --recent 10
 
 # Inspect available toolchains or verify an artifact without running it
 python .\UniversalCompiler.py list-toolchains
+python .\UniversalCompiler.py list-toolchains --json
+python .\UniversalCompiler.py inspect .\myscript.py --json
 python .\UniversalCompiler.py verify .\dist\myscript.exe
 python .\UniversalCompiler.py verify .\dist\myscript.exe.manifest.json
 python .\UniversalCompiler.py extract-icon .\existing.exe --output .\icon.ico
@@ -191,9 +194,14 @@ internal testing only.
 The optional `vscode-extension/` package adds a **Universal Compiler: Build
 Active File** command. Point its `universalCompiler.scriptPath` setting at the
 repository's `UniversalCompiler.py` when the extension is installed locally.
-The PowerShell GUI also delegates builds to this Python CLI and consumes its
-versioned JSON request/result contract; it remains useful as a Windows shell
-and explicit toolchain setup surface.
+`list-toolchains --json` is the authoritative, schema-versioned capability
+registry consumed by the CLI, both GUI shells, and the VS Code extension. It
+reports lifecycle, availability, host/target/architecture constraints,
+required SDKs, and a verified tool version when the installed tool exposes one.
+Automatic selection excludes deprecated backends; `pkg` remains available only
+when explicitly requested. The PowerShell GUI also delegates builds to this
+Python CLI and consumes its versioned JSON request/result contract; it remains
+useful as a Windows shell and explicit toolchain setup surface.
 
 ### Drag & Drop
 
@@ -298,10 +306,12 @@ Install-Module ps2exe -Scope CurrentUser -Force
 pip install pyinstaller
 ```
 
-**"pkg not found"**
+**"No active JavaScript backend"**
 ```bash
-npm install -g pkg
+python .\UniversalCompiler.py list-toolchains --json
 ```
+Install a supported Bun or Deno SDK and rerun the capability probe. The
+archived `pkg` backend is available only as an explicit legacy override.
 
 **Window appears cut off**
 - The app now opens maximized by default
@@ -384,6 +394,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - [PS2EXE](https://github.com/MScholtes/PS2EXE) - PowerShell to EXE compiler
 - [PyInstaller](https://pyinstaller.org/) - Python to EXE compiler
+- [Bun](https://bun.sh/) and [Deno](https://deno.com/) - JavaScript compilers
 - [pkg](https://github.com/vercel/pkg) - Node.js to EXE compiler
 - [Ocra](https://github.com/larsch/ocra) - Ruby to EXE compiler
 

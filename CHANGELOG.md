@@ -16,6 +16,10 @@ All notable changes to UniversalCompiler will be documented in this file.
 - Emit versioned artifact manifests with source/toolchain/config identities,
   hashes, sizes, verification results, warnings, and explicit unsigned status;
   strengthen PE, archive, MSIX/APPX, and WebAssembly structural validation.
+- Add a schema-versioned backend capability catalog consumed by the CLI, both
+  GUI shells, and the VS Code extension, with lifecycle, host/target/
+  architecture constraints, SDK requirements, and verified tool versions;
+  deprecated pkg is no longer selected automatically.
 - Add a side-effect-free Python build engine and CLI with YAML profiles, backend
   previews, cache-aware builds, dependency prefetching, parallel batch builds,
   watch mode, and static post-build verification.

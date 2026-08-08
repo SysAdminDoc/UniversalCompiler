@@ -118,47 +118,107 @@ DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
 }
 
 
-EXTENSION_BACKENDS: dict[str, tuple[str, ...]] = {
-    "ps1": ("ps2exe",),
-    "py": ("pyinstaller", "nuitka"),
-    "bat": ("iexpress",),
-    "cmd": ("iexpress",),
-    "js": ("bun", "pkg", "deno"),
-    "ts": ("bun",),
-    "vbs": ("iexpress",),
-    "ahk": ("ahk2exe",),
-    "cs": ("csc",),
-    "go": ("go",),
-    "rb": ("ocra",),
-    "rs": ("rust",),
-    "lua": ("srlua", "luastatic"),
-    "pl": ("perl-pp",),
-    "pm": ("perl-pp",),
-    "kt": ("kotlin-native",),
-    "kts": ("kotlin-native",),
-    "wat": ("wat2wasm",),
+BACKEND_CATALOG: dict[str, dict[str, Any]] = {
+    "ps2exe": {
+        "name": "PowerShell PS2EXE", "extensions": ("ps1",), "status": "stable",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
+        "architectures": ("native", "x86", "x64", "arm64"), "required_sdks": ("PowerShell",),
+    },
+    "pyinstaller": {
+        "name": "Python PyInstaller", "extensions": ("py", "pyw"), "status": "stable",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
+        "architectures": ("native", "x86", "x64", "arm64"), "required_sdks": ("Python",),
+    },
+    "nuitka": {
+        "name": "Python Nuitka", "extensions": ("py", "pyw"), "status": "stable",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
+        "architectures": ("native", "x86", "x64", "arm64"), "required_sdks": ("Python", "C compiler"),
+    },
+    "iexpress": {
+        "name": "Windows IExpress", "extensions": ("bat", "cmd", "vbs"), "status": "stable",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
+        "architectures": ("native",), "required_sdks": ("Windows",),
+    },
+    "bun": {
+        "name": "Bun compile", "extensions": ("js", "ts"), "status": "stable",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows", "linux", "darwin"),
+        "architectures": ("native", "x86", "x64", "arm64"), "required_sdks": ("Bun",),
+    },
+    "deno": {
+        "name": "Deno compile", "extensions": ("js",), "status": "stable",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows", "linux", "darwin"),
+        "architectures": ("native", "x86", "x64", "arm64"), "required_sdks": ("Deno",),
+    },
+    "pkg": {
+        "name": "Node.js pkg", "extensions": ("js",), "status": "deprecated",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows", "linux", "darwin"),
+        "architectures": ("native", "x86", "x64", "arm64"), "required_sdks": ("Node.js",),
+    },
+    "ahk2exe": {
+        "name": "AutoHotkey Ahk2Exe", "extensions": ("ahk",), "status": "stable",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
+        "architectures": ("native",), "required_sdks": ("AutoHotkey",),
+    },
+    "csc": {
+        "name": "C# CSC", "extensions": ("cs",), "status": "stable",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
+        "architectures": ("native", "x86", "x64", "arm64"), "required_sdks": (".NET Framework",),
+    },
+    "go": {
+        "name": "Go build", "extensions": ("go",), "status": "stable",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows", "linux", "darwin"),
+        "architectures": ("native", "x86", "x64", "amd64", "arm64"), "required_sdks": ("Go",),
+    },
+    "ocra": {
+        "name": "Ruby Ocra", "extensions": ("rb",), "status": "experimental",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
+        "architectures": ("native",), "required_sdks": ("Ruby",),
+    },
+    "rust": {
+        "name": "Rust cargo/rustc", "extensions": ("rs",), "status": "stable",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows", "linux", "darwin"),
+        "architectures": ("native", "x86", "x64", "amd64", "arm64"), "required_sdks": ("Rust",),
+    },
+    "srlua": {
+        "name": "Lua srlua", "extensions": ("lua",), "status": "experimental",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
+        "architectures": ("native",), "required_sdks": ("srlua",),
+    },
+    "luastatic": {
+        "name": "Lua luastatic", "extensions": ("lua",), "status": "experimental",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
+        "architectures": ("native",), "required_sdks": ("luastatic",),
+    },
+    "perl-pp": {
+        "name": "Perl PAR::Packer", "extensions": ("pl", "pm"), "status": "experimental",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
+        "architectures": ("native",), "required_sdks": ("Perl",),
+    },
+    "kotlin-native": {
+        "name": "Kotlin/Native", "extensions": ("kt", "kts"), "status": "experimental",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows", "linux", "darwin"),
+        "architectures": ("native", "x86", "x64", "arm64"), "required_sdks": ("Kotlin/Native",),
+    },
+    "wat2wasm": {
+        "name": "WebAssembly wat2wasm", "extensions": ("wat",), "status": "stable",
+        "host_platforms": ("windows",), "target_platforms": ("native", "wasm"),
+        "architectures": ("native",), "required_sdks": ("WABT",),
+    },
+    "upx": {
+        "name": "UPX compressor", "extensions": (), "status": "optional",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
+        "architectures": ("native",), "required_sdks": ("UPX",),
+    },
 }
 
+EXTENSION_BACKENDS: dict[str, tuple[str, ...]] = {}
+for _backend_name, _backend_spec in BACKEND_CATALOG.items():
+    for _extension in _backend_spec["extensions"]:
+        EXTENSION_BACKENDS.setdefault(_extension, ())
+        EXTENSION_BACKENDS[_extension] += (_backend_name,)
 
 BACKEND_NAMES: dict[str, str] = {
-    "ps2exe": "PowerShell PS2EXE",
-    "pyinstaller": "Python PyInstaller",
-    "nuitka": "Python Nuitka",
-    "iexpress": "Windows IExpress",
-    "bun": "Bun compile",
-    "pkg": "Node.js pkg",
-    "deno": "Deno compile",
-    "ahk2exe": "AutoHotkey Ahk2Exe",
-    "csc": "C# CSC",
-    "go": "Go build",
-    "ocra": "Ruby Ocra",
-    "rust": "Rust cargo/rustc",
-    "srlua": "Lua srlua",
-    "luastatic": "Lua luastatic",
-    "perl-pp": "Perl PAR::Packer",
-    "kotlin-native": "Kotlin/Native",
-    "upx": "UPX compressor",
-    "wat2wasm": "WebAssembly wat2wasm",
+    backend: str(spec["name"]) for backend, spec in BACKEND_CATALOG.items()
 }
 
 OBFUSCATOR_NAMES: dict[str, str] = {
@@ -1089,21 +1149,57 @@ def resolve_obfuscator(method: str) -> str | None:
     return None
 
 
+def _verified_backend_version(backend: str) -> str | None:
+    """Probe a CLI tool's version without installing or invoking build inputs."""
+
+    executable = resolve_backend_executable(backend)
+    if not executable or backend in {"iexpress", "ahk2exe", "csc"}:
+        return None
+    command: tuple[str, ...]
+    if backend == "nuitka":
+        command = (sys.executable, "-m", "nuitka", "--version")
+    elif backend == "ps2exe":
+        command = (
+            executable,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-Module -ListAvailable ps2exe | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty Version)",
+        )
+    else:
+        command = (executable, "--version")
+    try:
+        result = run_command(command, timeout=10)
+    except (BuildValidationError, OSError, ValueError):
+        return None
+    if not result.success:
+        return None
+    first_line = next((line.strip() for line in result.output.splitlines() if line.strip()), "")
+    return redact_text(first_line) or None
+
+
 def backend_status() -> dict[str, dict[str, Any]]:
-    """Return deterministic, read-only availability information for every backend."""
+    """Return the schema-versioned capability and availability catalog."""
 
     status: dict[str, dict[str, Any]] = {}
-    for backend, name in BACKEND_NAMES.items():
+    host_platform = "windows" if os.name == "nt" else sys.platform
+    for backend, spec in BACKEND_CATALOG.items():
         path = resolve_backend_executable(backend)
         status[backend] = {
             "schema_version": CAPABILITY_SCHEMA_VERSION,
             "backend": backend,
-            "name": name,
+            "name": spec["name"],
+            "lifecycle": spec["status"],
             "available": path is not None,
             "executable": path,
-            "extensions": [
-                ext for ext, values in EXTENSION_BACKENDS.items() if backend in values
-            ],
+            "extensions": list(spec["extensions"]),
+            "host_platforms": list(spec["host_platforms"]),
+            "host_supported": host_platform in spec["host_platforms"],
+            "target_platforms": list(spec["target_platforms"]),
+            "architectures": list(spec["architectures"]),
+            "required_sdks": list(spec["required_sdks"]),
+            "default": backend != "pkg",
+            "verified_version": _verified_backend_version(backend),
         }
     return status
 
@@ -1268,15 +1364,49 @@ class CompilerEngine:
     def choose_backend(self, file_type: str, requested: str = "auto") -> str | None:
         choices = EXTENSION_BACKENDS.get(file_type.lower(), ())
         if requested != "auto":
-            return (
-                requested
-                if requested in choices or requested in BACKEND_NAMES
-                else None
-            )
-        for backend in choices:
+            return requested if requested in choices else None
+        auto_choices = tuple(
+            backend
+            for backend in choices
+            if BACKEND_CATALOG.get(backend, {}).get("status") != "deprecated"
+        )
+        for backend in auto_choices:
             if resolve_backend_executable(backend):
                 return backend
-        return choices[0] if choices else None
+        return auto_choices[0] if auto_choices else None
+
+    def _validate_capability(self, request: BuildRequest, backend: str) -> None:
+        capability = BACKEND_CATALOG.get(backend)
+        if capability is None:
+            raise BuildValidationError(f"Backend is not in the capability catalog: {backend}")
+        host_platform = "windows" if os.name == "nt" else sys.platform
+        if host_platform not in capability["host_platforms"]:
+            raise BuildValidationError(
+                f"Backend {backend} is not supported on host platform {host_platform}"
+            )
+        target = request.target.lower()
+        target_platforms = tuple(str(value) for value in capability["target_platforms"])
+        if target not in {"native", "auto"} and not (
+            target in target_platforms
+            or any(
+                f"-{platform}-" in target
+                or target.startswith(f"{platform}-")
+                or target.endswith(f"-{platform}")
+                for platform in target_platforms
+                if platform not in {"native", "wasm"}
+            )
+        ):
+            raise BuildValidationError(
+                f"Backend {backend} does not support target {request.target}; "
+                f"supported targets: {', '.join(target_platforms)}"
+            )
+        architecture = request.architecture.lower()
+        architectures = tuple(str(value) for value in capability["architectures"])
+        if architecture not in {"native", "auto"} and architecture not in architectures:
+            raise BuildValidationError(
+                f"Backend {backend} does not support architecture {request.architecture}; "
+                f"supported architectures: {', '.join(architectures)}"
+            )
 
     def _version_command(self, backend: str) -> tuple[str, ...] | None:
         executable = resolve_backend_executable(backend)
@@ -1324,7 +1454,12 @@ class CompilerEngine:
             raise BuildValidationError(f"Icon file not found: {normalized.icon}")
         backend = self.choose_backend(normalized.file_type, normalized.backend)
         if not backend:
+            if normalized.backend != "auto":
+                raise BuildValidationError(
+                    f"Backend {normalized.backend} is not compatible with .{normalized.file_type}"
+                )
             raise BuildValidationError(f"No backend supports .{normalized.file_type}")
+        self._validate_capability(normalized, backend)
         if normalized.backend == "auto" or normalized.backend != backend:
             normalized = BuildRequest(**{**asdict(normalized), "backend": backend})
         if self.require_available and not resolve_backend_executable(backend):
@@ -3116,6 +3251,7 @@ __all__ = [
     "APP_VERSION",
     "ARTIFACT_MANIFEST_SCHEMA_VERSION",
     "BACKEND_NAMES",
+    "BACKEND_CATALOG",
     "BuildAnalytics",
     "BuildPlan",
     "BuildRequest",

@@ -675,25 +675,38 @@ class DependencyChecker:
     
     @classmethod
     def get_all_status(cls) -> Dict[str, Dict]:
-        """Get status of all dependencies."""
-        status = {
-            "PS2EXE": {"name": "PS2EXE", "desc": "PowerShell (.ps1)", "installed": cls.check_ps2exe(), "size": "~2 MB"},
-            "PyInstaller": {"name": "PyInstaller", "desc": "Python (.py)", "installed": cls.check_pyinstaller(), "size": "~15 MB"},
-            "pkg": {"name": "pkg", "desc": "Node.js (.js)", "installed": cls.check_pkg(), "size": "~50 MB"},
-            "Go": {"name": "Go", "desc": "Go (.go)", "installed": cls.check_go(), "size": "~150 MB"},
-            "Ruby": {"name": "Ruby+Ocra", "desc": "Ruby (.rb)", "installed": cls.check_ruby(), "size": "~120 MB"},
-            "AutoHotkey": {"name": "AutoHotkey", "desc": "AHK (.ahk)", "installed": cls.check_ahk(), "size": "~5 MB"},
-            "CSC": {"name": "CSC", "desc": "C# (.cs)", "installed": cls.check_csc(), "size": "Built-in", "builtin": True},
-            "IExpress": {"name": "IExpress", "desc": "Batch/VBS", "installed": cls.check_iexpress(), "size": "Built-in", "builtin": True},
+        """Get the shared capability catalog in the GUI's card format."""
+
+        aliases = {
+            "ps2exe": "PS2EXE",
+            "pyinstaller": "PyInstaller",
+            "iexpress": "IExpress",
+            "go": "Go",
+            "ocra": "Ruby+Ocra",
+            "ahk2exe": "AutoHotkey",
+            "csc": "CSC",
         }
+        built_in = {"csc", "iexpress"}
+        status: Dict[str, Dict] = {}
         for backend, info in backend_status().items():
-            if backend in {"ps2exe", "pyinstaller", "iexpress", "pkg", "go", "ocra", "ahk2exe", "csc"}:
-                continue
-            status[info["name"]] = {
+            key = aliases.get(backend, backend)
+            extensions = ", ".join(
+                f".{extension}" for extension in info["extensions"]
+            )
+            status[key] = {
                 "name": info["name"],
-                "desc": ", ".join(f".{extension}" for extension in info["extensions"]),
-                "installed": info["available"],
-                "size": "Toolchain",
+                "desc": extensions or "Optional build utility",
+                "installed": bool(info["available"]),
+                "size": "Built-in" if backend in built_in else "Toolchain",
+                "builtin": backend in built_in,
+                "backend": backend,
+                "lifecycle": info["lifecycle"],
+                "default": info["default"],
+                "host_supported": info["host_supported"],
+                "target_platforms": info["target_platforms"],
+                "architectures": info["architectures"],
+                "required_sdks": info["required_sdks"],
+                "verified_version": info["verified_version"],
             }
         return status
 

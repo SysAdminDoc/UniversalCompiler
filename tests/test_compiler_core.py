@@ -17,6 +17,7 @@ from compiler_core import (
     BuildAnalytics,
     BuildValidationError,
     ARTIFACT_MANIFEST_SCHEMA_VERSION,
+    BACKEND_CATALOG,
     CAPABILITY_SCHEMA_VERSION,
     DEFAULT_PROFILES,
     BuildRequest,
@@ -153,6 +154,8 @@ def test_shells_delegate_to_versioned_core_contract() -> None:
     assert "spawn(" in extension
     assert "terminal.sendText" not in extension
     assert 'args.push("--json", "--no-analytics")' in extension
+    assert '"list-toolchains", "--json"' in extension
+    assert "Get-PreferredCapability" in powershell
 
 
 def test_profiles_round_trip_without_extra_dependency(tmp_path: Path) -> None:
@@ -364,6 +367,38 @@ def test_cross_target_plan_sets_platform_environment(tmp_path: Path) -> None:
     assert plan.environment["GOARCH"] == "amd64"
 
 
+def test_capability_registry_rejects_incompatible_backend_and_target(tmp_path: Path) -> None:
+    engine = CompilerEngine(require_available=False)
+    source = tmp_path / "main.py"
+
+    with pytest.raises(BuildValidationError, match=r"not compatible with \.py"):
+        engine.plan(
+            BuildRequest(source=source, output=tmp_path / "main.exe", backend="go"),
+            allow_missing_source=True,
+        )
+    with pytest.raises(BuildValidationError, match="does not support target linux"):
+        engine.plan(
+            BuildRequest(
+                source=source,
+                output=tmp_path / "main.exe",
+                backend="pyinstaller",
+                target="linux",
+            ),
+            allow_missing_source=True,
+        )
+    assert engine.choose_backend("js") != "pkg"
+    assert BACKEND_CATALOG["pkg"]["status"] == "deprecated"
+
+
+def test_auto_selection_never_falls_back_to_deprecated_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        compiler_core,
+        "resolve_backend_executable",
+        lambda backend: "pkg.exe" if backend == "pkg" else None,
+    )
+    assert CompilerEngine(require_available=False).choose_backend("js") == "bun"
+
+
 def test_cli_list_toolchains_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli_main(["list-toolchains", "--json"]) == 0
     output = json.loads(capsys.readouterr().out)
@@ -371,6 +406,9 @@ def test_cli_list_toolchains_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert "rs" in output["rust"]["extensions"]
     assert "wat" in output["wat2wasm"]["extensions"]
     assert output["pyinstaller"]["schema_version"] == CAPABILITY_SCHEMA_VERSION
+    assert output["pyinstaller"]["target_platforms"]
+    assert "required_sdks" in output["pyinstaller"]
+    assert "verified_version" in output["pyinstaller"]
 
 
 def test_github_actions_template_is_language_specific(tmp_path: Path) -> None:

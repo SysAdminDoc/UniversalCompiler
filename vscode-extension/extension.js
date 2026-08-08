@@ -38,10 +38,37 @@ function restrictedEnvironment() {
   return environment;
 }
 
+function readCapabilities(python, script, cwd) {
+  return new Promise((resolve) => {
+    const probe = spawn(String(python), [script, "list-toolchains", "--json"], {
+      cwd,
+      env: restrictedEnvironment(),
+      shell: false,
+      windowsHide: true,
+    });
+    let serialized = "";
+    probe.stdout.on("data", (data) => {
+      serialized += data.toString();
+    });
+    probe.on("error", () => resolve(null));
+    probe.on("close", (code) => {
+      if (code !== 0) {
+        resolve(null);
+        return;
+      }
+      try {
+        resolve(JSON.parse(serialized));
+      } catch (error) {
+        resolve(null);
+      }
+    });
+  });
+}
+
 function activate(context) {
   const disposable = vscode.commands.registerCommand(
     "universalCompiler.buildActiveFile",
-    () => {
+    async () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor) {
         vscode.window.showWarningMessage("Universal Compiler: no active source file.");
@@ -71,13 +98,63 @@ function activate(context) {
       const backend = config.get("backend", "auto");
       const workspace = vscode.workspace.getWorkspaceFolder(editor.document.uri);
       const cwd = workspace?.uri.fsPath || path.dirname(script);
+      const output = vscode.window.createOutputChannel("Universal Compiler");
+      const capabilities = await readCapabilities(python, script, cwd);
+      if (!capabilities) {
+        output.appendLine("Could not read the backend capability catalog.");
+        vscode.window.showErrorMessage(
+          "Universal Compiler: backend capability probe failed."
+        );
+        return;
+      }
+      const extension = path.extname(editor.document.uri.fsPath)
+        .replace(/^\./, "")
+        .toLowerCase();
+      const candidates = Object.values(capabilities).filter(
+        (capability) =>
+          capability.extensions.includes(extension) &&
+          capability.host_supported &&
+          capability.lifecycle !== "deprecated"
+      );
+      if (candidates.length === 0) {
+        output.appendLine(`No active backend supports .${extension} on this host.`);
+        vscode.window.showErrorMessage(
+          `Universal Compiler: no active backend supports .${extension}.`
+        );
+        return;
+      }
+      if (backend && backend !== "auto") {
+        const selected = capabilities[String(backend)];
+        if (
+          !selected ||
+          !selected.extensions.includes(extension) ||
+          !selected.host_supported
+        ) {
+          output.appendLine(
+            `Backend ${String(backend)} is incompatible with .${extension}.`
+          );
+          vscode.window.showErrorMessage(
+            `Universal Compiler: backend ${String(backend)} is incompatible with .${extension}.`
+          );
+          return;
+        }
+        if (selected.lifecycle === "deprecated") {
+          output.appendLine(`Warning: ${String(backend)} is deprecated.`);
+        }
+      }
+      const versions = candidates
+        .filter((capability) => capability.verified_version)
+        .map((capability) => `${capability.backend} ${capability.verified_version}`)
+        .join(", ");
+      output.appendLine(
+        `Capability catalog: ${candidates.map((capability) => capability.backend).join(", ")}${versions ? `; versions: ${versions}` : ""}`
+      );
       const args = [script, "build", editor.document.uri.fsPath];
       if (backend && backend !== "auto") {
         args.push("--backend", String(backend));
       }
       args.push("--json", "--no-analytics");
 
-      const output = vscode.window.createOutputChannel("Universal Compiler");
       const child = spawn(String(python), args, {
         cwd,
         env: restrictedEnvironment(),

@@ -156,6 +156,20 @@ function Get-CoreCapabilities {
     try { return ($processResult.Output | ConvertFrom-Json -ErrorAction Stop) } catch { return @{} }
 }
 
+function Get-PreferredCapability {
+    param([Parameter(Mandatory)][string]$Extension)
+    if ($null -eq $script:CoreCapabilities) { $script:CoreCapabilities = Get-CoreCapabilities }
+    $matches = @()
+    foreach ($property in $script:CoreCapabilities.PSObject.Properties) {
+        $capability = $property.Value
+        if (@($capability.extensions) -contains $Extension) { $matches += $capability }
+    }
+    $preferred = @($matches | Where-Object { $_.available -and $_.lifecycle -ne 'deprecated' } | Select-Object -First 1)
+    if ($preferred.Count -eq 0) { $preferred = @($matches | Where-Object { $_.default -and $_.lifecycle -ne 'deprecated' } | Select-Object -First 1) }
+    if ($preferred.Count -eq 0) { $preferred = @($matches | Where-Object { $_.lifecycle -ne 'deprecated' } | Select-Object -First 1) }
+    return $preferred | Select-Object -First 1
+}
+
 # Ensure config directory
 if (-not (Test-Path $script:ConfigDir)) { New-Item -ItemType Directory -Path $script:ConfigDir -Force | Out-Null }
 
@@ -754,9 +768,17 @@ function Load-SourceFile { param([string]$FilePath)
     $script:srcFile = $FilePath; $txtSource.Text = $FilePath
     Add-RecentFile $FilePath
     $ext = [IO.Path]::GetExtension($FilePath).TrimStart('.').ToLower()
-    if ($script:compilers.ContainsKey($ext)) {
-        $script:fileType = $ext; $ci = $script:compilers[$ext]
-        $fi = Get-Item $FilePath; $lblType.Text = $ci.Desc; $lblSize.Text = FmtSize $fi.Length; $lblCompiler.Text = $ci.Compiler
+    $capability = Get-PreferredCapability $ext
+    if ($capability) {
+        $script:fileType = $ext
+        $ci = if ($script:compilers.ContainsKey($ext)) {
+            $script:compilers[$ext]
+        } else {
+            @{ Name=$ext.ToUpperInvariant(); Desc=".$ext Source"; Admin=$false; Console=$true }
+        }
+        $fi = Get-Item $FilePath
+        $version = if ($capability.verified_version) { " ($($capability.verified_version))" } else { "" }
+        $lblType.Text = $ci.Desc; $lblSize.Text = FmtSize $fi.Length; $lblCompiler.Text = "$($capability.name)$version"
         $lblEstSize.Text = Get-EstimatedOutputSize $FilePath $ext
         $avail = TestCompiler $ext
         $lblStatus.Text = if ($avail) { "Ready" } else { "Not installed" }
