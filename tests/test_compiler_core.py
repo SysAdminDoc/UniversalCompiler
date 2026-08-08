@@ -20,6 +20,9 @@ from compiler_core import (
     BACKEND_CATALOG,
     CAPABILITY_SCHEMA_VERSION,
     DEFAULT_PROFILES,
+    DEPENDENCY_LOCK_KIND,
+    DEPENDENCY_LOCK_SCHEMA_VERSION,
+    DEPENDENCY_POLICY_VERSION,
     BuildRequest,
     BuildResult,
     CommandResult,
@@ -31,6 +34,7 @@ from compiler_core import (
     cli_main,
     compile_bytecode,
     detect_file_type,
+    load_dependency_lock,
     format_size,
     github_actions_template,
     load_profiles,
@@ -65,6 +69,36 @@ def _planned_pyinstaller_output(command: tuple[str, ...] | list[str]) -> Path:
     return Path(command[command.index("--distpath") + 1]) / (
         Path(command[command.index("--name") + 1]).stem + ".exe"
     )
+
+
+def _write_dependency_lock(tmp_path: Path) -> Path:
+    dependency_file = tmp_path / "requirements.lock"
+    dependency_file.write_text(
+        "example-package==1.0.0 --hash=sha256:" + "a" * 64 + "\n",
+        encoding="utf-8",
+    )
+    lock = {
+        "schema_version": DEPENDENCY_LOCK_SCHEMA_VERSION,
+        "kind": DEPENDENCY_LOCK_KIND,
+        "approved": True,
+        "policy": {
+            "version": DEPENDENCY_POLICY_VERSION,
+            "network": "offline",
+            "mirror": None,
+            "cache_dir": ".uc-dependency-cache",
+        },
+        "lockfiles": {
+            "py": {
+                "path": dependency_file.name,
+                "sha256": compiler_core.sha256_file(dependency_file),
+                "manager": "pip",
+            }
+        },
+        "toolchains": {"pyinstaller": {"version": "6.20.0"}},
+    }
+    lock_path = tmp_path / "universal-compiler.lock.json"
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    return lock_path
 
 
 def test_detect_file_type_and_size() -> None:
@@ -156,6 +190,92 @@ def test_prefetch_requires_explicit_network_and_install_permissions(tmp_path: Pa
 
     with pytest.raises(BuildValidationError, match="allow-network"):
         CompilerEngine(require_available=False).prefetch_dependencies(request)
+
+
+def test_approved_dependency_lock_requires_hashes_and_drives_offline_command(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "script.py"
+    source.write_text("print('hello')\n", encoding="utf-8")
+    lock_path = _write_dependency_lock(tmp_path)
+    snapshot = load_dependency_lock(lock_path, source_type="py", require_entry=True)
+    assert snapshot["policy"]["network"] == "offline"
+    assert snapshot["dependency"]["hashes_verified"] is True
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_runner(command, cwd=None, environment=None, timeout=None):
+        calls.append(tuple(command))
+        return CommandResult(tuple(command), 0, stdout="prefetched")
+
+    request = BuildRequest(
+        source=source,
+        output=tmp_path / "script.exe",
+        file_type="py",
+        backend="pyinstaller",
+        prefetch=True,
+        allow_network=True,
+        allow_dependency_install=True,
+        dependency_lockfile=lock_path,
+    )
+    result = CompilerEngine(
+        runner=fake_runner,
+        require_available=False,
+    ).prefetch_dependencies(request, snapshot)
+
+    assert result[0].success is True
+    assert "--require-hashes" in calls[0]
+    assert "--no-index" in calls[0]
+    assert "--find-links" in calls[0]
+    assert str(tmp_path / ".uc-dependency-cache") in calls[0]
+
+
+def test_dependency_snapshot_changes_cache_identity_and_is_recorded(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "script.py"
+    source.write_text("print('hello')\n", encoding="utf-8")
+    output = tmp_path / "script.exe"
+    lock_path = _write_dependency_lock(tmp_path)
+    request = BuildRequest(
+        source=source,
+        output=output,
+        file_type="py",
+        backend="pyinstaller",
+        prefetch=True,
+        allow_network=True,
+        allow_dependency_install=True,
+        dependency_lockfile=lock_path,
+    ).normalized()
+    engine = CompilerEngine(require_available=False)
+    first_snapshot = engine._dependency_snapshot(request)
+    first_key = engine._cache_key(request, compiler_core.sha256_file(source), "pyinstaller", first_snapshot)
+
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["toolchains"]["pyinstaller"]["version"] = "6.21.0"
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    second_snapshot = engine._dependency_snapshot(request)
+    second_key = engine._cache_key(request, compiler_core.sha256_file(source), "pyinstaller", second_snapshot)
+
+    assert first_key != second_key
+    assert first_snapshot["toolchains"]["pyinstaller"]["version"] == "6.20.0"
+    assert second_snapshot["toolchains"]["pyinstaller"]["version"] == "6.21.0"
+
+    def fake_runner(command, cwd=None, environment=None, timeout=None):
+        if "--distpath" in command:
+            _fake_pe(_planned_pyinstaller_output(command))
+        return CommandResult(tuple(command), 0)
+
+    result = CompilerEngine(
+        runner=fake_runner,
+        require_available=False,
+    ).build(request)
+    assert result.success is True
+    assert result.manifest is not None
+    manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
+    assert manifest["dependencies"]["status"] == "locked"
+    assert manifest["dependencies"]["lockfile_sha256"]
+    assert manifest["dependencies"]["dependency"]["hashes_verified"] is True
 
 
 def test_shells_delegate_to_versioned_core_contract() -> None:

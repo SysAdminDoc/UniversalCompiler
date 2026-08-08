@@ -145,8 +145,8 @@ python .\UniversalCompiler.py build .\myscript.py --profile Release --verify
 # Keep the bounded default policy, or tune its per-command limits
 python .\UniversalCompiler.py build .\myscript.py --timeout 900 --max-output-bytes 4194304
 
-# Dependency installation is never implicit; both permissions are required
-python .\UniversalCompiler.py build .\myscript.py --prefetch --allow-network --allow-dependency-install
+# Dependency installation is never implicit; both permissions and an approved lock are required
+python .\UniversalCompiler.py build .\myscript.py --prefetch --dependency-lock .\universal-compiler.lock.json --allow-network --allow-dependency-install
 
 # Build a queue in parallel
 python .\UniversalCompiler.py batch .\src\*.py --jobs 4 --output-dir .\dist
@@ -198,7 +198,15 @@ remains available for creating a legacy YAML file for older integrations.
 
 Builds use a content/toolchain cache
 next to the output and opt-in dependency prefetching (`--prefetch
---allow-network --allow-dependency-install`). Every compiler command is
+--dependency-lock <approved-lock> --allow-network --allow-dependency-install`).
+The lock must use `uc.dependencies.v1`, declare `approved: true`, an explicit
+offline/online mirror and cache policy, SHA-256 identities for its lock inputs,
+and package hashes where the package manager supports them. The default
+source-adjacent name is `universal-compiler.lock.json`; online policies also
+require an HTTPS or file mirror. Cache keys and artifact manifests record the
+lock hash, dependency input hash, policy, and declared toolchain versions.
+Without `--prefetch`, builds do not invoke package managers or network fetches.
+Every compiler command is
 launched without a shell with bounded timeout/output capture, a minimal
 inherited environment, and redacted diagnostics. Static verification checks
 the produced container or PE header without launching the artifact, so a GUI
@@ -269,6 +277,7 @@ Save your favorite settings as profiles:
 | Configuration | `%APPDATA%\UniversalCompiler\config.json` |
 | Canonical project state | `%APPDATA%\UniversalCompiler\universal-compiler.json` |
 | Workspace project state | `<project>\universal-compiler.json` |
+| Dependency lock | `<project>\universal-compiler.lock.json` |
 | Legacy Build Profiles | `%APPDATA%\UniversalCompiler\profiles.yaml` (imported on migration) |
 | Legacy Compilation History | `%APPDATA%\UniversalCompiler\history.json` (imported on migration) |
 | Local Analytics | `%APPDATA%\UniversalCompiler\analytics.sqlite3` |

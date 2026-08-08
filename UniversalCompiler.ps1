@@ -294,7 +294,7 @@ function ConvertFrom-CanonicalSettings {
 
 function ConvertTo-CanonicalProfiles {
     param($Value)
-    $map = @{ Console='console'; Admin='admin'; SingleFile='single_file'; Backend='backend'; Target='target'; Architecture='architecture'; Version='version'; Company='company'; Copyright='copyright'; Description='description'; Product='product'; Prefetch='prefetch'; Verify='verify'; Cache='cache'; Force='force'; ExtraArgs='extra_args'; ToolchainVersions='toolchain_versions'; Upx='upx'; TimeoutSeconds='timeout_seconds'; MaxOutputBytes='max_output_bytes'; AllowNetwork='allow_network'; AllowDependencyInstall='allow_dependency_install' }
+    $map = @{ Console='console'; Admin='admin'; SingleFile='single_file'; Backend='backend'; Target='target'; Architecture='architecture'; Version='version'; Company='company'; Copyright='copyright'; Description='description'; Product='product'; Prefetch='prefetch'; Verify='verify'; Cache='cache'; Force='force'; ExtraArgs='extra_args'; ToolchainVersions='toolchain_versions'; Upx='upx'; TimeoutSeconds='timeout_seconds'; MaxOutputBytes='max_output_bytes'; AllowNetwork='allow_network'; AllowDependencyInstall='allow_dependency_install'; DependencyLockfile='dependency_lockfile'; DependencyCacheDir='dependency_cache_dir'; DependencyMirror='dependency_mirror' }
     $result = [ordered]@{}
     foreach ($profile in Get-ObjectEntries $Value) {
         $entry = [ordered]@{}
@@ -306,7 +306,7 @@ function ConvertTo-CanonicalProfiles {
 
 function ConvertFrom-CanonicalProfiles {
     param($Value)
-    $map = @{ console='Console'; admin='Admin'; single_file='SingleFile'; backend='Backend'; target='Target'; architecture='Architecture'; version='Version'; company='Company'; copyright='Copyright'; description='Description'; product='Product'; prefetch='Prefetch'; verify='Verify'; cache='Cache'; force='Force'; extra_args='ExtraArgs'; toolchain_versions='ToolchainVersions'; upx='Upx'; timeout_seconds='TimeoutSeconds'; max_output_bytes='MaxOutputBytes'; allow_network='AllowNetwork'; allow_dependency_install='AllowDependencyInstall' }
+    $map = @{ console='Console'; admin='Admin'; single_file='SingleFile'; backend='Backend'; target='Target'; architecture='Architecture'; version='Version'; company='Company'; copyright='Copyright'; description='Description'; product='Product'; prefetch='Prefetch'; verify='Verify'; cache='Cache'; force='Force'; extra_args='ExtraArgs'; toolchain_versions='ToolchainVersions'; upx='Upx'; timeout_seconds='TimeoutSeconds'; max_output_bytes='MaxOutputBytes'; allow_network='AllowNetwork'; allow_dependency_install='AllowDependencyInstall'; dependency_lockfile='DependencyLockfile'; dependency_cache_dir='DependencyCacheDir'; dependency_mirror='DependencyMirror' }
     $result = @{}
     foreach ($profile in Get-ObjectEntries $Value) {
         $entry = @{}

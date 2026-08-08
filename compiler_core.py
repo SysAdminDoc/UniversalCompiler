@@ -44,6 +44,10 @@ ARTIFACT_MANIFEST_SCHEMA_VERSION = "uc.artifact-manifest.v1"
 PROJECT_MANIFEST_SCHEMA_VERSION = "uc.project.v1"
 PROJECT_MANIFEST_KIND = "universal-compiler.project"
 PROJECT_MANIFEST_FILENAME = "universal-compiler.json"
+DEPENDENCY_LOCK_SCHEMA_VERSION = "uc.dependencies.v1"
+DEPENDENCY_LOCK_KIND = "universal-compiler.dependencies"
+DEPENDENCY_LOCK_FILENAME = "universal-compiler.lock.json"
+DEPENDENCY_POLICY_VERSION = "uc.dependency-policy.v1"
 
 
 DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
@@ -155,6 +159,9 @@ PROJECT_MANIFEST_PROFILE_FIELDS = frozenset(
         "max_output_bytes",
         "allow_network",
         "allow_dependency_install",
+        "dependency_lockfile",
+        "dependency_cache_dir",
+        "dependency_mirror",
     }
 )
 PROJECT_MANIFEST_SETTINGS_FIELDS = frozenset(DEFAULT_MANIFEST_SETTINGS)
@@ -597,6 +604,9 @@ class BuildRequest:
     max_output_bytes: int | None = None
     allow_network: bool = False
     allow_dependency_install: bool = False
+    dependency_lockfile: Path | None = None
+    dependency_cache_dir: Path | None = None
+    dependency_mirror: str | None = None
     cancel_event: threading.Event | None = field(
         default=None, repr=False, compare=False
     )
@@ -644,6 +654,21 @@ class BuildRequest:
             ),
             allow_network=bool(self.allow_network),
             allow_dependency_install=bool(self.allow_dependency_install),
+            dependency_lockfile=(
+                Path(self.dependency_lockfile).expanduser()
+                if self.dependency_lockfile
+                else None
+            ),
+            dependency_cache_dir=(
+                Path(self.dependency_cache_dir).expanduser()
+                if self.dependency_cache_dir
+                else None
+            ),
+            dependency_mirror=(
+                str(self.dependency_mirror).strip()
+                if self.dependency_mirror
+                else None
+            ),
             cancel_event=self.cancel_event,
         )
 
@@ -713,6 +738,16 @@ class BuildResult:
         result["request"].pop("cancel_event", None)
         result["request"]["icon"] = (
             str(self.request.icon) if self.request.icon else None
+        )
+        result["request"]["dependency_lockfile"] = (
+            str(self.request.dependency_lockfile)
+            if self.request.dependency_lockfile
+            else None
+        )
+        result["request"]["dependency_cache_dir"] = (
+            str(self.request.dependency_cache_dir)
+            if self.request.dependency_cache_dir
+            else None
         )
         result["request"]["metadata"] = dict(self.request.metadata)
         result["request"]["extra_args"] = list(redact_command(self.request.extra_args))
@@ -1140,6 +1175,15 @@ def validate_project_manifest(
             raise BuildValidationError(
                 f"Manifest field profiles.{name}.extra_args must be an array"
             )
+        for path_key in (
+            "dependency_lockfile",
+            "dependency_cache_dir",
+            "dependency_mirror",
+        ):
+            if base.get(path_key) is not None and not isinstance(base[path_key], str):
+                raise BuildValidationError(
+                    f"Manifest field profiles.{name}.{path_key} must be a string or null"
+                )
         base["extra_args"] = [str(item) for item in base.get("extra_args", [])]
         base["toolchain_versions"] = {
             str(key): str(value)
@@ -1281,6 +1325,12 @@ _LEGACY_MANIFEST_KEY_MAP = {
     "allow_network": "allow_network",
     "allowdependencyinstall": "allow_dependency_install",
     "allow_dependency_install": "allow_dependency_install",
+    "dependencylockfile": "dependency_lockfile",
+    "dependency_lockfile": "dependency_lockfile",
+    "dependencycachedir": "dependency_cache_dir",
+    "dependency_cache_dir": "dependency_cache_dir",
+    "dependencymirror": "dependency_mirror",
+    "dependency_mirror": "dependency_mirror",
     "theme": "theme",
     "postbuildaction": "post_build_action",
     "post_build_action": "post_build_action",
@@ -1454,6 +1504,254 @@ def sha256_file(path: os.PathLike[str] | str, chunk_size: int = 1024 * 1024) -> 
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+_DEPENDENCY_LOCK_FIELDS = frozenset(
+    {"schema_version", "kind", "approved", "policy", "lockfiles", "toolchains"}
+)
+_DEPENDENCY_POLICY_FIELDS = frozenset(
+    {"version", "network", "mirror", "cache_dir"}
+)
+_DEPENDENCY_LOCKFILE_FIELDS = frozenset({"path", "sha256", "manager"})
+_DEPENDENCY_TOOLCHAIN_FIELDS = frozenset({"version", "sha256"})
+_DEPENDENCY_MANAGERS = {
+    "py": frozenset({"pip"}),
+    "pyw": frozenset({"pip"}),
+    "js": frozenset({"npm", "bun"}),
+    "ts": frozenset({"npm", "bun"}),
+    "go": frozenset({"go"}),
+    "rs": frozenset({"cargo"}),
+    "rb": frozenset({"bundle"}),
+}
+
+
+def _dependency_unknown_fields(
+    value: Mapping[str, Any], allowed: Iterable[str], location: str
+) -> None:
+    unknown = sorted(str(key) for key in value if str(key) not in allowed)
+    if unknown:
+        raise BuildValidationError(
+            f"Unknown dependency lock field(s) at {location}: {', '.join(unknown)}"
+        )
+
+
+def _dependency_sha256(value: Any, location: str) -> str:
+    text = str(value).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", text):
+        raise BuildValidationError(
+            f"Dependency lock field {location} must be a SHA-256 hex digest"
+        )
+    return text
+
+
+def _dependency_has_hashes(manager: str, path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        text = path.read_bytes().decode("latin-1")
+    if manager == "pip":
+        return bool(re.search(r"--hash\s*=\s*sha(?:256|384|512):[0-9a-f]+", text, re.I))
+    if manager in {"npm", "bun"}:
+        if path.suffix.lower() == ".json":
+            try:
+                json.loads(text)
+            except ValueError as error:
+                raise BuildValidationError(
+                    f"Dependency lock file is not valid JSON: {path}"
+                ) from error
+        return bool(re.search(r'"(?:integrity|checksum|sha(?:256|512))"\s*:', text, re.I))
+    if manager == "go":
+        return "h1:" in text
+    if manager == "cargo":
+        return bool(re.search(r"^\s*checksum\s*=", text, re.M))
+    # Bundler lock files pin the complete dependency graph but do not carry
+    # package hashes in the lock format, so the lockfile hash is the identity.
+    return True
+
+
+def dependency_lock_path(
+    source: os.PathLike[str] | str, lockfile: os.PathLike[str] | str | None = None
+) -> Path:
+    """Return the explicit lockfile or the source-adjacent default path."""
+
+    if lockfile:
+        return Path(lockfile).expanduser()
+    return Path(source).expanduser().resolve().parent / DEPENDENCY_LOCK_FILENAME
+
+
+def load_dependency_lock(
+    path: os.PathLike[str] | str,
+    source_type: str | None = None,
+    cache_dir: os.PathLike[str] | str | None = None,
+    mirror: str | None = None,
+    require_entry: bool = False,
+) -> dict[str, Any]:
+    """Validate an approved, hash-addressed dependency lock and snapshot it."""
+
+    lock_path = Path(path).expanduser().resolve()
+    if not lock_path.is_file():
+        raise BuildValidationError(
+            f"Approved dependency lock file not found: {lock_path}"
+        )
+    try:
+        loaded = json.loads(lock_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as error:
+        raise BuildValidationError(
+            f"Could not read dependency lock file {lock_path}: {error}"
+        ) from error
+    if not isinstance(loaded, Mapping):
+        raise BuildValidationError("Dependency lock must be a JSON object")
+    _dependency_unknown_fields(loaded, _DEPENDENCY_LOCK_FIELDS, "<root>")
+    if loaded.get("schema_version") != DEPENDENCY_LOCK_SCHEMA_VERSION:
+        raise BuildValidationError(
+            f"Unsupported dependency lock schema {loaded.get('schema_version')!r}; "
+            f"expected {DEPENDENCY_LOCK_SCHEMA_VERSION}"
+        )
+    if loaded.get("kind") != DEPENDENCY_LOCK_KIND:
+        raise BuildValidationError(
+            f"Unsupported dependency lock kind {loaded.get('kind')!r}"
+        )
+    if loaded.get("approved") is not True:
+        raise BuildValidationError(
+            "Dependency prefetch requires an approved dependency lock"
+        )
+
+    raw_policy = loaded.get("policy")
+    if not isinstance(raw_policy, Mapping):
+        raise BuildValidationError("Dependency lock policy must be an object")
+    _dependency_unknown_fields(raw_policy, _DEPENDENCY_POLICY_FIELDS, "policy")
+    if raw_policy.get("version") != DEPENDENCY_POLICY_VERSION:
+        raise BuildValidationError(
+            f"Unsupported dependency policy {raw_policy.get('version')!r}; "
+            f"expected {DEPENDENCY_POLICY_VERSION}"
+        )
+    network = str(raw_policy.get("network", "")).lower()
+    if network not in {"offline", "online"}:
+        raise BuildValidationError(
+            "Dependency lock policy.network must be 'offline' or 'online'"
+        )
+    raw_mirror = raw_policy.get("mirror")
+    if raw_mirror is not None and not isinstance(raw_mirror, str):
+        raise BuildValidationError("Dependency lock policy.mirror must be a string or null")
+    effective_mirror = str(mirror or raw_mirror or "").strip() or None
+    if network == "online" and not effective_mirror:
+        raise BuildValidationError(
+            "Online dependency policy requires an explicit package mirror"
+        )
+    if network == "offline" and mirror:
+        raise BuildValidationError(
+            "An online mirror cannot override an offline dependency policy"
+        )
+    if effective_mirror and not effective_mirror.startswith(("https://", "file://")):
+        raise BuildValidationError(
+            "Dependency mirror must use https:// or file://"
+        )
+    raw_cache = raw_policy.get("cache_dir")
+    if not isinstance(raw_cache, str) or not raw_cache.strip():
+        raise BuildValidationError(
+            "Dependency lock policy requires an explicit cache_dir"
+        )
+    effective_cache = Path(cache_dir).expanduser() if cache_dir else Path(raw_cache)
+    if not effective_cache.is_absolute():
+        effective_cache = lock_path.parent / effective_cache
+    effective_cache = effective_cache.resolve()
+    policy = {
+        "version": DEPENDENCY_POLICY_VERSION,
+        "network": network,
+        "mirror": effective_mirror,
+        "cache_dir": str(effective_cache),
+    }
+
+    raw_lockfiles = loaded.get("lockfiles")
+    if not isinstance(raw_lockfiles, Mapping):
+        raise BuildValidationError("Dependency lock lockfiles must be an object")
+    selected: dict[str, Any] | None = None
+    selected_type = (source_type or "").lower().lstrip(".")
+    if selected_type == "pyw":
+        selected_type = "py"
+    if selected_type:
+        raw_entry = raw_lockfiles.get(selected_type)
+        if not isinstance(raw_entry, Mapping):
+            if require_entry:
+                raise BuildValidationError(
+                    f"Dependency lock has no entry for source type .{selected_type}"
+                )
+        else:
+            _dependency_unknown_fields(raw_entry, _DEPENDENCY_LOCKFILE_FIELDS, f"lockfiles.{selected_type}")
+            relative_path = raw_entry.get("path")
+            if not isinstance(relative_path, str) or not relative_path.strip():
+                raise BuildValidationError(
+                    f"Dependency lock entry .{selected_type}.path is required"
+                )
+            dependency_path = Path(relative_path).expanduser()
+            if not dependency_path.is_absolute():
+                dependency_path = lock_path.parent / dependency_path
+            dependency_path = dependency_path.resolve()
+            if not dependency_path.is_file():
+                raise BuildValidationError(
+                    f"Dependency lock input is missing: {dependency_path}"
+                )
+            expected_hash = _dependency_sha256(
+                raw_entry.get("sha256"), f"lockfiles.{selected_type}.sha256"
+            )
+            actual_hash = sha256_file(dependency_path)
+            if actual_hash != expected_hash:
+                raise BuildValidationError(
+                    f"Dependency lock hash mismatch for {dependency_path}: "
+                    f"expected {expected_hash}, got {actual_hash}"
+                )
+            manager = str(raw_entry.get("manager", "")).lower()
+            allowed_managers = _DEPENDENCY_MANAGERS.get(selected_type, frozenset())
+            if manager not in allowed_managers:
+                expected = ", ".join(sorted(allowed_managers)) or "none"
+                raise BuildValidationError(
+                    f"Unsupported dependency manager {manager!r} for .{selected_type}; "
+                    f"expected {expected}"
+                )
+            if manager != "bundle" and not _dependency_has_hashes(manager, dependency_path):
+                raise BuildValidationError(
+                    f"Dependency lock input has no verifiable package hashes: {dependency_path}"
+                )
+            selected = {
+                "path": str(dependency_path),
+                "sha256": actual_hash,
+                "manager": manager,
+                "hashes_verified": manager == "bundle"
+                or _dependency_has_hashes(manager, dependency_path),
+            }
+
+    raw_toolchains = loaded.get("toolchains", {})
+    if not isinstance(raw_toolchains, Mapping):
+        raise BuildValidationError("Dependency lock toolchains must be an object")
+    toolchains: dict[str, dict[str, str]] = {}
+    for name, raw_toolchain in raw_toolchains.items():
+        if isinstance(raw_toolchain, str):
+            raw_toolchain = {"version": raw_toolchain}
+        if not isinstance(raw_toolchain, Mapping):
+            raise BuildValidationError(f"Dependency lock toolchain {name} must be an object")
+        _dependency_unknown_fields(raw_toolchain, _DEPENDENCY_TOOLCHAIN_FIELDS, f"toolchains.{name}")
+        version = raw_toolchain.get("version")
+        if not isinstance(version, str) or not version.strip():
+            raise BuildValidationError(f"Dependency lock toolchain {name} needs a version")
+        record = {"version": version.strip()}
+        if raw_toolchain.get("sha256") is not None:
+            record["sha256"] = _dependency_sha256(
+                raw_toolchain["sha256"], f"toolchains.{name}.sha256"
+            )
+        toolchains[str(name)] = record
+
+    return {
+        "schema_version": DEPENDENCY_LOCK_SCHEMA_VERSION,
+        "kind": DEPENDENCY_LOCK_KIND,
+        "status": "locked",
+        "approved": True,
+        "lockfile": str(lock_path),
+        "lockfile_sha256": sha256_file(lock_path),
+        "source_type": selected_type or None,
+        "dependency": selected,
+        "policy": policy,
+        "toolchains": toolchains,
+    }
 
 
 def _canonical_hash(value: Any) -> str:
@@ -2070,7 +2368,36 @@ class CompilerEngine:
     def _cache_path(self, output: Path) -> Path:
         return output.with_name(output.name + ".uc-cache.json")
 
-    def _cache_key(self, request: BuildRequest, source_hash: str, backend: str) -> str:
+    def _dependency_snapshot(self, request: BuildRequest) -> dict[str, Any]:
+        lock_path = dependency_lock_path(
+            request.source, request.dependency_lockfile
+        )
+        if not lock_path.is_file() and not request.prefetch and not request.dependency_lockfile:
+            return {
+                "schema_version": DEPENDENCY_LOCK_SCHEMA_VERSION,
+                "status": "not-requested",
+                "policy_version": DEPENDENCY_POLICY_VERSION,
+            }
+        snapshot = load_dependency_lock(
+            lock_path,
+            source_type=request.file_type,
+            cache_dir=request.dependency_cache_dir,
+            mirror=request.dependency_mirror,
+            require_entry=request.prefetch,
+        )
+        if request.prefetch and snapshot["policy"]["network"] == "online" and not request.allow_network:
+            raise BuildValidationError(
+                "Online dependency policy requires explicit --allow-network"
+            )
+        return snapshot
+
+    def _cache_key(
+        self,
+        request: BuildRequest,
+        source_hash: str,
+        backend: str,
+        dependency_snapshot: Mapping[str, Any],
+    ) -> str:
         return _canonical_hash(
             {
                 "source": str(request.source.resolve()),
@@ -2091,6 +2418,8 @@ class CompilerEngine:
                 "toolchain_versions": dict(request.toolchain_versions),
                 "upx": request.upx,
                 "tool": self._tool_identity(backend),
+                "dependency_snapshot": dependency_snapshot,
+                "policy_version": DEPENDENCY_POLICY_VERSION,
             }
         )
 
@@ -2114,6 +2443,7 @@ class CompilerEngine:
         source_hash: str,
         backend: str,
         verification: VerificationResult | None,
+        dependency_snapshot: Mapping[str, Any],
     ) -> None:
         save_json(
             self._cache_path(request.output),
@@ -2124,6 +2454,7 @@ class CompilerEngine:
                 "output": str(request.output),
                 "created_at": datetime.now(UTC).isoformat(),
                 "verification": asdict(verification) if verification else None,
+                "dependency_snapshot": dict(dependency_snapshot),
             },
         )
 
@@ -2134,6 +2465,7 @@ class CompilerEngine:
         source_hash: str,
         cache_key: str,
         verification: VerificationResult | None,
+        dependency_snapshot: Mapping[str, Any],
     ) -> Path:
         """Atomically emit the identity and verification record for a build."""
 
@@ -2173,6 +2505,7 @@ class CompilerEngine:
                 "backend": self._tool_identity(plan.backend),
                 "pins": dict(request.toolchain_versions),
             },
+            "dependencies": dict(dependency_snapshot),
             "policy": {
                 "timeout_seconds": policy.timeout_seconds,
                 "max_output_bytes": policy.max_output_bytes,
@@ -2473,46 +2806,98 @@ class CompilerEngine:
             environment=environment,
         )
 
-    def prefetch_dependencies(self, request: BuildRequest) -> list[CommandResult]:
-        """Run opt-in dependency prefetch commands discovered beside the source."""
+    def prefetch_dependencies(
+        self,
+        request: BuildRequest,
+        dependency_snapshot: Mapping[str, Any] | None = None,
+    ) -> list[CommandResult]:
+        """Run one approved, hash-addressed dependency operation."""
 
         if not request.allow_network or not request.allow_dependency_install:
             raise BuildValidationError(
                 "Dependency prefetch requires both --allow-network and "
                 "--allow-dependency-install"
             )
-
         source = request.source.resolve()
         root = source.parent
-        commands: list[tuple[Sequence[str], Path]] = []
-        requirements = root / "requirements.txt"
-        if requirements.exists() and request.file_type in {"py", "pyw"}:
-            commands.append(
-                (
-                    (sys.executable, "-m", "pip", "install", "-r", str(requirements)),
-                    root,
-                )
+        snapshot = dependency_snapshot or self._dependency_snapshot(request)
+        dependency = snapshot.get("dependency")
+        if not isinstance(dependency, Mapping):
+            raise BuildValidationError(
+                f"Dependency lock has no usable entry for .{request.file_type}"
             )
-        package = root / "package.json"
-        if package.exists() and request.file_type in {"js", "ts"}:
-            manager = _find_first(("bun", "npm"))
-            if manager:
-                commands.append(((manager, "install"), root))
-        go_mod = root / "go.mod"
-        if go_mod.exists() and request.file_type == "go":
-            go = _find_first(("go",))
-            if go:
-                commands.append(((go, "mod", "download"), root))
-        cargo = root / "Cargo.toml"
-        if cargo.exists() and request.file_type == "rs":
-            cargo_exe = _find_first(("cargo",))
-            if cargo_exe:
-                commands.append(((cargo_exe, "fetch"), root))
-        gemfile = root / "Gemfile"
-        bundle = _find_first(("bundle",))
-        if gemfile.exists() and bundle and request.file_type == "rb":
-            commands.append(((bundle, "install"), root))
-        return [self._run(request, command, cwd=cwd) for command, cwd in commands]
+        manager = str(dependency.get("manager", "")).lower()
+        lock_input = Path(str(dependency["path"]))
+        cache_dir = Path(str(snapshot["policy"]["cache_dir"]))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        offline = snapshot["policy"]["network"] == "offline"
+        environment: dict[str, str] = {}
+
+        if manager == "pip":
+            command: tuple[str, ...] = (
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--require-hashes",
+                "--no-deps",
+            )
+            if offline:
+                command += ("--no-index", "--find-links", str(cache_dir))
+            else:
+                command += ("--index-url", str(snapshot["policy"]["mirror"]))
+            command += ("-r", str(lock_input))
+        elif manager in {"npm", "bun"}:
+            executable = _find_first((manager,))
+            if not executable:
+                raise BuildValidationError(
+                    f"Required dependency manager is unavailable: {manager}"
+                )
+            if lock_input.parent != root:
+                raise BuildValidationError(
+                    f"{manager} lock input must be beside the source: {lock_input}"
+                )
+            command = (executable, "ci", "--ignore-scripts", "--no-audit", "--no-fund")
+            if manager == "bun":
+                command = (executable, "install", "--frozen-lockfile")
+                if offline:
+                    command += ("--offline",)
+            elif offline:
+                command += ("--offline",)
+            else:
+                command += ("--registry", str(snapshot["policy"]["mirror"]))
+            command += ("--cache", str(cache_dir))
+        elif manager == "go":
+            executable = _find_first(("go",))
+            if not executable:
+                raise BuildValidationError("Required dependency manager is unavailable: go")
+            command = (executable, "mod", "download")
+            environment["GOMODCACHE"] = str(cache_dir)
+            environment["GOPROXY"] = "off" if offline else str(snapshot["policy"]["mirror"])
+            if offline:
+                environment["GOSUMDB"] = "off"
+        elif manager == "cargo":
+            executable = _find_first(("cargo",))
+            if not executable:
+                raise BuildValidationError("Required dependency manager is unavailable: cargo")
+            command = (executable, "fetch", "--locked")
+            if offline:
+                command += ("--offline",)
+            environment["CARGO_HOME"] = str(cache_dir)
+        elif manager == "bundle":
+            executable = _find_first(("bundle",))
+            if not executable:
+                raise BuildValidationError("Required dependency manager is unavailable: bundle")
+            command = (executable, "install", "--deployment", "--path", str(cache_dir))
+            if offline:
+                command += ("--local",)
+            else:
+                environment["BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG"] = str(
+                    snapshot["policy"]["mirror"]
+                )
+        else:
+            raise BuildValidationError(f"Unsupported dependency manager: {manager}")
+        return [self._run(request, command, cwd=root, environment=environment)]
 
     def _staged_request(self, request: BuildRequest) -> tuple[BuildRequest, Path]:
         """Create a per-build staging directory on the output volume."""
@@ -2547,8 +2932,14 @@ class CompilerEngine:
                     message="Build cancelled before execution",
                     duration_seconds=time.monotonic() - started,
                 )
+            dependency_snapshot = self._dependency_snapshot(normalized)
             source_hash = sha256_file(normalized.source)
-            cache_key = self._cache_key(normalized, source_hash, normalized.backend)
+            cache_key = self._cache_key(
+                normalized,
+                source_hash,
+                normalized.backend,
+                dependency_snapshot,
+            )
             if self._cache_hit(normalized, cache_key):
                 verification = (
                     verify_artifact(normalized.output) if normalized.verify else None
@@ -2567,6 +2958,7 @@ class CompilerEngine:
                             source_hash,
                             cache_key,
                             verification,
+                            dependency_snapshot,
                         )
                     return BuildResult(
                         True,
@@ -2586,7 +2978,9 @@ class CompilerEngine:
             plan = self.plan(staged_request)
             commands: list[CommandResult] = []
             if normalized.prefetch:
-                commands.extend(self.prefetch_dependencies(normalized))
+                commands.extend(
+                    self.prefetch_dependencies(normalized, dependency_snapshot)
+                )
                 failed_prefetch = next(
                     (result for result in commands if not result.success), None
                 )
@@ -2740,7 +3134,12 @@ class CompilerEngine:
             os.replace(staged_request.output, normalized.output)
             verification = publication_verification if normalized.verify else None
             self._save_cache(
-                normalized, cache_key, source_hash, plan.backend, verification
+                normalized,
+                cache_key,
+                source_hash,
+                plan.backend,
+                verification,
+                dependency_snapshot,
             )
             manifest_path = self._write_artifact_manifest(
                 normalized,
@@ -2748,6 +3147,7 @@ class CompilerEngine:
                 source_hash,
                 cache_key,
                 verification,
+                dependency_snapshot,
             )
             return BuildResult(
                 True,
@@ -3563,6 +3963,19 @@ def _profile_request(
             args.allow_dependency_install
             or bool(profile.get("allow_dependency_install", False))
         ),
+        dependency_lockfile=(
+            Path(args.dependency_lockfile or profile["dependency_lockfile"])
+            if args.dependency_lockfile or profile.get("dependency_lockfile")
+            else None
+        ),
+        dependency_cache_dir=(
+            Path(args.dependency_cache_dir or profile["dependency_cache_dir"])
+            if args.dependency_cache_dir or profile.get("dependency_cache_dir")
+            else None
+        ),
+        dependency_mirror=(
+            args.dependency_mirror or profile.get("dependency_mirror")
+        ),
     )
 
 
@@ -3614,6 +4027,23 @@ def _add_build_options(parser: argparse.ArgumentParser) -> None:
         "--allow-dependency-install",
         action="store_true",
         help="Allow dependency installation during --prefetch",
+    )
+    parser.add_argument(
+        "--dependency-lock",
+        "--lockfile",
+        dest="dependency_lockfile",
+        help=(
+            "Approved uc.dependencies.v1 lock file; defaults to "
+            "universal-compiler.lock.json beside the source"
+        ),
+    )
+    parser.add_argument(
+        "--dependency-cache-dir",
+        help="Override the lock file's explicit dependency cache directory",
+    )
+    parser.add_argument(
+        "--dependency-mirror",
+        help="Override the lock file's explicit package mirror",
     )
     parser.add_argument(
         "--verify",
@@ -4063,6 +4493,10 @@ __all__ = [
     "CAPABILITY_SCHEMA_VERSION",
     "CommandResult",
     "CompilerEngine",
+    "DEPENDENCY_LOCK_FILENAME",
+    "DEPENDENCY_LOCK_KIND",
+    "DEPENDENCY_LOCK_SCHEMA_VERSION",
+    "DEPENDENCY_POLICY_VERSION",
     "DEFAULT_MANIFEST_SETTINGS",
     "DEFAULT_PROFILES",
     "DEFAULT_EXECUTION_TIMEOUT_SECONDS",
@@ -4078,12 +4512,14 @@ __all__ = [
     "compile_bytecode",
     "config_dir",
     "detect_file_type",
+    "dependency_lock_path",
     "estimate_output_size",
     "extract_icon",
     "format_size",
     "github_actions_template",
     "obfuscate_source",
     "load_json",
+    "load_dependency_lock",
     "load_project_manifest",
     "load_profiles",
     "default_project_manifest",
