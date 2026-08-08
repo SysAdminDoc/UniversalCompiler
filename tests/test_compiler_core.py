@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import struct
 import sys
 import threading
@@ -740,6 +741,43 @@ def test_capability_registry_rejects_incompatible_backend_and_target(tmp_path: P
     assert BACKEND_CATALOG["pkg"]["status"] == "deprecated"
 
 
+_BACKEND_PLAN_CASES = tuple(
+    (extension, backend)
+    for backend, spec in BACKEND_CATALOG.items()
+    if spec["extensions"]
+    for extension in spec["extensions"][:1]
+)
+
+
+@pytest.mark.parametrize(
+    ("extension", "backend"),
+    _BACKEND_PLAN_CASES,
+    ids=[f"{backend}-{extension}" for extension, backend in _BACKEND_PLAN_CASES],
+)
+def test_every_catalog_backend_has_a_side_effect_free_plan_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extension: str,
+    backend: str,
+) -> None:
+    monkeypatch.setattr(compiler_core, "resolve_backend_executable", lambda name: name)
+    source = tmp_path / f"input.{extension}"
+    source.write_text("contract fixture\n", encoding="utf-8")
+    plan = CompilerEngine(require_available=False).plan(
+        BuildRequest(
+            source=source,
+            output=tmp_path / "artifact.exe",
+            file_type=extension,
+            backend=backend,
+        ),
+        allow_missing_source=True,
+    )
+
+    assert plan.backend == backend
+    assert plan.command
+    assert plan.cwd == source.resolve().parent
+
+
 def test_auto_selection_never_falls_back_to_deprecated_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         compiler_core,
@@ -765,6 +803,16 @@ def test_github_actions_template_is_language_specific(tmp_path: Path) -> None:
     workflow = github_actions_template("py")
     assert "setup-python" in workflow
     assert "--no-analytics" in workflow
+    assert "--require-hashes" in workflow
+    for line in workflow.splitlines():
+        if "uses:" in line:
+            assert re.search(r"@[0-9a-f]{40}(?:\s|#|$)", line)
+
+    ci_workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "permissions:\n  contents: read" in ci_workflow
+    for line in ci_workflow.splitlines():
+        if "uses:" in line:
+            assert re.search(r"@[0-9a-f]{40}(?:\s|#|$)", line)
 
     destination = tmp_path / ".github" / "workflow.yml"
     assert (

@@ -45,6 +45,9 @@ All notable changes to UniversalCompiler will be documented in this file.
 - Require approved, hash-addressed dependency locks for prefetch, enforce
   explicit offline/online mirror and cache policies, and record dependency and
   toolchain snapshots in cache metadata and artifact manifests.
+- Add a pinned Windows CI contract gate with isolated temporary-root cleanup,
+  full backend planning coverage, artifact/migration/cancellation tests, and
+  lint/type checks; generated workflow actions now use commit SHAs.
 
 ## [v0.1.0] - %Y->- (HEAD -> main, origin/main, origin/HEAD)
 

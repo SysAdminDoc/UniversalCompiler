@@ -3849,25 +3849,26 @@ def github_actions_template(file_type: str) -> str:
     setup: list[str]
     if extension == "py":
         setup = [
-            "      - uses: actions/setup-python@v5",
+            "      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0",
             "        with:",
             "          python-version: '3.12'",
-            "      - run: python -m pip install pyinstaller",
+            "      - name: Install locked Python toolchain",
+            "        run: python -m pip install --require-hashes --no-deps --no-index --find-links .uc-dependency-cache -r requirements.lock",
         ]
     elif extension in {"js", "ts"}:
         setup = [
-            "      - uses: oven-sh/setup-bun@v2",
-            "      - run: bun install --frozen-lockfile",
+            "      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2",
+            "      - run: bun install --frozen-lockfile --offline",
         ]
     elif extension == "go":
         setup = [
-            "      - uses: actions/setup-go@v5",
+            "      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0",
             "        with:",
             "          go-version: stable",
         ]
     elif extension == "rs":
         setup = [
-            "      - uses: actions-rust-lang/setup-rust-toolchain@v1",
+            "      - uses: actions-rust-lang/setup-rust-toolchain@2fcdc490d667999e01ddbbf0f2823181beef6b39 # v1.15.0",
             "        with:",
             "          toolchain: stable",
         ]
@@ -3888,7 +3889,7 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 {setup_text}
       - name: Build source
         shell: pwsh
@@ -3896,7 +3897,7 @@ jobs:
         env:
           UC_SOURCE: ${{{{ vars.UC_SOURCE || 'src/main.{extension}' }}}}
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: universal-compiler-{extension}
           path: dist/*.exe

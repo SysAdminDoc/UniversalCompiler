@@ -236,6 +236,12 @@ when explicitly requested. The PowerShell GUI also delegates builds to this
 Python CLI and consumes its versioned JSON request/result contract; it remains
 useful as a Windows shell and explicit toolchain setup surface.
 
+The repository contract gate is `.github/workflows/ci.yml`. It runs the full
+fake-runner/backend-plan matrix, artifact and migration tests, lint, and mypy
+on an isolated temporary root. Every generated workflow action is pinned to a
+full commit SHA, and installed-tool availability is never used to skip core
+contract tests.
+
 ### Drag & Drop
 
 - **Single file**: Loads immediately for compilation
