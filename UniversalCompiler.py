@@ -9,6 +9,7 @@ and AutoHotkey scripts into standalone Windows executables.
 
 import os
 import sys
+import json
 import shutil
 import threading
 import queue
@@ -46,11 +47,26 @@ from compiler_core import (
 _CLI_COMMANDS = {
     "build", "batch", "inspect", "verify", "release", "list-toolchains", "compatibility", "target-policy", "diagnostics",
     "init-profiles", "manifest", "bytecode", "extract-icon", "wrap-msix", "obfuscate",
-    "analytics", "init-actions", "--help", "-h",
+    "analytics", "init-actions",
 }
-if __name__ == "__main__" and any(
-    argument.lower() in _CLI_COMMANDS for argument in sys.argv[1:]
-):
+
+
+def _is_cli_invocation(arguments: List[str]) -> bool:
+    """Identify a CLI command without mistaking option values for commands."""
+
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index].lower()
+        if argument in {"--help", "-h"}:
+            return True
+        if argument == "--locale":
+            index += 2
+            continue
+        return argument in _CLI_COMMANDS
+    return False
+
+
+if __name__ == "__main__" and _is_cli_invocation(sys.argv[1:]):
     from compiler_core import cli_main
 
     raise SystemExit(cli_main(sys.argv[1:]))
@@ -100,45 +116,72 @@ CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 THEMES = {
     "Dark": {
-        "bg": "#020617",
-        "card": "#0f172a",
-        "card_hover": "#1e293b",
-        "border": "#1e293b",
-        "input": "#0f172a",
-        "green": "#22c55e",
-        "green_hover": "#16a34a",
-        "blue": "#60a5fa",
-        "red": "#ef4444",
-        "yellow": "#eab308",
+        "bg": "#080d18",
+        "sidebar": "#0a111f",
+        "surface": "#0f1829",
+        "surface_alt": "#121d30",
+        "card": "#0f1829",
+        "card_hover": "#17243a",
+        "border": "#263651",
+        "border_strong": "#3a5277",
+        "divider": "#22314a",
+        "input": "#0c1525",
+        "dropzone": "#0b1424",
+        "accent": "#2f8cff",
+        "accent_hover": "#1f73da",
+        "accent_soft": "#142a4a",
+        "green": "#34d399",
+        "green_hover": "#20b77f",
+        "blue": "#38bdf8",
+        "red": "#fb6b5b",
+        "yellow": "#fbbf24",
         "text1": "#f8fafc",
-        "text2": "#94a3b8",
-        "text3": "#64748b",
-        "log_bg": "#0a0f1a",
+        "text2": "#a7b4c8",
+        "text3": "#71819a",
+        "log_bg": "#08101d",
     },
     "Light": {
-        "bg": "#f8fafc",
+        "bg": "#f4f7fb",
+        "sidebar": "#ffffff",
+        "surface": "#ffffff",
+        "surface_alt": "#f7f9fc",
         "card": "#ffffff",
-        "card_hover": "#f1f5f9",
-        "border": "#e2e8f0",
+        "card_hover": "#edf3fb",
+        "border": "#d3deed",
+        "border_strong": "#9db2cf",
+        "divider": "#dbe4f0",
         "input": "#ffffff",
-        "green": "#16a34a",
-        "green_hover": "#15803d",
-        "blue": "#3b82f6",
-        "red": "#dc2626",
-        "yellow": "#ca8a04",
-        "text1": "#0f172a",
-        "text2": "#475569",
-        "text3": "#94a3b8",
-        "log_bg": "#f1f5f9",
+        "dropzone": "#f8fbff",
+        "accent": "#176fd1",
+        "accent_hover": "#125cab",
+        "accent_soft": "#e4f0ff",
+        "green": "#12805c",
+        "green_hover": "#0f6c4e",
+        "blue": "#176fd1",
+        "red": "#c63f33",
+        "yellow": "#9a6700",
+        "text1": "#102039",
+        "text2": "#52627a",
+        "text3": "#7b8aa0",
+        "log_bg": "#f4f7fb",
     }
 }
 
 HIGH_CONTRAST_THEME = {
     "bg": "#000000",
+    "sidebar": "#000000",
+    "surface": "#000000",
+    "surface_alt": "#000000",
     "card": "#000000",
     "card_hover": "#333333",
     "border": "#ffffff",
+    "border_strong": "#ffffff",
+    "divider": "#ffffff",
     "input": "#000000",
+    "dropzone": "#000000",
+    "accent": "#00ffff",
+    "accent_hover": "#00cccc",
+    "accent_soft": "#003333",
     "green": "#00ff00",
     "green_hover": "#00cc00",
     "blue": "#00ffff",
@@ -166,11 +209,12 @@ def high_contrast_enabled() -> bool:
 
         value = HighContrast()
         value.cb_size = ctypes.sizeof(HighContrast)
-        return bool(
+        loaded = bool(
             ctypes.windll.user32.SystemParametersInfoW(
                 0x0042, value.cb_size, ctypes.byref(value), 0
             )
         )
+        return loaded and bool(value.flags & 0x00000001)
     except (AttributeError, OSError, TypeError):
         return False
 
@@ -473,6 +517,12 @@ class RecentFiles:
         self._files.insert(0, filepath)
         self._files = self._files[:self.max_items]
         self.save()
+
+    def set_limit(self, max_items: int) -> None:
+        """Apply a new bounded retention limit to the live list."""
+        self.max_items = max(1, int(max_items))
+        self._files = self._files[:self.max_items]
+        self.save()
     
     def get_all(self) -> List[str]:
         """Get all recent files."""
@@ -574,6 +624,12 @@ class CompilationHistory:
             "size": size,
         }
         self._history.insert(0, entry)
+        self._history = self._history[:self.max_items]
+        self.save()
+
+    def set_limit(self, max_items: int) -> None:
+        """Apply a new bounded retention limit to the live history."""
+        self.max_items = max(1, int(max_items))
         self._history = self._history[:self.max_items]
         self.save()
     
@@ -872,6 +928,8 @@ class Compiler:
         single_file: bool = True,
         metadata: Optional[Dict] = None,
         backend: str = "auto",
+        target: str = "native",
+        architecture: str = "native",
         prefetch: bool = False,
         verify: bool = True,
         force: bool = False,
@@ -891,6 +949,8 @@ class Compiler:
             prefetch=prefetch,
             verify=verify,
             force=force,
+            target=target,
+            architecture=architecture,
             cancel_event=cancel_event,
         )
         return CompilerEngine().build(request)
@@ -1200,6 +1260,7 @@ class UniversalCompiler:
     size_label: Any
     compiler_label: Any
     est_label: Any
+    architecture_combo: Any
     
     def __init__(self):
         # Initialize managers
@@ -1247,10 +1308,10 @@ class UniversalCompiler:
                 highlightcolor=self.theme["blue"],
                 highlightbackground=self.theme["border"],
             )
-        except (AttributeError, tk.TclError):
+        except (AttributeError, tk.TclError, ValueError):
             try:
                 widget.configure(takefocus=True)
-            except (AttributeError, tk.TclError):
+            except (AttributeError, tk.TclError, ValueError):
                 pass
         return widget
 
@@ -1275,34 +1336,37 @@ class UniversalCompiler:
     
     def _create_window(self):
         """Create main application window."""
-        # Use TkinterDnD for drag & drop support if available
+        # Configure CustomTkinter before constructing its DPI-aware root.
+        self.high_contrast = high_contrast_enabled()
+        self.theme = HIGH_CONTRAST_THEME if self.high_contrast else THEMES[self.settings.theme]
+        ctk.set_appearance_mode("dark" if self.settings.theme == "Dark" else "light")
+        ctk.set_default_color_theme("blue")
+
+        # Keep a CTk root so CustomTkinter's scaling tracker owns a compatible
+        # toplevel. tkinterdnd2 patches BaseWidget; loading its Tcl package on
+        # this root preserves native file drops without replacing the root.
+        self.root = ctk.CTk(fg_color=self.theme["bg"])
         self._has_dnd = False
         if HAS_DND:
             try:
-                self.root = TkinterDnD.Tk()
+                self.root.TkdndVersion = TkinterDnD._require(self.root)
                 self._has_dnd = True
             except Exception:
-                self.root = tk.Tk()
-        else:
-            self.root = tk.Tk()
+                pass
         
         self.root.title(f"{self._tr('app.title', APP_NAME)} v{APP_VERSION}")
-        self.root.geometry("1200x900")
-        self.root.minsize(800, 600)
+        self.root.geometry("1536x960")
+        self.root.minsize(1120, 720)
+        try:
+            self.root.iconbitmap(str(Path(__file__).with_name("icon.ico")))
+        except tk.TclError:
+            pass
         
-        # Maximize on start
-        self.root.state("zoomed")
-        
-        # Get theme colors
-        self.high_contrast = high_contrast_enabled()
-        self.theme = HIGH_CONTRAST_THEME if self.high_contrast else THEMES[self.settings.theme]
-        
-        # Configure CustomTkinter
-        ctk.set_appearance_mode("dark" if self.settings.theme == "Dark" else "light")
-        ctk.set_default_color_theme("green")
-        
-        # Set background color using standard tk config
-        self.root.configure(bg=self.theme["bg"])
+        # Maximize normal sessions. Deterministic private-desktop snapshots keep
+        # the mockup's 1536x960 viewport instead of inheriting a host display's
+        # maximized backing surface before the isolation harness places it.
+        if "--ui-snapshot-dir" not in sys.argv:
+            self.root.state("zoomed")
         
         self._create_ui()
         self._setup_keyboard_navigation()
@@ -1335,51 +1399,17 @@ class UniversalCompiler:
             pass
     
     def _create_ui(self):
-        """Create all UI elements."""
-        # Main container
-        main = ctk.CTkFrame(self.root, fg_color=self.theme["bg"])
-        main.pack(fill="both", expand=True, padx=20, pady=20)
-        
-        # Header
-        self._create_header(main)
-        
-        # Content area
-        content = ctk.CTkFrame(main, fg_color="transparent")
-        content.pack(fill="both", expand=True, pady=(15, 0))
-        content.grid_columnconfigure(0, weight=1)
-        content.grid_columnconfigure(1, weight=0)
-        content.grid_rowconfigure(0, weight=1)
-        
-        # Left panel (scrollable)
-        left_scroll = ctk.CTkScrollableFrame(content, fg_color="transparent")
-        left_scroll.grid(row=0, column=0, sticky="nsew", padx=(0, 15))
-        
-        self._create_source_section(left_scroll)
-        self._create_output_section(left_scroll)
-        self._create_options_section(left_scroll)
-        self._create_postbuild_section(left_scroll)
-        self._create_metadata_section(left_scroll)
-        
-        # Right panel
-        right = ctk.CTkFrame(content, fg_color="transparent", width=320)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.grid_propagate(False)
-        
-        self._create_queue_section(right)
-        self._create_log_section(right)
-        self._create_actions_section(right)
-        
-        # Footer
-        ctk.CTkLabel(
-            main,
-            text=self._tr(
-                "app.footer",
-                "Universal Compiler v{version} • Drag & Drop • Batch Build • Profiles • Unsigned Builds",
-                version=APP_VERSION,
-            ),
-            font=("Segoe UI", 9),
-            text_color=self.theme["text3"]
-        ).pack(pady=(10, 0))
+        """Create the persistent navigation workspace and its six pages."""
+
+        from workspace_ui import WorkspaceController
+
+        self.workspace = WorkspaceController(
+            self,
+            version=APP_VERSION,
+            templates_dir=TEMPLATES_DIR,
+            compiler_catalog=COMPILERS,
+        )
+        self.workspace.create()
     
     def _create_header(self, parent):
         """Create header section."""
@@ -2120,10 +2150,12 @@ class UniversalCompiler:
         files = self.root.tk.splitlist(event.data)
         if len(files) == 1:
             self._load_file(files[0])
+            self.workspace.show_page("build")
         else:
             for f in files:
                 self.batch_queue.append(f)
             self._update_queue_display()
+            self.workspace.show_page("queue")
             self.log(self.catalog.plural("queue.files", len(files), "{count} files", count=len(files)))
     
     def _browse_source(self):
@@ -2235,6 +2267,14 @@ class UniversalCompiler:
                 values = list(self.backend_combo.cget("values"))
                 if backend in values:
                     self.backend_combo.set(backend)
+            if hasattr(self, "architecture_combo"):
+                architecture = profile.get("architecture", "native")
+                if architecture in self.architecture_combo.cget("values"):
+                    self.architecture_combo.set(architecture)
+            if hasattr(self, "verify_var"):
+                self.verify_var.set(bool(profile.get("verify", True)))
+            if hasattr(self, "workspace"):
+                self.workspace.refresh_build_plan()
 
     def _on_backend_change(self, backend: str):
         """Refresh the selected source status after a backend switch."""
@@ -2249,6 +2289,8 @@ class UniversalCompiler:
             text_color=self.theme["green"] if available else self.theme["red"]
         )
         self.compile_btn.configure(state="normal" if available else "disabled")
+        if hasattr(self, "workspace"):
+            self.workspace.on_backend_changed()
     
     def _save_profile(self):
         """Save current settings as profile."""
@@ -2261,6 +2303,8 @@ class UniversalCompiler:
             "admin": self.admin_var.get(),
             "single_file": self.single_var.get(),
             "backend": self.backend_combo.get(),
+            "architecture": self.architecture_combo.get(),
+            "verify": self.verify_var.get(),
             "version": self.version_entry.get(),
             "company": self.company_entry.get(),
             "copyright": self.copyright_entry.get(),
@@ -2297,27 +2341,15 @@ class UniversalCompiler:
             self.postbuild_path_entry.insert(0, dirpath)
     
     def _toggle_theme(self):
-        """Toggle between dark and light theme."""
-        new_theme = "Light" if self.settings.theme == "Dark" else "Dark"
-        self.settings.theme = new_theme
-        messagebox.showinfo(
-            self._tr("actions.theme", "Theme Changed"),
-            self._tr(
-                "message.theme_changed",
-                "Theme changed to {theme}. Please restart the app.",
-                theme=new_theme,
-            ),
-        )
+        """Open the real settings page at its appearance controls."""
+        if hasattr(self, "workspace"):
+            self.workspace.show_page("settings")
+            self.workspace.scroll_settings_to("appearance")
     
     def _show_settings(self):
-        """Show settings dialog."""
-        messagebox.showinfo(
-            self._tr("actions.settings", "Settings"),
-            f"Theme: {self.settings.theme}\n"
-            f"Notifications: {self.settings.get('show_notifications')}\n"
-            f"Recent Files: {self.settings.get('max_recent_files')}\n"
-            f"History Items: {self.settings.get('max_history_items')}"
-        )
+        """Navigate to the settings workspace."""
+        if hasattr(self, "workspace"):
+            self.workspace.show_page("settings")
     
     def _show_setup(self):
         """Show setup window."""
@@ -2335,6 +2367,8 @@ class UniversalCompiler:
                 text_color=self.theme["green"] if available else self.theme["red"]
             )
             self.compile_btn.configure(state="normal" if available else "disabled")
+        if hasattr(self, "workspace"):
+            self.workspace.refresh_toolchains(force=True)
     
     def _add_to_queue(self):
         """Add files to batch queue."""
@@ -2354,19 +2388,9 @@ class UniversalCompiler:
         self._update_queue_display()
     
     def _update_queue_display(self):
-        """Update queue display."""
-        self.queue_listbox.configure(state="normal")
-        self.queue_listbox.delete("1.0", "end")
-        for f in self.batch_queue:
-            self.queue_listbox.insert("end", f"{os.path.basename(f)}\n")
-        self.queue_listbox.configure(state="disabled")
-        
-        self.queue_count_label.configure(text=f" ({len(self.batch_queue)})")
-        
-        if self.batch_queue:
-            self.compile_all_btn.pack(fill="x", pady=(8, 0))
-        else:
-            self.compile_all_btn.pack_forget()
+        """Refresh the dedicated queue page and navigation badge."""
+        if hasattr(self, "workspace"):
+            self.workspace.refresh_queue()
     
     def _clear_log(self):
         """Clear build log."""
@@ -2429,23 +2453,14 @@ Source: {self.source_file}
         os.startfile(str(desktop))
     
     def _open_templates(self):
-        """Open templates folder."""
-        os.startfile(str(TEMPLATES_DIR))
+        """Navigate to the template browser."""
+        if hasattr(self, "workspace"):
+            self.workspace.show_page("templates")
     
     def _show_history(self):
-        """Show compilation history."""
-        history = self.history.get_all()
-        if not history:
-            messagebox.showinfo("History", "No compilation history")
-            return
-        
-        msg = ""
-        for h in history[:10]:
-            status = "✓" if h["success"] else "✗"
-            source = os.path.basename(h["source"])
-            msg += f"[{status}] {source}\n"
-        
-        messagebox.showinfo("Recent Builds", msg)
+        """Navigate to the searchable history workspace."""
+        if hasattr(self, "workspace"):
+            self.workspace.show_page("history")
     
     # ========================================================================
     # FILE LOADING
@@ -2500,7 +2515,7 @@ Source: {self.source_file}
             )
             
             # Show info panel
-            self.info_frame.pack(fill="x", pady=(10, 0))
+            self.info_frame.pack(fill="x", pady=(4, 0))
             
             # Set default output
             self.output_name_entry.delete(0, "end")
@@ -2520,6 +2535,8 @@ Source: {self.source_file}
             self.info_frame.pack_forget()
             self.compile_btn.configure(state="disabled")
             self.log(f"Unsupported file type: {ext}", "error")
+        if hasattr(self, "workspace"):
+            self.workspace.on_file_loaded()
     
     # ========================================================================
     # COMPILATION
@@ -2555,9 +2572,11 @@ Source: {self.source_file}
         # Get options
         icon = self.icon_entry.get().strip() or None
         backend = self.backend_combo.get()
+        architecture = self.architecture_combo.get()
         admin = self.admin_var.get()
         console = self.console_var.get()
         single_file = self.single_var.get()
+        verify = self.verify_var.get()
         metadata = {
             "product": self.product_entry.get(),
             "version": self.version_entry.get(),
@@ -2591,6 +2610,8 @@ Source: {self.source_file}
                     single_file,
                     metadata,
                     backend=backend,
+                    architecture=architecture,
+                    verify=verify,
                     cancel_event=self._cancel_event,
                 )
                 error_text = None
@@ -2690,6 +2711,8 @@ Source: {self.source_file}
             self.compile_btn.configure(state="normal")
             self.cancel_btn.configure(state="disabled")
             self._cancel_event.clear()
+            if hasattr(self, "workspace"):
+                self.workspace.on_history_changed()
     
     def _compile_all(self):
         """Compile all files in queue."""
@@ -2749,6 +2772,232 @@ Source: {self.source_file}
         
         self.log_text.insert("end", f"{timestamp} {prefix} {message}\n")
         self.log_text.see("end")
+
+    def _gui_option_value(self, name: str) -> Optional[str]:
+        """Return a value for a private GUI verification option."""
+
+        try:
+            index = sys.argv.index(name)
+        except ValueError:
+            return None
+        if index + 1 >= len(sys.argv):
+            raise ValueError(f"{name} requires a value")
+        return sys.argv[index + 1]
+
+    def _prepare_ui_snapshot_fixture(self) -> None:
+        """Populate deterministic, privacy-safe display data for visual QA."""
+
+        self._ui_snapshot_mode = True
+        self.source_file = r"C:\Projects\tools\release-tool.py"
+        self.file_type = "py"
+        self.source_entry.configure(state="normal")
+        self.source_entry.delete(0, "end")
+        self.source_entry.insert(0, self.source_file)
+        self.source_entry.configure(state="readonly")
+        self.type_label.configure(text="Python Application")
+        self.size_label.configure(text="18.4 KB")
+        self.compiler_label.configure(text="PyInstaller")
+        self.est_label.configure(text="24.7 MB")
+        self.info_frame.pack(fill="x", pady=(4, 0))
+        self.backend_combo.configure(values=["auto", "pyinstaller", "nuitka", "python-zipapp", "pex"])
+        self.backend_combo.set("pyinstaller")
+        self.architecture_combo.set("x64")
+        self.output_name_entry.delete(0, "end")
+        self.output_name_entry.insert(0, "release-tool.exe")
+        self.output_dir_entry.configure(state="normal")
+        self.output_dir_entry.delete(0, "end")
+        self.output_dir_entry.insert(0, r"C:\Artifacts\dist")
+        self.output_dir_entry.configure(state="readonly")
+        self.compile_btn.configure(state="normal")
+        self.status_label.configure(text="Ready", text_color=self.theme["green"])
+        self.log_text.delete("1.0", "end")
+        self.log_text.insert(
+            "1.0",
+            "12:45:10 [*] Source loaded: release-tool.py (18.4 KB)\n"
+            "12:45:11 [*] Analyzing dependencies in offline mode\n"
+            "12:45:12 [*] Packaging with PyInstaller for Windows x64\n"
+            "12:45:15 [OK] Build plan validated. Ready to build.\n",
+        )
+        self.source_preview.configure(state="normal")
+        self.source_preview.delete("1.0", "end")
+        self.source_preview.insert(
+            "1.0",
+            "   1 | from pathlib import Path\n"
+            "   2 |\n"
+            "   3 | def main() -> None:\n"
+            "   4 |     print('Release tool ready')\n"
+            "   5 |\n"
+            "   6 | if __name__ == '__main__':\n"
+            "   7 |     main()\n",
+        )
+        self.source_preview.configure(state="disabled")
+        self.workspace.refresh_build_plan()
+
+        self.batch_queue = [
+            r"C:\Projects\tools\release-tool.py",
+            r"C:\Projects\scripts\inventory.ps1",
+            r"C:\Projects\services\worker.go",
+            r"C:\Projects\web\bundle.js",
+        ]
+        self.workspace.queue_selected_index = 0
+        self.workspace.snapshot_history = [
+            {"timestamp": "2026-08-08T12:45:15", "source": r"C:\Projects\tools\release-tool.py", "output": r"C:\Artifacts\release-tool.exe", "type": "pyinstaller", "success": True, "profile": "Default", "size": 25_899_008},
+            {"timestamp": "2026-08-08T11:09:00", "source": r"C:\Projects\scripts\inventory.ps1", "output": r"C:\Artifacts\inventory.exe", "type": "ps2exe", "success": True, "profile": "Default", "size": 5_242_880},
+            {"timestamp": "2026-08-07T17:20:00", "source": r"C:\Projects\services\worker.go", "output": r"C:\Artifacts\worker.exe", "type": "go", "success": False, "profile": "Default", "size": 0},
+            {"timestamp": "2026-08-07T14:06:00", "source": r"C:\Projects\web\bundle.js", "output": r"C:\Artifacts\bundle.exe", "type": "bun", "success": True, "profile": "Default", "size": 47_185_920},
+            {"timestamp": "2026-08-06T09:42:00", "source": r"C:\Projects\tasks\cleanup.bat", "output": r"C:\Artifacts\cleanup.exe", "type": "iexpress", "success": True, "profile": "Default", "size": 1_048_576},
+        ]
+        self.workspace.history_selected_index = 0
+        self.workspace.toolchain_data = {
+            "pyinstaller": {"name": "Python PyInstaller", "lifecycle": "stable", "available": True, "verified_version": "6.21.0", "target_platforms": ["native", "windows"], "extensions": ["py", "pyw"], "architectures": ["native", "x64"], "required_sdks": ["Python 3.10+"], "default": True},
+            "ps2exe": {"name": "PowerShell PS2EXE", "lifecycle": "stable", "available": True, "verified_version": "1.12.0", "target_platforms": ["windows"], "extensions": ["ps1"], "architectures": ["native", "x64"], "required_sdks": ["PowerShell"], "default": True},
+            "bun": {"name": "Bun", "lifecycle": "stable", "available": False, "verified_version": None, "target_platforms": ["windows", "linux", "darwin"], "extensions": ["js", "ts"], "architectures": ["native", "x64"], "required_sdks": ["Bun"], "default": True},
+            "go": {"name": "Go", "lifecycle": "stable", "available": True, "verified_version": "1.22.5", "target_platforms": ["windows", "linux", "darwin"], "extensions": ["go"], "architectures": ["native", "x64", "arm64"], "required_sdks": ["Go SDK"], "default": True},
+            "node-sea": {"name": "Node SEA", "lifecycle": "experimental", "available": False, "verified_version": None, "target_platforms": ["windows"], "extensions": ["js"], "architectures": ["native", "x64"], "required_sdks": ["Node.js", "postject"], "default": False},
+            "pex": {"name": "PEX", "lifecycle": "experimental", "available": False, "verified_version": None, "target_platforms": ["native", "windows", "linux"], "extensions": ["py", "pyw"], "architectures": ["native"], "required_sdks": ["Python", "PEX"], "default": False},
+            "pkg": {"name": "Node pkg", "lifecycle": "deprecated", "available": True, "verified_version": "5.8.1", "target_platforms": ["windows"], "extensions": ["js"], "architectures": ["native", "x64"], "required_sdks": ["Node.js"], "default": False},
+            "wat2wasm": {"name": "wat2wasm", "lifecycle": "stable", "available": True, "verified_version": "1.0.35", "target_platforms": ["wasm", "wasi"], "extensions": ["wat"], "architectures": ["wasm32"], "required_sdks": ["WABT"], "default": True},
+        }
+        self.workspace.toolchain_selected = "pyinstaller"
+        python_template = TEMPLATES_DIR / "HelloWorld.py"
+        if python_template.is_file():
+            self.workspace.template_selected = python_template
+
+    def _finish_ui_snapshot(self) -> None:
+        """Stop a private-desktop snapshot run without leaving DPI callbacks."""
+
+        # CustomTkinter keeps a process-global DPI poller registered against
+        # every CTk root.  Remove this root before leaving the main loop so a
+        # pending callback cannot run against a partially torn-down Tcl app.
+        ctk.ScalingTracker.remove_window(None, self.root)
+        self.root.quit()
+        # This path exists only in the short-lived private verification process.
+        # A hard process exit avoids Tcl/customtkinter interpreter finalizers
+        # running after the private desktop and HWND have been released.
+        os._exit(1 if self._ui_snapshot_error is not None else 0)
+
+    def _capture_ui_pages(
+        self,
+        destination: Path,
+        pages: tuple[str, ...] | None = None,
+    ) -> None:
+        """Capture each page from its own private-desktop window handle."""
+
+        from PIL import ImageGrab
+
+        pages = pages or (
+            "build",
+            "queue",
+            "history",
+            "toolchains",
+            "templates",
+            "settings",
+        )
+        destination.mkdir(parents=True, exist_ok=True)
+
+        def capture_window():
+            client_handle = self.root.winfo_id()
+            capture_handle = client_handle
+            if os.name == "nt":
+                user32 = ctypes.windll.user32
+                top_level_handle = user32.GetAncestor(client_handle, 2)
+                if top_level_handle:
+                    capture_handle = top_level_handle
+                user32.RedrawWindow(
+                    capture_handle,
+                    None,
+                    None,
+                    0x0001 | 0x0080 | 0x0100 | 0x0400,
+                )
+            return ImageGrab.grab(
+                window=capture_handle,
+                include_layered_windows=True,
+            )
+
+        def stage(index: int) -> None:
+            if index >= len(pages):
+                # Leave the verified HWND alive long enough for the isolation
+                # harness to finish its independent placement proof.
+                self.root.after(5000, self._finish_ui_snapshot)
+                return
+            page = pages[index]
+            try:
+                self.workspace.show_page(page)
+                if page == "toolchains":
+                    self.workspace._populate_toolchains(self.workspace.toolchain_data)
+            except Exception as error:
+                (destination / "capture-error.json").write_text(
+                    json.dumps({"page": page, "error": repr(error)}, indent=2),
+                    encoding="utf-8",
+                )
+                self._ui_snapshot_error = error
+                self._finish_ui_snapshot()
+                return
+            current = self.workspace.pages[page]
+            try:
+                current._parent_canvas.yview_moveto(0.0)
+            except (AttributeError, tk.TclError):
+                pass
+            self.root.update_idletasks()
+
+            def draw_widget_tree(widget: Any) -> None:
+                draw = getattr(widget, "_draw", None)
+                if callable(draw):
+                    try:
+                        draw()
+                    except (tk.TclError, TypeError, ValueError):
+                        pass
+                try:
+                    children = widget.winfo_children()
+                except (AttributeError, tk.TclError):
+                    return
+                for child in children:
+                    draw_widget_tree(child)
+
+            def redraw() -> None:
+                draw_widget_tree(self.root)
+                self.root.update()
+
+            def capture() -> None:
+                try:
+                    redraw()
+                    image = capture_window()
+                    image.save(destination / f"{page}.png")
+                    image.close()
+                except Exception as error:
+                    (destination / "capture-error.json").write_text(
+                        json.dumps(
+                            {"page": page, "error": repr(error)},
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                    self._ui_snapshot_error = error
+                    self._finish_ui_snapshot()
+                    return
+                # Give CustomTkinter a full paint cycle after changing the
+                # scrollable page. Rapid page swaps can otherwise leave the
+                # next capture with stale title pixels on private desktops.
+                self.root.after(400, lambda: stage(index + 1))
+
+            def prime() -> None:
+                try:
+                    redraw()
+                    preview = capture_window()
+                    preview.close()
+                except Exception as error:
+                    (destination / "capture-error.json").write_text(
+                        json.dumps({"page": page, "error": repr(error)}, indent=2),
+                        encoding="utf-8",
+                    )
+                    self._ui_snapshot_error = error
+                    self._finish_ui_snapshot()
+                    return
+                self.root.after(300, capture)
+
+            self.root.after(350, prime)
+
+        stage(0)
     
     # ========================================================================
     # RUN
@@ -2768,8 +3017,32 @@ Source: {self.source_file}
             self.log("PS2EXE: Ready", "success")
         else:
             self.log("PS2EXE: Not installed", "warning")
-        
+
+        snapshot_dir = self._gui_option_value("--ui-snapshot-dir")
+        if snapshot_dir:
+            self._ui_snapshot_error: Optional[Exception] = None
+            self._prepare_ui_snapshot_fixture()
+            snapshot_page = self._gui_option_value("--ui-snapshot-page")
+            available_pages = tuple(self.workspace.pages)
+            if snapshot_page and snapshot_page not in available_pages:
+                raise ValueError(
+                    "--ui-snapshot-page must be one of: "
+                    + ", ".join(available_pages)
+                )
+            capture_pages = (snapshot_page,) if snapshot_page else available_pages
+            # Selecting before the first mapped frame avoids stale child-canvas
+            # pixels when PrintWindow captures a page on a private desktop.
+            self.workspace.show_page(capture_pages[0])
+            self.root.after(
+                1400,
+                lambda: self._capture_ui_pages(Path(snapshot_dir), capture_pages),
+            )
         self.root.mainloop()
+        if snapshot_dir:
+            snapshot_error = self._ui_snapshot_error
+            self.root.destroy()
+            if snapshot_error is not None:
+                raise RuntimeError("Private-desktop UI capture failed") from snapshot_error
 
 
 # ============================================================================

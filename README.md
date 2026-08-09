@@ -1,7 +1,7 @@
 # ⚡ Universal Compiler
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.1.1-green?style=for-the-badge" alt="Version 2.1.1">
+  <img src="https://img.shields.io/badge/version-2.1.2-green?style=for-the-badge" alt="Version 2.1.2">
   <img src="https://img.shields.io/badge/platform-Windows-blue?style=for-the-badge" alt="Windows">
   <img src="https://img.shields.io/badge/PowerShell-5.1+-purple?style=for-the-badge" alt="PowerShell 5.1+">
   <img src="https://img.shields.io/badge/license-MIT-orange?style=for-the-badge" alt="MIT License">
@@ -56,6 +56,7 @@ availability, targets, architectures, lifecycle, and artifact boundaries.
 - **🔔 Toast Notifications** - Get notified when builds complete
 - **📊 Compilation History** - Track all your previous builds
 - **📄 Template Scripts** - Pre-made "Hello World" for all languages
+- **🧭 Six-Page Workspace** - Build, queue, history, toolchains, templates, and settings in one GUI
 - **⚡ Post-Build Actions** - Auto-run, open folder, or copy after build
 - **📤 Export Build Log** - Save detailed logs for troubleshooting
 - **📏 Size Estimation** - See estimated output size before compiling
@@ -68,10 +69,29 @@ availability, targets, architectures, lifecycle, and artifact boundaries.
 
 ## 📸 Screenshots
 
-### Main Interface
+### Python GUI workspace
+
+The optional Python GUI opens a persistent six-page workspace. Build is the
+golden path; Queue and History keep batch and artifact evidence visible,
+Toolchains reports read-only capability probes, Templates covers every bundled
+source family, and Settings keeps local preferences and retention controls in
+one place. The GUI remains offline by default and never launches build output.
+
+Reference mockups: [Build](resources/mockups/build.png) ·
+[Queue](resources/mockups/queue.png) ·
+[History](resources/mockups/history.png) ·
+[Toolchains](resources/mockups/toolchains.png) ·
+[Templates](resources/mockups/templates.png) ·
+[Settings](resources/mockups/settings.png)
+
+#### Legacy single-panel sketch
+
+The original compact layout is retained below as a historical reference; the
+six-page workspace mockups above represent the current GUI.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ ⚡ Universal Compiler v2.1.1                  [🌙 Theme] [⚙]    │
+│ ⚡ Universal Compiler v2.1.2                  [🌙 Theme] [⚙]    │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  📁 SOURCE FILE (Drag & Drop)        │  📋 Batch Queue         │
@@ -633,6 +653,11 @@ Remove-Item "$env:APPDATA\UniversalCompiler" -Recurse -Force
 ---
 
 ## 📝 Changelog
+
+### v2.1.2 — 2026-08-09
+- ✨ Persistent six-page workspace for build, queue, history, toolchains, templates, and settings
+- 🧭 Deterministic private-display UI snapshots and workspace contract coverage
+- 📏 Immediate bounded retention updates for recent files and build history
 
 ### v2.1.1 — 2026-08-08
 - ✨ Complete UI redesign with modern dark theme

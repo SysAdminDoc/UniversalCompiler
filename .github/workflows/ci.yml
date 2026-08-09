@@ -48,4 +48,4 @@ jobs:
 
       - name: Type check
         shell: pwsh
-        run: mypy compiler_core.py UniversalCompiler.py
+        run: mypy compiler_core.py UniversalCompiler.py workspace_ui.py

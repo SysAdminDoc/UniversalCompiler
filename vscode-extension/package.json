@@ -2,7 +2,7 @@
   "name": "universal-compiler",
   "displayName": "Universal Compiler",
   "description": "Build the active source file with Universal Compiler.",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "publisher": "SysAdminDoc",
   "engines": {
     "vscode": ">=1.85.0"

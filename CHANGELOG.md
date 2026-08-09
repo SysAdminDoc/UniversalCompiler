@@ -2,6 +2,15 @@
 
 All notable changes to UniversalCompiler will be documented in this file.
 
+## [v2.1.2] - 2026-08-09
+
+- Add a persistent six-page Python workspace for build, queue, history,
+  toolchains, templates, and settings, with capability-aware build planning.
+- Add deterministic private-display UI snapshots and contract coverage for the
+  workspace, accessibility metadata, and all bundled template families.
+- Apply recent-file and build-history retention changes immediately while
+  preserving bounded local state.
+
 ## [v2.1.1] - 2026-08-08
 
 - Add a bounded, offline-by-default execution policy with executable-root

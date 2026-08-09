@@ -405,6 +405,25 @@ def test_gui_accessibility_and_localization_contracts_are_declared() -> None:
     assert "[string]$Locale" in powershell
 
 
+def test_python_gui_declares_the_six_page_workspace_and_visual_contract() -> None:
+    root = Path(__file__).resolve().parents[1]
+    python_shell = (root / "UniversalCompiler.py").read_text(encoding="utf-8")
+    workspace = (root / "workspace_ui.py").read_text(encoding="utf-8")
+    pages = ("build", "queue", "history", "toolchains", "templates", "settings")
+
+    assert "WorkspaceController" in python_shell
+    assert "self.root = ctk.CTk" in python_shell
+    assert "value.flags & 0x00000001" in python_shell
+    assert "--ui-snapshot-dir" in python_shell
+    assert "--ui-snapshot-page" in python_shell
+    assert "ImageGrab.grab" in python_shell
+    for extension in (".ts", ".rs", ".lua", ".pl", ".kt", ".wat"):
+        assert f'"{extension}"' in workspace
+    for page in pages:
+        assert f'("{page}",' in workspace or f'_new_page("{page}"' in workspace
+        assert (root / "resources" / "mockups" / f"{page}.png").is_file()
+
+
 def test_profiles_round_trip_without_extra_dependency(tmp_path: Path) -> None:
     path = tmp_path / "profiles.yaml"
     profiles = dict(DEFAULT_PROFILES)
