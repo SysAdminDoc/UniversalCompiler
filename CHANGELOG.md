@@ -67,6 +67,10 @@ All notable changes to UniversalCompiler will be documented in this file.
   package-manager-only acquisition catalog, explicit dry-run/manual/diagnostic
   modes, offline SHA-256 verification, bounded provenance records, and no
   implicit setup during script startup.
+- Add a shared cross-process state-lock convention for Python and PowerShell,
+  fsync-backed atomic/recoverable user and workspace writes, serialized
+  manifest field updates, and SQLite WAL/busy-timeout/immediate-transaction
+  analytics with explicit backup and recovery commands.
 
 ## [v0.1.0] - %Y->- (HEAD -> main, origin/main, origin/HEAD)
 

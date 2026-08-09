@@ -9,7 +9,6 @@ and AutoHotkey scripts into standalone Windows executables.
 
 import os
 import sys
-import json
 import shutil
 import threading
 import queue
@@ -30,11 +29,13 @@ from compiler_core import (
     estimate_output_size as core_estimate_output_size,
     extract_icon,
     load_profiles,
+    load_json as core_load_json,
     load_project_manifest,
     project_manifest_path,
     run_command as core_run_command,
-    save_project_manifest,
+    save_json as core_save_json,
     save_profiles,
+    update_project_manifest,
 )
 
 # Keep automation side-effect free: CLI invocations must not import the GUI or
@@ -242,22 +243,14 @@ COMPILERS = {
 # ============================================================================
 
 def load_json(filepath: Path, default: Any = None) -> Any:
-    """Load JSON file with fallback to default."""
-    try:
-        if filepath.exists():
-            with open(filepath, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return default if default is not None else {}
+    """Load user-private JSON, recovering a valid adjacent backup if needed."""
+    return core_load_json(filepath, default, recoverable=True)
 
 
 def save_json(filepath: Path, data: Any) -> None:
-    """Save data to JSON file."""
+    """Save user-private JSON atomically with a recoverable backup."""
     try:
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        core_save_json(filepath, data, recoverable=True)
     except Exception as e:
         print(f"Error saving {filepath}: {e}")
 
@@ -377,11 +370,11 @@ class Settings:
     def save(self) -> None:
         """Save settings to file."""
         try:
-            manifest = load_project_manifest(
-                MANIFEST_FILE, expected_scope="user"
-            ).manifest
-            manifest["settings"] = dict(self._settings)
-            save_project_manifest(MANIFEST_FILE, manifest)
+            update_project_manifest(
+                MANIFEST_FILE,
+                lambda manifest: manifest.update(settings=dict(self._settings)) or manifest,
+                expected_scope="user",
+            )
         except (BuildValidationError, OSError, ValueError):
             save_json(SETTINGS_FILE, self._settings)
     
@@ -466,11 +459,11 @@ class BuildProfiles:
     def save(self) -> None:
         """Save profiles to disk."""
         try:
-            manifest = load_project_manifest(
-                MANIFEST_FILE, expected_scope="user"
-            ).manifest
-            manifest["profiles"] = dict(self._profiles)
-            save_project_manifest(MANIFEST_FILE, manifest)
+            update_project_manifest(
+                MANIFEST_FILE,
+                lambda manifest: manifest.update(profiles=dict(self._profiles)) or manifest,
+                expected_scope="user",
+            )
         except (BuildValidationError, OSError, ValueError):
             save_profiles(PROFILES_FILE, self._profiles)
     
@@ -512,11 +505,11 @@ class CompilationHistory:
     def save(self) -> None:
         """Save history to disk."""
         try:
-            manifest = load_project_manifest(
-                MANIFEST_FILE, expected_scope="user"
-            ).manifest
-            manifest["history"] = list(self._history)
-            save_project_manifest(MANIFEST_FILE, manifest)
+            update_project_manifest(
+                MANIFEST_FILE,
+                lambda manifest: manifest.update(history=list(self._history)) or manifest,
+                expected_scope="user",
+            )
         except (BuildValidationError, OSError, ValueError):
             save_json(HISTORY_FILE, self._history)
     

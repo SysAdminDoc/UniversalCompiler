@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import concurrent.futures
+from contextlib import contextmanager
 import hashlib
 import importlib.metadata as importlib_metadata
 import importlib.util
@@ -32,11 +33,23 @@ import time
 import zipfile
 import xml.etree.ElementTree as ET
 import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
+
+_fcntl: Any
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows uses msvcrt.
+    _fcntl = None
+
+_msvcrt: Any
+try:
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - POSIX uses fcntl.
+    _msvcrt = None
 
 APP_NAME = "Universal Compiler"
 APP_VERSION = "2.1.0"
@@ -300,8 +313,16 @@ class BuildValidationError(ValueError):
     """Raised when a build request cannot be safely planned."""
 
 
+class StateLockError(BuildValidationError):
+    """Raised when a local state file cannot be locked within the bound."""
+
+
 DEFAULT_EXECUTION_TIMEOUT_SECONDS = 15 * 60
 DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+DEFAULT_STATE_LOCK_TIMEOUT_SECONDS = 15.0
+STATE_LOCK_POLL_SECONDS = 0.05
+ANALYTICS_BUSY_TIMEOUT_MS = 10_000
+ANALYTICS_SCHEMA_VERSION = 1
 MAX_CLEANUP_PATHS = 32
 DEFAULT_INHERITED_ENVIRONMENT = (
     "APPDATA",
@@ -328,7 +349,87 @@ DEFAULT_INHERITED_ENVIRONMENT = (
     "WINDIR",
 )
 
+_STATE_LOCKS: dict[str, threading.RLock] = {}
+_STATE_LOCKS_GUARD = threading.Lock()
 _BUILD_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _state_lock_key(path: os.PathLike[str] | str) -> str:
+    candidate = Path(path).expanduser()
+    try:
+        candidate = candidate.resolve()
+    except OSError:
+        candidate = Path(os.path.abspath(candidate))
+    return os.path.normcase(str(candidate))
+
+
+def _state_thread_lock(path: os.PathLike[str] | str) -> threading.RLock:
+    key = _state_lock_key(path)
+    with _STATE_LOCKS_GUARD:
+        lock = _STATE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _STATE_LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def state_lock(
+    path: os.PathLike[str] | str,
+    timeout: float = DEFAULT_STATE_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[Path]:
+    """Coordinate state writers across threads and processes.
+
+    The lock file is deliberately retained beside the state file. OS-level
+    locks are released when the owning process exits, so a stale lock file
+    never becomes a false permanent lock and remains discoverable for support.
+    """
+
+    destination = Path(path).expanduser()
+    lock_path = destination.with_name(f".{destination.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    thread_lock = _state_thread_lock(lock_path)
+    if not thread_lock.acquire(timeout=max(0.0, float(timeout))):
+        raise StateLockError(f"Timed out waiting for state lock: {lock_path}")
+    handle = None
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    try:
+        handle = lock_path.open("a+b")
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        while True:
+            try:
+                handle.seek(0)
+                if os.name == "nt" and _msvcrt is not None:
+                    _msvcrt.locking(handle.fileno(), _msvcrt.LK_NBLCK, 1)
+                elif _fcntl is not None:
+                    _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                else:  # pragma: no cover - supported runtimes have one backend.
+                    raise StateLockError("No supported process lock implementation")
+                break
+            except OSError as error:
+                if time.monotonic() >= deadline:
+                    raise StateLockError(
+                        f"Timed out waiting for state lock: {lock_path}"
+                    ) from error
+                time.sleep(STATE_LOCK_POLL_SECONDS)
+        try:
+            yield lock_path
+        finally:
+            try:
+                handle.seek(0)
+                if os.name == "nt" and _msvcrt is not None:
+                    _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)
+                elif _fcntl is not None:
+                    _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        if handle is not None:
+            handle.close()
+        thread_lock.release()
 _BUILD_LOCKS_GUARD = threading.Lock()
 
 
@@ -1290,24 +1391,97 @@ def estimate_output_size(
     return format_size(int(base + path.stat().st_size * multiplier))
 
 
-def load_json(path: os.PathLike[str] | str, default: Any = None) -> Any:
-    """Load JSON safely, returning a caller-provided default on failure."""
-
+def _atomic_write_bytes(destination: Path, value: bytes) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
     try:
-        with Path(path).open("r", encoding="utf-8-sig") as handle:
+        with temporary.open("wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_backup(destination: Path) -> Path | None:
+    if not destination.is_file():
+        return None
+    backup = project_manifest_backup_path(destination)
+    temporary = backup.with_name(
+        f".{backup.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        shutil.copy2(destination, temporary)
+        with temporary.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, backup)
+        return backup
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def load_json(
+    path: os.PathLike[str] | str,
+    default: Any = None,
+    *,
+    recoverable: bool = False,
+) -> Any:
+    """Load JSON, optionally restoring a valid ``.bak`` after interruption."""
+
+    destination = Path(path).expanduser()
+    try:
+        with destination.open("r", encoding="utf-8-sig") as handle:
             return json.load(handle)
     except (OSError, ValueError, TypeError):
+        if not recoverable:
+            return default if default is not None else {}
+    backup = project_manifest_backup_path(destination)
+    try:
+        with state_lock(destination):
+            try:
+                with destination.open("r", encoding="utf-8-sig") as handle:
+                    return json.load(handle)
+            except (OSError, ValueError, TypeError):
+                with backup.open("r", encoding="utf-8-sig") as handle:
+                    recovered = json.load(handle)
+                _atomic_write_bytes(
+                    destination,
+                    json.dumps(recovered, indent=2, sort_keys=True).encode("utf-8"),
+                )
+                return recovered
+    except (OSError, ValueError, TypeError, StateLockError):
         return default if default is not None else {}
 
 
-def save_json(path: os.PathLike[str] | str, value: Any) -> None:
-    """Atomically save JSON while keeping a partially-written file recoverable."""
+def save_json(
+    path: os.PathLike[str] | str,
+    value: Any,
+    *,
+    recoverable: bool = False,
+) -> None:
+    """Atomically save JSON under a cross-process lock.
 
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(temporary, destination)
+    ``recoverable=True`` keeps the previous valid file at ``<name>.bak``;
+    caches and generated reports intentionally omit that backup.
+    """
+
+    destination = Path(path).expanduser()
+    encoded = json.dumps(value, indent=2, sort_keys=True).encode("utf-8")
+    with state_lock(destination):
+        if recoverable:
+            _atomic_backup(destination)
+        _atomic_write_bytes(destination, encoded)
 
 
 def _yaml_scalar(value: Any) -> str:
@@ -1409,26 +1583,47 @@ def _load_simple_yaml(text: str) -> dict[str, dict[str, Any]]:
 def load_profiles(
     path: os.PathLike[str] | str,
     defaults: Mapping[str, Mapping[str, Any]] | None = None,
+    *,
+    recoverable: bool = True,
 ) -> dict[str, dict[str, Any]]:
-    """Load YAML profiles, with JSON and a dependency-free YAML fallback."""
+    """Load YAML profiles, recovering from a valid adjacent backup if needed."""
 
     merged = {
         name: dict(profile) for name, profile in (defaults or DEFAULT_PROFILES).items()
     }
     source = Path(path)
-    if not source.exists():
-        return merged
-    try:
-        text = source.read_text(encoding="utf-8-sig")
-    except OSError:
-        return merged
+    candidates = [source]
+    backup = project_manifest_backup_path(source)
+    if recoverable and backup.is_file():
+        candidates.append(backup)
     loaded: Any = None
-    try:
-        import yaml  # type: ignore[import-not-found, import-untyped]
+    recovered_text: str | None = None
+    source_valid = False
+    for candidate in candidates:
+        try:
+            text = candidate.read_text(encoding="utf-8-sig")
+        except OSError:
+            continue
+        try:
+            import yaml  # type: ignore[import-not-found, import-untyped]
 
-        loaded = yaml.safe_load(text)
-    except (ImportError, AttributeError, ValueError):
-        loaded = _load_simple_yaml(text)
+            loaded = yaml.safe_load(text)
+        except (ImportError, AttributeError, ValueError):
+            loaded = _load_simple_yaml(text)
+        except Exception:
+            try:
+                loaded = _load_simple_yaml(text)
+            except Exception:
+                loaded = None
+        if isinstance(loaded, Mapping):
+            if candidate == source:
+                source_valid = True
+            elif candidate == backup and not source_valid:
+                recovered_text = text
+            break
+    if recovered_text is not None:
+        with state_lock(source):
+            _atomic_write_bytes(source, recovered_text.encode("utf-8"))
     if not isinstance(loaded, Mapping):
         return merged
     for name, profile in loaded.items():
@@ -1440,15 +1635,19 @@ def load_profiles(
 
 
 def save_profiles(
-    path: os.PathLike[str] | str, profiles: Mapping[str, Mapping[str, Any]]
+    path: os.PathLike[str] | str,
+    profiles: Mapping[str, Mapping[str, Any]],
+    *,
+    recoverable: bool = True,
 ) -> None:
-    """Write human-readable YAML without requiring PyYAML."""
+    """Atomically write human-readable YAML with optional recovery backup."""
 
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-    temporary.write_text(_dump_profiles_yaml(profiles), encoding="utf-8")
-    os.replace(temporary, destination)
+    destination = Path(path).expanduser()
+    encoded = _dump_profiles_yaml(profiles).encode("utf-8")
+    with state_lock(destination):
+        if recoverable:
+            _atomic_backup(destination)
+        _atomic_write_bytes(destination, encoded)
 
 
 _PROJECT_MANIFEST_FIELDS = frozenset(
@@ -1642,49 +1841,68 @@ def project_manifest_backup_path(path: os.PathLike[str] | str) -> Path:
     return destination.with_name(f"{destination.name}.bak")
 
 
-def _atomic_write_bytes(destination: Path, value: bytes) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(
-        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
-    try:
-        with temporary.open("wb") as handle:
-            handle.write(value)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-    except BaseException:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
-        raise
-
-
 def save_project_manifest(
     path: os.PathLike[str] | str, manifest: Mapping[str, Any]
 ) -> Path:
-    """Validate and atomically save a manifest, retaining the prior version."""
+    """Lock, validate, back up, and atomically save a project manifest."""
 
     destination = Path(path).expanduser()
     normalized = validate_project_manifest(manifest)
-    if destination.exists():
-        backup = project_manifest_backup_path(destination)
-        backup_temporary = backup.with_name(
-            f".{backup.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-        )
-        try:
-            shutil.copy2(destination, backup_temporary)
-            os.replace(backup_temporary, backup)
-        except BaseException:
-            try:
-                backup_temporary.unlink()
-            except OSError:
-                pass
-            raise
     encoded = json.dumps(normalized, indent=2, sort_keys=True).encode("utf-8")
-    _atomic_write_bytes(destination, encoded)
+    with state_lock(destination):
+        _atomic_backup(destination)
+        _atomic_write_bytes(destination, encoded)
     return destination
+
+
+def update_project_manifest(
+    path: os.PathLike[str] | str,
+    updater: Callable[[dict[str, Any]], Mapping[str, Any] | None],
+    expected_scope: str | None = None,
+) -> ManifestLoadResult:
+    """Apply one manifest-field update while holding the cross-process lock."""
+
+    destination = Path(path).expanduser()
+    if not destination.is_file():
+        migrate_project_manifest(destination, scope=expected_scope or "user")
+    with state_lock(destination):
+        if destination.is_file():
+            try:
+                current = validate_project_manifest(
+                    json.loads(destination.read_text(encoding="utf-8-sig")),
+                    expected_scope=expected_scope,
+                )
+            except (OSError, ValueError, BuildValidationError) as error:
+                backup = project_manifest_backup_path(destination)
+                try:
+                    current = validate_project_manifest(
+                        json.loads(backup.read_text(encoding="utf-8-sig")),
+                        expected_scope=expected_scope,
+                    )
+                    _atomic_write_bytes(
+                        destination,
+                        json.dumps(current, indent=2, sort_keys=True).encode("utf-8"),
+                    )
+                except (OSError, ValueError, BuildValidationError) as backup_error:
+                    raise BuildValidationError(
+                        f"Could not load project manifest {destination}: {error}"
+                    ) from backup_error
+        else:
+            current = default_project_manifest(
+                expected_scope or "user",
+                destination.parent if (expected_scope or "user") == "workspace" else None,
+            )
+        candidate = copy.deepcopy(current)
+        updated = updater(candidate)
+        normalized = validate_project_manifest(
+            updated if updated is not None else candidate,
+            expected_scope=expected_scope,
+        )
+        _atomic_backup(destination)
+        _atomic_write_bytes(
+            destination, json.dumps(normalized, indent=2, sort_keys=True).encode("utf-8")
+        )
+    return ManifestLoadResult(normalized)
 
 
 def rollback_project_manifest(path: os.PathLike[str] | str) -> Path:
@@ -1699,9 +1917,10 @@ def rollback_project_manifest(path: os.PathLike[str] | str) -> Path:
             f"Manifest backup is unavailable or invalid: {backup}"
         ) from error
     normalized = validate_project_manifest(candidate)
-    _atomic_write_bytes(
-        destination, json.dumps(normalized, indent=2, sort_keys=True).encode("utf-8")
-    )
+    with state_lock(destination):
+        _atomic_write_bytes(
+            destination, json.dumps(normalized, indent=2, sort_keys=True).encode("utf-8")
+        )
     return destination
 
 
@@ -4524,35 +4743,53 @@ def obfuscate_source(
 
 
 class BuildAnalytics:
-    """Local-only build timing and size history backed by SQLite."""
+    """Local SQLite analytics with WAL, bounded busy waits, and backups.
+
+    Writers take an immediate transaction under the shared state lock. SQLite
+    WAL keeps readers available while one writer commits; ``backup`` and
+    ``recover`` provide the explicit copy/restore policy used by the CLI.
+    """
 
     def __init__(self, path: os.PathLike[str] | str | None = None) -> None:
         self.path = (
             Path(path).expanduser() if path else config_dir() / "analytics.sqlite3"
         )
+        self.backup_path = self.path.with_name(f"{self.path.name}.bak")
 
     def _connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS builds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                source TEXT NOT NULL,
-                output TEXT NOT NULL,
-                file_type TEXT,
-                backend TEXT,
-                profile TEXT,
-                success INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                size_bytes INTEGER NOT NULL,
-                duration_seconds REAL NOT NULL
-            )
-            """
+        connection = sqlite3.connect(
+            self.path,
+            timeout=ANALYTICS_BUSY_TIMEOUT_MS / 1000,
+            isolation_level=None,
         )
-        connection.commit()
-        return connection
+        try:
+            connection.execute(f"PRAGMA busy_timeout={ANALYTICS_BUSY_TIMEOUT_MS}")
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS builds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    output TEXT NOT NULL,
+                    file_type TEXT,
+                    backend TEXT,
+                    profile TEXT,
+                    success INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    duration_seconds REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(f"PRAGMA user_version={ANALYTICS_SCHEMA_VERSION}")
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
     def record(self, result: BuildResult) -> None:
         size = 0
@@ -4560,30 +4797,110 @@ class BuildAnalytics:
             size = result.output.stat().st_size
         except OSError:
             pass
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO builds (
-                    timestamp, source, output, file_type, backend, profile,
-                    success, status, size_bytes, duration_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    datetime.now(UTC).isoformat(),
-                    str(result.request.source),
-                    str(result.output),
-                    result.request.file_type,
-                    result.backend,
-                    result.request.profile_name,
-                    int(result.success),
-                    result.status,
-                    size,
-                    result.duration_seconds,
-                ),
-            )
+        with state_lock(self.path):
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO builds (
+                        timestamp, source, output, file_type, backend, profile,
+                        success, status, size_bytes, duration_seconds
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        datetime.now(UTC).isoformat(),
+                        str(result.request.source),
+                        str(result.output),
+                        result.request.file_type,
+                        result.backend,
+                        result.request.profile_name,
+                        int(result.success),
+                        result.status,
+                        size,
+                        result.duration_seconds,
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    def backup(self, destination: os.PathLike[str] | str | None = None) -> Path:
+        """Create an atomic SQLite backup, defaulting to ``analytics.sqlite3.bak``."""
+
+        output = Path(destination).expanduser() if destination else self.backup_path
+        if output.resolve() == self.path.resolve():
+            raise BuildValidationError("Analytics backup must differ from its database")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_name(
+            f".{output.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+        )
+        with state_lock(self.path):
+            source = self._connect()
+            target = None
+            try:
+                target = sqlite3.connect(
+                    temporary,
+                    timeout=ANALYTICS_BUSY_TIMEOUT_MS / 1000,
+                    isolation_level=None,
+                )
+                target.execute(f"PRAGMA busy_timeout={ANALYTICS_BUSY_TIMEOUT_MS}")
+                source.backup(target, pages=100, sleep=STATE_LOCK_POLL_SECONDS)
+                target.execute("PRAGMA synchronous=NORMAL")
+                target.commit()
+                target.close()
+                target = None
+                with temporary.open("r+b") as handle:
+                    os.fsync(handle.fileno())
+                os.replace(temporary, output)
+            finally:
+                source.close()
+                if target is not None:
+                    target.close()
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+        return output
+
+    def recover(self, backup: os.PathLike[str] | str | None = None) -> Path:
+        """Restore a validated SQLite backup atomically into the live database."""
+
+        source_path = Path(backup).expanduser() if backup else self.backup_path
+        if not source_path.is_file():
+            raise BuildValidationError(f"Analytics backup is unavailable: {source_path}")
+        try:
+            connection = sqlite3.connect(source_path, timeout=ANALYTICS_BUSY_TIMEOUT_MS / 1000)
+            try:
+                integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            finally:
+                connection.close()
+        except sqlite3.DatabaseError as error:
+            raise BuildValidationError(f"Analytics backup is invalid: {source_path}") from error
+        if not integrity or integrity[0] != "ok":
+            raise BuildValidationError(f"Analytics backup failed integrity check: {source_path}")
+        temporary = self.path.with_name(
+            f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+        )
+        with state_lock(self.path):
+            try:
+                shutil.copy2(source_path, temporary)
+                with temporary.open("r+b") as handle:
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self.path)
+            finally:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+        return self.path
 
     def summary(self) -> dict[str, Any]:
-        with self._connect() as connection:
+        connection = self._connect()
+        try:
             row = connection.execute(
                 """
                 SELECT COUNT(*), COALESCE(SUM(success), 0),
@@ -4598,6 +4915,8 @@ class BuildAnalytics:
                 FROM builds GROUP BY backend ORDER BY backend
                 """
             ).fetchall()
+        finally:
+            connection.close()
         total, successful, bytes_built, average_seconds = row or (0, 0, 0, 0)
         return {
             "database": str(self.path),
@@ -4612,7 +4931,8 @@ class BuildAnalytics:
         }
 
     def recent(self, limit: int = 10) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        connection = self._connect()
+        try:
             rows = connection.execute(
                 """
                 SELECT timestamp, source, output, backend, profile, success,
@@ -4621,6 +4941,8 @@ class BuildAnalytics:
                 """,
                 (max(1, int(limit)),),
             ).fetchall()
+        finally:
+            connection.close()
         keys = (
             "timestamp",
             "source",
@@ -4682,16 +5004,18 @@ class DiagnosticsStore:
                 records.append(dict(value))
         return records
 
-    def _rewrite(self, records: Sequence[Mapping[str, Any]]) -> None:
+    def _rewrite_unlocked(self, records: Sequence[Mapping[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         payload = "".join(
             json.dumps(record, sort_keys=True, separators=(",", ":"), default=str)
             + "\n"
             for record in records
         )
-        temporary.write_text(payload, encoding="utf-8")
-        os.replace(temporary, self.path)
+        _atomic_write_bytes(self.path, payload.encode("utf-8"))
+
+    def _rewrite(self, records: Sequence[Mapping[str, Any]]) -> None:
+        with state_lock(self.path):
+            self._rewrite_unlocked(records)
 
     def _retained(self, records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         cutoff = datetime.now(UTC).timestamp() - self.retention_days * 86400
@@ -4717,8 +5041,9 @@ class DiagnosticsStore:
         sanitized["correlation_id"] = _normalize_correlation_id(
             str(sanitized.get("correlation_id", ""))
         )
-        records = self._retained([*self._read(), sanitized])
-        self._rewrite(records)
+        with state_lock(self.path):
+            records = self._retained([*self._read(), sanitized])
+            self._rewrite_unlocked(records)
 
     def record(self, result: BuildResult) -> None:
         self.append(result.diagnostic_record())
@@ -5165,10 +5490,24 @@ def create_cli_parser() -> argparse.ArgumentParser:
     obfuscate_parser.add_argument("--output", "-o", required=True)
 
     analytics_parser = subparsers.add_parser(
-        "analytics", help="Show local build timing and size analytics"
+        "analytics", help="Show, back up, or recover local build analytics"
     )
     analytics_parser.add_argument("--path")
     analytics_parser.add_argument("--recent", type=int, default=0)
+    analytics_parser.add_argument(
+        "--backup",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help="Create an atomic SQLite backup (default: <database>.bak)",
+    )
+    analytics_parser.add_argument(
+        "--recover",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help="Restore a validated SQLite backup (default: <database>.bak)",
+    )
     analytics_parser.add_argument("--json", action="store_true")
 
     diagnostics_parser = subparsers.add_parser(
@@ -5359,9 +5698,24 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "analytics":
         analytics_store = BuildAnalytics(args.path)
-        analytics_value: dict[str, Any] = analytics_store.summary()
-        if args.recent:
-            analytics_value["recent"] = analytics_store.recent(args.recent)
+        try:
+            analytics_value: dict[str, Any] = {}
+            if args.recover is not None:
+                recovery_source = args.recover or None
+                analytics_value["recovered"] = str(
+                    analytics_store.recover(recovery_source)
+                )
+            if args.backup is not None:
+                backup_destination = args.backup or None
+                analytics_value["backup"] = str(
+                    analytics_store.backup(backup_destination)
+                )
+            analytics_value.update(analytics_store.summary())
+            if args.recent:
+                analytics_value["recent"] = analytics_store.recent(args.recent)
+        except (BuildValidationError, OSError, sqlite3.DatabaseError) as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
         print(
             json.dumps(analytics_value, indent=2, default=str)
             if args.json
@@ -5590,6 +5944,7 @@ __all__ = [
     "ADAPTER_API_VERSION",
     "ADAPTER_ENTRY_POINT_GROUP",
     "ADAPTER_POLICY_VERSION",
+    "ANALYTICS_SCHEMA_VERSION",
     "AdapterDescriptor",
     "BackendAdapter",
     "ARTIFACT_MANIFEST_SCHEMA_VERSION",
@@ -5600,6 +5955,7 @@ __all__ = [
     "BuildRequest",
     "BuildResult",
     "BuildValidationError",
+    "StateLockError",
     "CAPABILITY_SCHEMA_VERSION",
     "CommandResult",
     "CompilerEngine",
@@ -5662,6 +6018,8 @@ __all__ = [
     "save_project_manifest",
     "save_profiles",
     "sha256_file",
+    "state_lock",
+    "update_project_manifest",
     "rollback_project_manifest",
     "validate_project_manifest",
     "verify_artifact_manifest",

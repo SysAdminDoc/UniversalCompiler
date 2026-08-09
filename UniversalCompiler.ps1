@@ -184,6 +184,63 @@ function New-CanonicalManifest {
     }
 }
 
+function Invoke-WithStateLock {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [int]$TimeoutSeconds = 15
+    )
+    $destination = [IO.Path]::GetFullPath($Path)
+    $lockParent = Split-Path -Parent $destination
+    $lockPath = Join-Path $lockParent ("." + [IO.Path]::GetFileName($destination) + ".lock")
+    if ($lockParent -and -not (Test-Path -LiteralPath $lockParent)) { New-Item -ItemType Directory -Path $lockParent -Force | Out-Null }
+    $stream = $null
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    try {
+        while ($null -eq $stream) {
+            try { $stream = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+            catch {
+                if ((Get-Date) -ge $deadline) { throw "Timed out waiting for state lock: $lockPath" }
+                Start-Sleep -Milliseconds 50
+            }
+        }
+        & $Action
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Write-AtomicText {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Content,
+        [switch]$Recoverable
+    )
+    $destination = [IO.Path]::GetFullPath($Path)
+    $parent = Split-Path -Parent $destination
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $temporary = "$destination.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
+    $temporaryBackup = "$destination.bak.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
+    $stream = $null
+    try {
+        if ($Recoverable -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
+            Copy-Item -LiteralPath $destination -Destination $temporaryBackup -Force
+            Move-Item -LiteralPath $temporaryBackup -Destination "$destination.bak" -Force
+        }
+        $encoding = New-Object System.Text.UTF8Encoding($false)
+        $bytes = $encoding.GetBytes($Content)
+        $stream = [IO.File]::Open($temporary, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose(); $stream = $null
+        Move-Item -LiteralPath $temporary -Destination $destination -Force
+    } finally {
+        if ($stream) { $stream.Dispose() }
+        if (Test-Path -LiteralPath $temporary) { [IO.File]::Delete($temporary) }
+        if (Test-Path -LiteralPath $temporaryBackup) { [IO.File]::Delete($temporaryBackup) }
+    }
+}
+
 function Read-CanonicalManifest {
     if (-not (Test-Path -LiteralPath $script:ManifestFile)) { return $null }
     try {
@@ -200,9 +257,7 @@ function Read-CanonicalManifest {
             try {
                 $candidate = Get-Content -LiteralPath $backup -Raw | ConvertFrom-Json -ErrorAction Stop
                 if ($candidate.schema_version -eq 'uc.project.v1' -and $candidate.kind -eq 'universal-compiler.project' -and ($candidate.scope -eq 'user' -or $candidate.scope -eq 'workspace')) {
-                    $restoreTemp = "$($script:ManifestFile).$PID.restore.tmp"
-                    Copy-Item -LiteralPath $backup -Destination $restoreTemp -Force
-                    Move-Item -LiteralPath $restoreTemp -Destination $script:ManifestFile -Force
+                    Write-AtomicText -Path $script:ManifestFile -Content ($candidate | ConvertTo-Json -Depth 8)
                     return $candidate
                 }
             } catch { }
@@ -234,23 +289,28 @@ function Get-CanonicalManifestForUpdate {
 function Save-CanonicalManifest {
     param([Parameter(Mandatory)]$Manifest)
     if ($Manifest.schema_version -ne 'uc.project.v1' -or $Manifest.kind -ne 'universal-compiler.project') { throw 'Cannot save an invalid project manifest' }
-    if (Test-Path -LiteralPath $script:ManifestFile) {
-        $backupTemp = "$($script:ManifestFile).$PID.backup.tmp"
-        Copy-Item -LiteralPath $script:ManifestFile -Destination $backupTemp -Force
-        Move-Item -LiteralPath $backupTemp -Destination "$($script:ManifestFile).bak" -Force
-    }
-    $temporary = "$($script:ManifestFile).$PID.tmp"
-    $utf8 = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($temporary, ($Manifest | ConvertTo-Json -Depth 8), $utf8)
-    Move-Item -LiteralPath $temporary -Destination $script:ManifestFile -Force
+    Invoke-WithStateLock -Path $script:ManifestFile -Action {
+        Write-AtomicText -Path $script:ManifestFile -Content ($Manifest | ConvertTo-Json -Depth 8) -Recoverable
+    } | Out-Null
+}
+
+function Update-CanonicalManifest {
+    param([Parameter(Mandatory)][scriptblock]$Updater)
+    Invoke-WithStateLock -Path $script:ManifestFile -Action {
+        $manifest = Get-CanonicalManifestForUpdate
+        $updated = & $Updater $manifest
+        if ($null -eq $updated) { $updated = $manifest }
+        if ($updated.schema_version -ne 'uc.project.v1' -or $updated.kind -ne 'universal-compiler.project') { throw 'Cannot save an invalid project manifest' }
+        Write-AtomicText -Path $script:ManifestFile -Content ($updated | ConvertTo-Json -Depth 8) -Recoverable
+    } | Out-Null
 }
 
 function Restore-CanonicalManifest {
     $backup = "$($script:ManifestFile).bak"
     if (-not (Test-Path -LiteralPath $backup)) { throw 'Project manifest backup is unavailable' }
-    $temporary = "$($script:ManifestFile).$PID.restore.tmp"
-    Copy-Item -LiteralPath $backup -Destination $temporary -Force
-    Move-Item -LiteralPath $temporary -Destination $script:ManifestFile -Force
+    Invoke-WithStateLock -Path $script:ManifestFile -Action {
+        Write-AtomicText -Path $script:ManifestFile -Content (Get-Content -LiteralPath $backup -Raw)
+    } | Out-Null
     return Read-CanonicalManifest
 }
 
@@ -348,7 +408,7 @@ function Get-AppSettings {
     if ($loaded) { foreach ($p in Get-ObjectEntries $loaded) { if ($s.ContainsKey($p.Name)) { $s[$p.Name] = $p.Value } } }
     return $s
 }
-function Save-AppSettings { param([hashtable]$S); $manifest = Get-CanonicalManifestForUpdate; $manifest.settings = ConvertTo-CanonicalSettings $S; Save-CanonicalManifest $manifest }
+function Save-AppSettings { param([hashtable]$S); Update-CanonicalManifest -Updater { param($manifest); $manifest.settings = ConvertTo-CanonicalSettings $S; return $manifest } }
 
 $script:Settings = Get-AppSettings
 
@@ -362,7 +422,15 @@ $script:Themes = @{
 # ============================================================================
 
 function Get-RecentFiles { if (Test-Path $script:RecentFile) { try { return @(Get-Content $script:RecentFile -Raw | ConvertFrom-Json | Where-Object { Test-Path $_ }) } catch { } }; return @() }
-function Add-RecentFile { param([string]$F); $r = @(Get-RecentFiles); $r = @($F) + @($r | Where-Object { $_ -ne $F }) | Select-Object -First $script:Settings.MaxRecentFiles; $r | ConvertTo-Json | Set-Content -Path $script:RecentFile -Force }
+function Add-RecentFile {
+    param([string]$F)
+    Invoke-WithStateLock -Path $script:RecentFile -Action {
+        $r = @()
+        if (Test-Path -LiteralPath $script:RecentFile) { try { $r = @(Get-Content $script:RecentFile -Raw | ConvertFrom-Json | Where-Object { Test-Path $_ }) } catch { } }
+        $r = @($F) + @($r | Where-Object { $_ -ne $F }) | Select-Object -First $script:Settings.MaxRecentFiles
+        Write-AtomicText -Path $script:RecentFile -Content ($r | ConvertTo-Json) -Recoverable
+    } | Out-Null
+}
 
 $script:DefaultProfiles = @{
     'Default' = @{ Console=$false; Admin=$false; SingleFile=$true; Version='1.0.0.0'; Company=''; Copyright=''; Description=''; Product='' }
@@ -378,11 +446,11 @@ function Get-BuildProfiles {
     foreach ($k in $script:DefaultProfiles.Keys) { if (-not $p.ContainsKey($k)) { $p[$k] = $script:DefaultProfiles[$k] } }
     return $p
 }
-function Save-BuildProfiles { param([hashtable]$P); $manifest = Get-CanonicalManifestForUpdate; $manifest.profiles = ConvertTo-CanonicalProfiles $P; Save-CanonicalManifest $manifest }
-function Save-BuildProfile { param([string]$N, [hashtable]$P); $profiles = Get-BuildProfiles; $profiles[$N] = $P; Save-BuildProfiles $profiles }
+function Save-BuildProfiles { param([hashtable]$P); Update-CanonicalManifest -Updater { param($manifest); $manifest.profiles = ConvertTo-CanonicalProfiles $P; return $manifest } }
+function Save-BuildProfile { param([string]$N, [hashtable]$P); Update-CanonicalManifest -Updater { param($manifest); $profiles = ConvertFrom-CanonicalProfiles $manifest.profiles; if (-not $profiles) { $profiles = @{} }; $profiles[$N] = $P; $manifest.profiles = ConvertTo-CanonicalProfiles $profiles; return $manifest } }
 
 function Get-CompilationHistory { try { return @((Read-CanonicalManifest).history) } catch { if (Test-Path $script:HistoryFile) { try { return @(Get-Content $script:HistoryFile -Raw | ConvertFrom-Json) } catch { } } }; return @() }
-function Add-CompilationHistory { param([string]$Src, [string]$Out, [string]$Type, [bool]$Success, [string]$Prof, [long]$Size); $h = @(Get-CompilationHistory); $e = @{ Timestamp=(Get-Date).ToString("o"); Source=$Src; Output=$Out; Type=$Type; Success=$Success; Profile=$Prof; Size=$Size }; $h = @($e) + $h | Select-Object -First $script:Settings.MaxHistoryItems; $manifest = Get-CanonicalManifestForUpdate; $manifest.history = ConvertTo-CanonicalHistory $h; Save-CanonicalManifest $manifest }
+function Add-CompilationHistory { param([string]$Src, [string]$Out, [string]$Type, [bool]$Success, [string]$Prof, [long]$Size); $e = @{ Timestamp=(Get-Date).ToString("o"); Source=$Src; Output=$Out; Type=$Type; Success=$Success; Profile=$Prof; Size=$Size }; Update-CanonicalManifest -Updater { param($manifest); $h = @($e) + @($manifest.history); $h = @($h | Select-Object -First $script:Settings.MaxHistoryItems); $manifest.history = ConvertTo-CanonicalHistory $h; return $manifest } }
 
 # ============================================================================
 # NOTIFICATIONS & UTILITIES
@@ -447,7 +515,11 @@ if ($SetupMode -notin @('Diagnostic', 'DryRun', 'Manual', 'OfflineArtifact')) { 
 # DEPENDENCY MANAGEMENT
 # ============================================================================
 
-function Write-InstallLog { param([string]$M); Add-Content -Path $script:LogFile -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] $M" -ErrorAction SilentlyContinue }
+function Write-InstallLog {
+    param([string]$M)
+    $line = "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] $M`r`n"
+    try { Invoke-WithStateLock -Path $script:LogFile -Action { [IO.File]::AppendAllText($script:LogFile, $line, (New-Object System.Text.UTF8Encoding($false))) } | Out-Null } catch { }
+}
 function Test-PS2EXEInstalled { $m = Get-Module -ListAvailable -Name ps2exe -EA SilentlyContinue; if ($m) { return $true }; $paths = @((Join-Path ([Environment]::GetFolderPath('MyDocuments')) "WindowsPowerShell\Modules\ps2exe")); foreach ($p in $paths) { if (Test-Path (Join-Path $p "ps2exe.psm1")) { return $true } }; return $false }
 
 function Get-ToolchainCatalog {
@@ -462,20 +534,22 @@ function Get-ToolchainCatalog {
 
 function Save-ToolchainAcquisitionRecord {
     param([Parameter(Mandatory)]$Record)
-    $records = @()
-    if (Test-Path -LiteralPath $script:ToolchainAcquisitionFile) {
-        try {
-            $loaded = Get-Content -LiteralPath $script:ToolchainAcquisitionFile -Raw | ConvertFrom-Json -ErrorAction Stop
-            if ($loaded.records) { $records = @($loaded.records) }
-        } catch { $records = @() }
-    }
-    $records += $Record
-    $records = @($records | Select-Object -Last 100)
-    $payload = [ordered]@{ schema_version=$script:ToolchainAcquisitionSchema; kind=$script:ToolchainAcquisitionKind; records=$records }
-    $temporary = "$($script:ToolchainAcquisitionFile).$PID.tmp"
-    $utf8 = New-Object System.Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($temporary, ($payload | ConvertTo-Json -Depth 12), $utf8)
-    Move-Item -LiteralPath $temporary -Destination $script:ToolchainAcquisitionFile -Force
+    Invoke-WithStateLock -Path $script:ToolchainAcquisitionFile -Action {
+        $records = @()
+        if (Test-Path -LiteralPath $script:ToolchainAcquisitionFile) {
+            try {
+                $loaded = Get-Content -LiteralPath $script:ToolchainAcquisitionFile -Raw | ConvertFrom-Json -ErrorAction Stop
+                if ($loaded.records) { $records = @($loaded.records) }
+            } catch {
+                $backup = "$($script:ToolchainAcquisitionFile).bak"
+                if (Test-Path -LiteralPath $backup) { try { $loaded = Get-Content -LiteralPath $backup -Raw | ConvertFrom-Json -ErrorAction Stop; if ($loaded.records) { $records = @($loaded.records) } } catch { } }
+            }
+        }
+        $records += $Record
+        $records = @($records | Select-Object -Last 100)
+        $payload = [ordered]@{ schema_version=$script:ToolchainAcquisitionSchema; kind=$script:ToolchainAcquisitionKind; records=$records }
+        Write-AtomicText -Path $script:ToolchainAcquisitionFile -Content ($payload | ConvertTo-Json -Depth 12) -Recoverable
+    } | Out-Null
 }
 
 function New-ToolchainAcquisitionRecord {
@@ -710,7 +784,11 @@ public class SetupDpiAwareness {
     })
     
     $win.ShowDialog() | Out-Null
-    if ($Mode -eq 'package-manager' -and $script:setupSucceeded) { @{ DependenciesInstalled=$true; SetupDate=(Get-Date).ToString("o") } | ConvertTo-Json | Set-Content -Path $script:ConfigFile -Force }
+    if ($Mode -eq 'package-manager' -and $script:setupSucceeded) {
+        Invoke-WithStateLock -Path $script:ConfigFile -Action {
+            Write-AtomicText -Path $script:ConfigFile -Content (@{ DependenciesInstalled=$true; SetupDate=(Get-Date).ToString("o") } | ConvertTo-Json) -Recoverable
+        } | Out-Null
+    }
     return $script:setupDone
 }
 

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import struct
 import sys
 import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ import compiler_core
 from compiler_core import (
     ADAPTER_API_VERSION,
     AdapterDescriptor,
+    ANALYTICS_SCHEMA_VERSION,
     BuildAnalytics,
     BuildPlan,
     BuildValidationError,
@@ -45,6 +48,7 @@ from compiler_core import (
     format_size,
     github_actions_template,
     load_profiles,
+    load_json,
     load_project_manifest,
     default_project_manifest,
     project_manifest_backup_path,
@@ -56,7 +60,10 @@ from compiler_core import (
     rollback_project_manifest,
     run_command,
     save_profiles,
+    save_json,
     save_project_manifest,
+    state_lock,
+    update_project_manifest,
     validate_project_manifest,
     verify_artifact_manifest,
     verify_artifact,
@@ -337,6 +344,9 @@ def test_powershell_toolchain_acquisition_is_pinned_and_explicit() -> None:
     assert "master.zip" not in powershell
     assert "if ($ForceSetup -and -not $SkipSetup)" in powershell
     assert "Install-Module $($definition.Package) -RequiredVersion" in powershell
+    assert "Invoke-WithStateLock" in powershell
+    assert "Write-AtomicText" in powershell
+    assert '("." + [IO.Path]::GetFileName($destination) + ".lock")' in powershell
 
 
 def test_profiles_round_trip_without_extra_dependency(tmp_path: Path) -> None:
@@ -439,6 +449,53 @@ def test_project_manifest_backup_recovery_and_rollback(tmp_path: Path) -> None:
     rollback_project_manifest(path)
     rolled_back = load_project_manifest(path, expected_scope="user")
     assert rolled_back.manifest["settings"]["theme"] == "Dark"
+
+
+def test_user_state_is_recoverable_and_manifest_updates_do_not_lose_fields(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "settings.json"
+    save_json(state_path, {"value": 1}, recoverable=True)
+    save_json(state_path, {"value": 2}, recoverable=True)
+    with state_lock(state_path):
+        assert state_path.with_name(".settings.json.lock").is_file()
+    assert state_path.with_name("settings.json.bak").is_file()
+    state_path.write_text("{ interrupted", encoding="utf-8")
+    assert load_json(state_path, {}, recoverable=True) == {"value": 1}
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {"value": 1}
+
+    profiles_path = tmp_path / "profiles.yaml"
+    save_profiles(profiles_path, DEFAULT_PROFILES)
+    changed_profiles = dict(DEFAULT_PROFILES)
+    changed_profiles["Default"] = dict(DEFAULT_PROFILES["Default"], backend="nuitka")
+    save_profiles(profiles_path, changed_profiles)
+    profiles_path.write_text("Default: [interrupted", encoding="utf-8")
+    assert load_profiles(profiles_path)["Default"]["backend"] == "auto"
+    profiles_path.unlink()
+    assert load_profiles(profiles_path)["Default"]["backend"] == "auto"
+    assert profiles_path.is_file()
+
+    manifest_path = tmp_path / "manifest.json"
+    save_project_manifest(manifest_path, default_project_manifest("user"))
+    barrier = threading.Barrier(2)
+
+    def update_theme(manifest: dict[str, object]) -> dict[str, object]:
+        manifest["settings"]["theme"] = "Light"  # type: ignore[index]
+        return manifest
+
+    def update_history_limit(manifest: dict[str, object]) -> dict[str, object]:
+        manifest["settings"]["max_history_items"] = 7  # type: ignore[index]
+        return manifest
+
+    def run_update(updater):
+        barrier.wait()
+        return update_project_manifest(manifest_path, updater, expected_scope="user")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(run_update, (update_theme, update_history_limit)))
+    merged = load_project_manifest(manifest_path, expected_scope="user").manifest
+    assert merged["settings"]["theme"] == "Light"
+    assert merged["settings"]["max_history_items"] == 7
 
 
 def test_manifest_cli_init_and_show(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -548,6 +605,33 @@ def test_local_analytics_records_summary(tmp_path: Path) -> None:
     assert summary["total_builds"] == 1
     assert summary["successful_builds"] == 1
     assert analytics.recent(1)[0]["backend"] == "pyinstaller"
+
+    connection = sqlite3.connect(analytics.path)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == ANALYTICS_SCHEMA_VERSION
+    finally:
+        connection.close()
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(analytics.record, (result, result, result)))
+    assert analytics.summary()["total_builds"] == 4
+
+    backup = analytics.backup()
+    assert backup == analytics.backup_path
+    assert backup.is_file()
+    for sidecar in (
+        analytics.path.with_name(f"{analytics.path.name}-wal"),
+        analytics.path.with_name(f"{analytics.path.name}-shm"),
+    ):
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+    analytics.path.write_bytes(b"interrupted database")
+    with pytest.raises(sqlite3.DatabaseError):
+        analytics.summary()
+    analytics.recover()
+    assert analytics.summary()["total_builds"] == 4
 
 
 def test_diagnostics_store_has_bounded_local_retention_and_opt_in_export(

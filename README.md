@@ -356,6 +356,30 @@ Save your favorite settings as profiles:
 | Legacy Settings | `%APPDATA%\UniversalCompiler\settings.json` (imported on migration) |
 | Templates | `%APPDATA%\UniversalCompiler\Templates\` |
 | Install Log | `%APPDATA%\UniversalCompiler\install.log` |
+| State locks | Adjacent hidden `.<filename>.lock` files; released by the owning process |
+| Recovery backups | Adjacent `<filename>.bak` files for user/project JSON/YAML state |
+
+State under `%APPDATA%\UniversalCompiler` is private to the current Windows
+user. Workspace manifests, dependency locks, and output-side caches remain
+beside the selected project or output; analytics, diagnostics, and
+installation logs remain private in the user profile. State writes use a
+bounded cross-process lock and an
+fsync-before-replace sequence; a valid `.bak` is restored after an interrupted
+write. Cache files are disposable and can be deleted without losing profiles
+or history.
+
+Analytics uses SQLite WAL with a 10-second busy timeout, explicit immediate
+writer transactions, and a validated atomic backup. Back up or recover it
+without opening the GUI:
+
+```powershell
+python .\UniversalCompiler.py analytics --path .\analytics.sqlite3 --backup --json
+python .\UniversalCompiler.py analytics --path .\analytics.sqlite3 --recover --json
+```
+
+The default analytics location is the per-user path above; `--path` is the
+explicit project or test database path. Builds remain offline by default and
+can disable analytics entirely with `--no-analytics`.
 
 ---
 
