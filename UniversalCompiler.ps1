@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Universal Compiler v2.1.0 - Script to EXE Compiler
+    Universal Compiler - Script to EXE Compiler
 .DESCRIPTION
     Compiles PowerShell, Python, Batch, Node.js, C#, Go, Ruby, VBScript, and AutoHotkey scripts to Windows executables.
     Features: Drag & Drop, Batch Compilation, Build Profiles, Recent Files, Theme Toggle, and unsigned builds.
@@ -26,7 +26,17 @@ param(
 # ============================================================================
 
 $script:AppName = "Universal Compiler"
-$script:AppVersion = "2.1.0"
+$script:VersionFile = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'version.json' } else { Join-Path (Get-Location).Path 'version.json' }
+try {
+    if (-not (Test-Path -LiteralPath $script:VersionFile -PathType Leaf)) { throw "version.json was not found" }
+    $versionDocument = Get-Content -LiteralPath $script:VersionFile -Raw | ConvertFrom-Json -ErrorAction Stop
+    if ($versionDocument.schema_version -ne 'uc.version.v1' -or $versionDocument.kind -ne 'universal-compiler.version' -or $versionDocument.version -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+        throw "version.json has an invalid schema or version"
+    }
+    $script:AppVersion = [string]$versionDocument.version
+} catch {
+    throw "Unable to load the application version from version.json: $($_.Exception.Message)"
+}
 $script:ConfigDir = Join-Path $env:APPDATA "UniversalCompiler"
 $script:ConfigFile = Join-Path $script:ConfigDir "config.json"
 $script:ManifestFile = Join-Path $script:ConfigDir "universal-compiler.json"

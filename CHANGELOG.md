@@ -75,8 +75,13 @@ All notable changes to UniversalCompiler will be documented in this file.
   messages, plural/placeholder support, locale-aware formatting, explicit
   locale selection, keyboard-only Python GUI paths, semantic Tk metadata,
   WPF UI Automation names, focus styles, and high-contrast palettes.
+- Add a schema-versioned `compatibility --json` matrix with lifecycle,
+  host/target/architecture constraints, artifact/runtime policies, explicit
+  deprecated-backend behavior, a canonical Python CLI quick start, and a
+  single `version.json` source for release metadata; document offline,
+  privacy, migration, recovery, and unsigned-package boundaries.
 
-## [v0.1.0] - %Y->- (HEAD -> main, origin/main, origin/HEAD)
+## [v0.1.0] - 2026-04-13
 
 - Create UniversalCompiler.py
 - Rename Universalcompiler.ps1 to UniversalCompiler.ps1

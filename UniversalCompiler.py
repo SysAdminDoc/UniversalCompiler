@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Universal Compiler v2.1.0 - Python Edition
+Universal Compiler - Python Edition
 A powerful, all-in-one script-to-EXE compiler with a modern dark-themed GUI
 
 Compiles PowerShell, Python, Batch, Node.js, C#, Go, Ruby, VBScript, 
@@ -18,6 +18,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List, Any, Callable
 from compiler_core import (
+    APP_VERSION as CORE_APP_VERSION,
     BACKEND_NAMES,
     BuildValidationError,
     BuildRequest,
@@ -43,7 +44,7 @@ from compiler_core import (
 # install optional desktop packages.  The legacy GUI remains the default when
 # the script is launched without a command.
 _CLI_COMMANDS = {
-    "build", "batch", "inspect", "verify", "release", "list-toolchains", "diagnostics",
+    "build", "batch", "inspect", "verify", "release", "list-toolchains", "compatibility", "diagnostics",
     "init-profiles", "manifest", "bytecode", "extract-icon", "wrap-msix", "obfuscate",
     "analytics", "init-actions", "--help", "-h",
 }
@@ -79,7 +80,7 @@ except ImportError:
 # ============================================================================
 
 APP_NAME = "Universal Compiler"
-APP_VERSION = "2.1.0"
+APP_VERSION = CORE_APP_VERSION
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "UniversalCompiler"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 PROFILES_FILE = CONFIG_DIR / "profiles.yaml"

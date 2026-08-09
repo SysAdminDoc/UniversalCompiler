@@ -8,11 +8,11 @@
 </p>
 
 <p align="center">
-  <b>A powerful, all-in-one script-to-EXE compiler</b>
+  <b>A capability-aware, offline-first source-to-artifact compiler</b>
 </p>
 
 <p align="center">
-  Compile PowerShell, Python, Batch, Node.js, C#, Go, Ruby, VBScript, and AutoHotkey scripts into standalone Windows executables with just a few clicks.
+  Plan and build supported source types through the Python core, with optional Windows GUI shells and explicit artifact/runtime boundaries.
 </p>
 
 ---
@@ -20,23 +20,29 @@
 ## ✨ Features
 
 ### 🎯 Multi-Language Support
-| Language | Extension | Compiler | Status |
-|----------|-----------|----------|--------|
-| PowerShell | `.ps1` | PS2EXE | ✅ Full Support |
-| Python | `.py` | PyInstaller / Nuitka | ✅ Full Support |
-| Batch | `.bat`, `.cmd` | IExpress | ✅ Full Support |
-| Node.js | `.js` | Bun compile / Deno compile | Capability-gated; legacy pkg is explicit-only |
-| TypeScript | `.ts` | Bun `build --compile` | ✅ Full Support |
-| C# | `.cs` | CSC (.NET) | ✅ Full Support |
-| Go | `.go` | go build | ✅ Full Support |
-| Ruby | `.rb` | Ocra | ✅ Full Support |
-| VBScript | `.vbs` | IExpress | ✅ Full Support |
-| AutoHotkey | `.ahk` | Ahk2Exe | ✅ Full Support |
-| Rust | `.rs` | Cargo / rustc | ✅ Full Support |
-| Lua | `.lua` | srlua / luastatic | ✅ Full Support |
-| Perl | `.pl`, `.pm` | PAR::Packer | ✅ Full Support |
-| Kotlin | `.kt`, `.kts` | Kotlin/Native | ✅ Full Support |
-| WebAssembly Text | `.wat` | wat2wasm | ✅ Full Support |
+| Language | Extension | Backend family | Lifecycle and artifact boundary |
+|----------|-----------|-----------------|--------------------------------|
+| PowerShell | `.ps1` | PS2EXE | Stable; capability-gated Windows PE output |
+| Python | `.py`, `.pyw` | PyInstaller / Nuitka | Stable; capability-gated Windows PE output with packaging/runtime inputs |
+| Batch | `.bat`, `.cmd` | IExpress | Stable; capability-gated self-extracting Windows package |
+| Node.js | `.js` | Bun / Deno | Stable; capability-gated platform executable with bundled runtime semantics |
+| Node.js (legacy) | `.js` | pkg | Deprecated; explicit-only and never auto-selected |
+| TypeScript | `.ts` | Bun | Stable; capability-gated platform executable |
+| C# | `.cs` | CSC (.NET) | Stable; managed executable with framework/deployment dependencies |
+| Go | `.go` | go build | Stable; capability-gated native platform executable |
+| Ruby | `.rb` | Ocra | Experimental; capability-gated Windows PE packaging |
+| VBScript | `.vbs` | IExpress | Stable; capability-gated self-extracting Windows package |
+| AutoHotkey | `.ahk` | Ahk2Exe | Stable; capability-gated Windows PE packaging |
+| Rust | `.rs` | Cargo / rustc | Stable; capability-gated native platform executable |
+| Lua | `.lua` | srlua / luastatic | Experimental; capability-gated Windows PE packaging |
+| Perl | `.pl`, `.pm` | PAR::Packer | Experimental; capability-gated Windows PE packaging |
+| Kotlin | `.kt`, `.kts` | Kotlin/Native | Experimental; capability-gated native platform executable |
+| WebAssembly Text | `.wat` | wat2wasm | Stable; emits a `.wasm` module requiring a host/WASI runtime, not a Windows EXE |
+
+The table describes backend policy, not installed-tool availability. Generate
+the current host-specific matrix with `python .\UniversalCompiler.py
+compatibility --json`; its `uc.compatibility.v1` output is authoritative for
+availability, targets, architectures, lifecycle, and artifact boundaries.
 
 ### 🚀 Key Features
 
@@ -92,16 +98,30 @@
 
 ### Quick Start
 
-1. **Download** `UniversalCompiler.ps1`
-2. **Right-click** → "Run with PowerShell"
-3. Build with the Python CLI or GUI; normal launches never download or install tools
+The Python CLI/core is the canonical build path:
+
+1. Install Python 3.10 or newer.
+2. Inspect the local capability contract:
+   `python .\UniversalCompiler.py list-toolchains --json`
+3. Preview or build without opening a window:
+   `python .\UniversalCompiler.py build .\myscript.py --output .\dist\myscript.exe --verify`
+4. Optionally use the Windows WPF shell with `.\UniversalCompiler.ps1 -SkipSetup`.
+
+The Python GUI (`python .\UniversalCompiler.py` with no command) is optional
+and requires an explicit `customtkinter` installation. Normal launches never
+download or install tools.
 
 ### Requirements
 
-- **Windows 10/11** (Windows 7/8 may work with limitations)
-- **PowerShell 5.1+** (included with Windows 10+)
-- **.NET Framework 4.5+** (included with Windows 10+)
+- **Windows 10/11** for the supported WPF shell and built-in Windows backend paths
+- **Python 3.10+** for the canonical CLI/core (CI exercises Python 3.12)
+- **PowerShell 5.1+** and **.NET Framework 4.5+** for the optional WPF shell
 - Python CLI builds do not install packages implicitly; install `customtkinter` explicitly only when launching the Python GUI
+
+`version.json` is the authoritative application version source. The Python
+core, PowerShell shell, VS Code extension manifest, README badge, and release
+notes are checked consumers of that value; source artifact metadata versions
+remain independent project metadata.
 
 ### Optional Dependencies
 
@@ -204,6 +224,7 @@ python .\UniversalCompiler.py --locale es list-toolchains
 python .\UniversalCompiler.py list-toolchains
 python .\UniversalCompiler.py list-toolchains --json
 python .\UniversalCompiler.py list-toolchains --adapter vendor.backend --json
+python .\UniversalCompiler.py compatibility --json
 python .\UniversalCompiler.py inspect .\myscript.py --json
 python .\UniversalCompiler.py verify .\dist\myscript.exe
 python .\UniversalCompiler.py verify .\dist\myscript.exe.manifest.json
@@ -227,6 +248,54 @@ python .\UniversalCompiler.py manifest rollback --path .\universal-compiler.json
 # Build from a canonical manifest instead of a legacy profiles file
 python .\UniversalCompiler.py build .\myscript.py --manifest .\universal-compiler.json --profile Release
 ```
+
+### Compatibility and artifact policy
+
+Generate the current matrix without installing or executing a source artifact:
+
+```powershell
+python .\UniversalCompiler.py compatibility --json
+python .\UniversalCompiler.py compatibility
+```
+
+The `uc.compatibility.v1` matrix is evaluated on the current host. Each entry
+reports lifecycle (`stable`, `experimental`, `deprecated`, or `optional`),
+installed availability, host support, target platforms, architectures,
+required SDKs, and a structured artifact policy:
+
+- Stable means the adapter contract and static verification path are supported;
+  it does not mean the SDK is installed or that every target is available.
+- Experimental means the adapter is retained for explicit use but has narrower
+  packaging assumptions and should be validated with a fixture before release.
+- Deprecated means it is never selected automatically. Archived Node `pkg` is
+  explicit-only and remains in the matrix so migrations can identify it.
+- Optional means the tool transforms an already-built artifact, such as UPX;
+  it is not a source compiler.
+
+Windows PE and native/platform executable entries still depend on their
+declared runtime, SDK, library, permission, and asset inputs. A `.wasm` entry
+is a WebAssembly module, not a Windows executable; its host APIs, imports,
+WASI profile, and data files must be supplied by the deployment host. The
+matrix never promises cross-compilation merely because a target name is
+listed: `host_supported`, target, architecture, and installed tool identity
+must all pass for a build plan.
+
+Verification is static and side-effect bounded. It checks artifact structure,
+hashes, and an adjacent versioned sidecar when present; it does not launch the
+artifact, exercise its runtime, install it, or validate external assets and
+permissions. Release dry-runs are unsigned and local. MSIX/APPX wrappers are
+deliberately unsigned, so Windows trust/install behavior is not proven; treat
+them as packaging or internal-test artifacts until a separately signed release
+process exists outside this repository.
+
+Builds are offline by default. Dependency prefetch requires an approved,
+hash-addressed lock, an explicit cache/mirror policy, and both network and
+installation permissions. Diagnostics and analytics stay local, redact source
+and environment data, and require an explicit export opt-in; no telemetry is
+sent. `manifest migrate` imports legacy settings/profiles/history
+idempotently, while `manifest rollback` and adjacent `.bak` files provide
+recoverable project-state paths. See [File Locations](#-file-locations) for
+the state, lock, cache, analytics, diagnostics, and recovery boundaries.
 
 Project state is stored in the versioned `%APPDATA%\UniversalCompiler\universal-compiler.json`
 manifest by default. A workspace manifest lives beside the project and is selected
@@ -290,10 +359,11 @@ constructs or sends a terminal command. Configure `profile`, `target`,
 namespaced `adapters` in VS Code settings. Failed builds are parsed into the
 Problems panel and structured result details remain in the output channel
 without forcing it into focus.
-`list-toolchains --json` is the authoritative, schema-versioned capability
-registry consumed by the CLI, both GUI shells, and the VS Code extension. It
-reports lifecycle, availability, host/target/architecture constraints,
-required SDKs, and a verified tool version when the installed tool exposes one.
+`compatibility --json` is the authoritative, schema-versioned host and artifact
+matrix. `list-toolchains --json` remains the lower-level capability registry
+consumed by the CLI, both GUI shells, and the VS Code extension; it reports
+lifecycle, availability, host/target/architecture constraints, required SDKs,
+and a verified tool version when the installed tool exposes one.
 Automatic selection excludes deprecated backends; `pkg` remains available only
 when explicitly requested. The PowerShell GUI also delegates builds to this
 Python CLI and consumes its versioned JSON request/result contract; it remains
@@ -517,7 +587,7 @@ Remove-Item "$env:APPDATA\UniversalCompiler" -Recurse -Force
 
 ## 📝 Changelog
 
-### v2.1.0
+### v2.1.0 — 2026-08-03
 - ✨ Complete UI redesign with modern dark theme
 - 🖱️ Drag & drop support
 - 📋 Batch compilation
@@ -534,7 +604,7 @@ Remove-Item "$env:APPDATA\UniversalCompiler" -Recurse -Force
 - 🖥️ DPI awareness
 - 🎨 Styled dropdown menus
 
-### v1.0
+### v1.0 — 2026-04-13
 - Initial release
 - Basic compilation support
 - Console-based setup

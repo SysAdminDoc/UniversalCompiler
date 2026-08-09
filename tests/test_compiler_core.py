@@ -21,12 +21,15 @@ from compiler_core import (
     ADAPTER_API_VERSION,
     AdapterDescriptor,
     ANALYTICS_SCHEMA_VERSION,
+    APP_VERSION,
     BuildAnalytics,
     BuildPlan,
     BuildValidationError,
     ARTIFACT_MANIFEST_SCHEMA_VERSION,
     BACKEND_CATALOG,
     CAPABILITY_SCHEMA_VERSION,
+    COMPATIBILITY_KIND,
+    COMPATIBILITY_SCHEMA_VERSION,
     DIAGNOSTICS_KIND,
     DIAGNOSTICS_SCHEMA_VERSION,
     DiagnosticsStore,
@@ -44,6 +47,7 @@ from compiler_core import (
     REQUEST_SCHEMA_VERSION,
     RESULT_SCHEMA_VERSION,
     cli_main,
+    compatibility_matrix,
     compile_bytecode,
     detect_file_type,
     load_dependency_lock,
@@ -1144,6 +1148,53 @@ def test_cli_list_toolchains_json(capsys: pytest.CaptureFixture[str]) -> None:
     assert output["pyinstaller"]["target_platforms"]
     assert "required_sdks" in output["pyinstaller"]
     assert "verified_version" in output["pyinstaller"]
+
+
+def test_compatibility_matrix_and_cli_json_are_schema_versioned(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    matrix = compatibility_matrix()
+    assert matrix["schema_version"] == COMPATIBILITY_SCHEMA_VERSION
+    assert matrix["kind"] == COMPATIBILITY_KIND
+    assert matrix["host_platform"]
+    entries = {entry["backend"]: entry for entry in matrix["entries"]}
+    assert entries["pyinstaller"]["artifact"]["type"] == "windows-pe"
+    assert entries["wat2wasm"]["artifact"]["type"] == "wasm-module"
+    assert entries["pkg"]["lifecycle"] == "deprecated"
+    assert entries["pkg"]["default"] is False
+
+    assert cli_main(["compatibility", "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["schema_version"] == COMPATIBILITY_SCHEMA_VERSION
+    assert {entry["backend"] for entry in output["entries"]} >= {
+        "pyinstaller",
+        "wat2wasm",
+    }
+
+
+def test_version_source_and_release_metadata_are_synchronized() -> None:
+    root = Path(__file__).resolve().parents[1]
+    version_document = json.loads(
+        (root / "version.json").read_text(encoding="utf-8")
+    )
+    assert version_document["version"] == APP_VERSION
+    assert version_document["schema_version"] == "uc.version.v1"
+    assert json.loads(
+        (root / "vscode-extension" / "package.json").read_text(encoding="utf-8")
+    )["version"] == APP_VERSION
+
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    assert f"version-{APP_VERSION}-green" in readme
+    assert f"alt=\"Version {APP_VERSION}\"" in readme
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert f"## [v{APP_VERSION}] - " in changelog
+    assert not re.search(r"## \[v[^]]+\] - (?:%Y|.*->)", changelog)
+
+    python_shell = (root / "UniversalCompiler.py").read_text(encoding="utf-8")
+    powershell = (root / "UniversalCompiler.ps1").read_text(encoding="utf-8")
+    assert "APP_VERSION = CORE_APP_VERSION" in python_shell
+    assert "version.json" in powershell
+    assert "$script:AppVersion = \"2.1.0\"" not in powershell
 
 
 def test_github_actions_template_is_language_specific(tmp_path: Path) -> None:

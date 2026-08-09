@@ -53,13 +53,41 @@ except ImportError:  # pragma: no cover - POSIX uses fcntl.
     _msvcrt = None
 
 APP_NAME = "Universal Compiler"
-APP_VERSION = "2.1.0"
+VERSION_SCHEMA_VERSION = "uc.version.v1"
+VERSION_KIND = "universal-compiler.version"
+VERSION_FILENAME = "version.json"
+_SEMVER_PATTERN = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+
+
+def _load_app_version() -> str:
+    """Load and validate the repository's single application version source."""
+
+    version_path = Path(__file__).resolve().with_name(VERSION_FILENAME)
+    try:
+        payload = json.loads(version_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Unable to load {VERSION_FILENAME}: {error}") from error
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("schema_version") != VERSION_SCHEMA_VERSION
+        or payload.get("kind") != VERSION_KIND
+    ):
+        raise RuntimeError(f"Invalid {VERSION_FILENAME} schema")
+    version = payload.get("version")
+    if not isinstance(version, str) or not _SEMVER_PATTERN.fullmatch(version):
+        raise RuntimeError(f"Invalid application version in {VERSION_FILENAME}")
+    return version
+
+
+APP_VERSION = _load_app_version()
 I18N_SCHEMA_VERSION = "uc.i18n.v1"
 DEFAULT_LOCALE = "en"
 I18N_CATALOG_FILENAME = "catalog.json"
 REQUEST_SCHEMA_VERSION = "uc.request.v1"
 RESULT_SCHEMA_VERSION = "uc.result.v1"
 CAPABILITY_SCHEMA_VERSION = "uc.capability.v1"
+COMPATIBILITY_SCHEMA_VERSION = "uc.compatibility.v1"
+COMPATIBILITY_KIND = "universal-compiler.compatibility"
 ARTIFACT_MANIFEST_SCHEMA_VERSION = "uc.artifact-manifest.v1"
 PROJECT_MANIFEST_SCHEMA_VERSION = "uc.project.v1"
 PROJECT_MANIFEST_KIND = "universal-compiler.project"
@@ -536,6 +564,117 @@ BACKEND_CATALOG: dict[str, dict[str, Any]] = {
         "name": "UPX compressor", "extensions": (), "status": "optional",
         "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
         "architectures": ("native",), "required_sdks": ("UPX",),
+    },
+}
+
+BACKEND_ARTIFACT_POLICIES: dict[str, dict[str, str]] = {
+    "ps2exe": {
+        "type": "windows-pe",
+        "runtime": "PowerShell runtime selected by PS2EXE",
+        "assets": "Source and declared assets follow PS2EXE packaging rules",
+        "verification": "Static PE/container structure and optional sidecar",
+    },
+    "pyinstaller": {
+        "type": "windows-pe",
+        "runtime": "Python runtime is bundled by PyInstaller",
+        "assets": "Imports and data files must be collected by the packaging plan",
+        "verification": "Static PE/container structure and optional sidecar",
+    },
+    "nuitka": {
+        "type": "windows-pe",
+        "runtime": "Compiled Python code plus toolchain/runtime dependencies",
+        "assets": "Dynamic imports and data files remain packaging inputs",
+        "verification": "Static PE/container structure and optional sidecar",
+    },
+    "iexpress": {
+        "type": "windows-self-extracting-package",
+        "runtime": "Payload runtime is external to the package wrapper",
+        "assets": "The payload archive is the explicit asset boundary",
+        "verification": "Static PE/container structure and optional sidecar",
+    },
+    "bun": {
+        "type": "platform-executable",
+        "runtime": "Bun JavaScript runtime is bundled by the selected target",
+        "assets": "Runtime assets and dynamic modules follow Bun compile rules",
+        "verification": "Static executable/container structure and optional sidecar",
+    },
+    "deno": {
+        "type": "platform-executable",
+        "runtime": "Deno JavaScript runtime is bundled by the selected target",
+        "assets": "Permissions, imports, and assets follow Deno compile rules",
+        "verification": "Static executable/container structure and optional sidecar",
+    },
+    "pkg": {
+        "type": "platform-executable",
+        "runtime": "Node.js runtime is bundled by the archived pkg toolchain",
+        "assets": "Dynamic modules and assets require explicit pkg configuration",
+        "verification": "Static executable/container structure and optional sidecar",
+    },
+    "ahk2exe": {
+        "type": "windows-pe",
+        "runtime": "AutoHotkey runtime is embedded by Ahk2Exe",
+        "assets": "Included script resources follow Ahk2Exe packaging rules",
+        "verification": "Static PE/container structure and optional sidecar",
+    },
+    "csc": {
+        "type": "managed-executable",
+        "runtime": ".NET Framework/runtime dependencies remain framework-dependent",
+        "assets": "Referenced assemblies and data files are external deployment inputs",
+        "verification": "Static PE/container structure and optional sidecar",
+    },
+    "go": {
+        "type": "platform-executable",
+        "runtime": "Native Go runtime and platform libraries",
+        "assets": "External files and platform services remain deployment inputs",
+        "verification": "Static executable/container structure and optional sidecar",
+    },
+    "ocra": {
+        "type": "windows-pe",
+        "runtime": "Ruby runtime is bundled according to Ocra packaging rules",
+        "assets": "Ruby dependencies and data files require explicit collection",
+        "verification": "Static PE/container structure and optional sidecar",
+    },
+    "rust": {
+        "type": "platform-executable",
+        "runtime": "Native Rust runtime and platform libraries",
+        "assets": "External files and platform services remain deployment inputs",
+        "verification": "Static executable/container structure and optional sidecar",
+    },
+    "srlua": {
+        "type": "windows-pe",
+        "runtime": "Lua interpreter is embedded by the srlua toolchain",
+        "assets": "Lua modules and data files require explicit collection",
+        "verification": "Static PE/container structure and optional sidecar",
+    },
+    "luastatic": {
+        "type": "windows-pe",
+        "runtime": "Lua interpreter is linked by the luastatic toolchain",
+        "assets": "Lua modules and data files require explicit collection",
+        "verification": "Static PE/container structure and optional sidecar",
+    },
+    "perl-pp": {
+        "type": "windows-pe",
+        "runtime": "Perl runtime is bundled according to PAR::Packer rules",
+        "assets": "Perl modules and data files require explicit collection",
+        "verification": "Static PE/container structure and optional sidecar",
+    },
+    "kotlin-native": {
+        "type": "platform-executable",
+        "runtime": "Kotlin/Native runtime and target libraries",
+        "assets": "External files and platform services remain deployment inputs",
+        "verification": "Static executable/container structure and optional sidecar",
+    },
+    "wat2wasm": {
+        "type": "wasm-module",
+        "runtime": "A WebAssembly host or WASI runtime is required",
+        "assets": "Imports, host APIs, and data files remain external",
+        "verification": "Static WebAssembly sections and optional sidecar",
+    },
+    "upx": {
+        "type": "compressed-executable-transform",
+        "runtime": "The input artifact's runtime is unchanged",
+        "assets": "The input artifact and its deployment assets remain authoritative",
+        "verification": "Static container/PE structure and optional sidecar",
     },
 }
 
@@ -3001,6 +3140,44 @@ def backend_status(
             "adapter_policy": ADAPTER_POLICY_VERSION,
         }
     return status
+
+
+def compatibility_matrix(
+    adapters: Sequence[AdapterDescriptor] | None = None,
+) -> dict[str, Any]:
+    """Return the generated compatibility and artifact-policy matrix.
+
+    Availability is probed at invocation time without installing or executing
+    a source artifact.  The matrix keeps lifecycle, host/target constraints,
+    and artifact/runtime boundaries together so consumers do not infer a
+    universal executable contract from a source extension alone.
+    """
+
+    capabilities = backend_status(adapters)
+    entries: list[dict[str, Any]] = []
+    for backend, capability in sorted(capabilities.items()):
+        entry = dict(capability)
+        entry["artifact"] = dict(
+            BACKEND_ARTIFACT_POLICIES.get(
+                backend,
+                {
+                    "type": "adapter-defined",
+                    "runtime": "Defined by the external adapter",
+                    "assets": "Defined by the external adapter contract",
+                    "verification": "Static verification required by the adapter contract",
+                },
+            )
+        )
+        entries.append(entry)
+    return {
+        "schema_version": COMPATIBILITY_SCHEMA_VERSION,
+        "kind": COMPATIBILITY_KIND,
+        "generated_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "host_platform": "windows" if os.name == "nt" else sys.platform,
+        "entries": entries,
+    }
 
 
 def _target_for(backend: str, architecture: str, platform: str = "native") -> str:
@@ -5658,6 +5835,12 @@ def create_cli_parser() -> argparse.ArgumentParser:
     list_parser.add_argument("--adapter", action="append", default=[])
     list_parser.add_argument("--json", action="store_true")
 
+    compatibility_parser = subparsers.add_parser(
+        "compatibility", help="Generate the host and artifact compatibility matrix"
+    )
+    compatibility_parser.add_argument("--adapter", action="append", default=[])
+    compatibility_parser.add_argument("--json", action="store_true")
+
     init_parser = subparsers.add_parser(
         "init-profiles", help="Create a starter YAML profile file"
     )
@@ -5841,6 +6024,28 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                 for key, item in status_value.items()
             )
         )
+        return 0
+    if args.command == "compatibility":
+        try:
+            matrix = compatibility_matrix(discover_adapters(args.adapter or None))
+        except BuildValidationError as error:
+            _cli_error(catalog, error)
+            return 1
+        if args.json:
+            print(json.dumps(matrix, indent=2))
+        else:
+            print(
+                "\n".join(
+                    (
+                        f"{entry['backend']}: {entry['lifecycle']}; "
+                        f"{'available' if entry['available'] else 'missing'}; "
+                        f"host={'yes' if entry['host_supported'] else 'no'}; "
+                        f"targets={','.join(entry['target_platforms'])}; "
+                        f"artifact={entry['artifact']['type']}"
+                    )
+                    for entry in matrix["entries"]
+                )
+            )
         return 0
     if args.command == "manifest":
         destination = (
@@ -6208,6 +6413,9 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "APP_NAME",
     "APP_VERSION",
+    "VERSION_FILENAME",
+    "VERSION_KIND",
+    "VERSION_SCHEMA_VERSION",
     "DEFAULT_LOCALE",
     "I18N_CATALOG_FILENAME",
     "I18N_SCHEMA_VERSION",
@@ -6221,6 +6429,7 @@ __all__ = [
     "ARTIFACT_MANIFEST_SCHEMA_VERSION",
     "BACKEND_NAMES",
     "BACKEND_CATALOG",
+    "BACKEND_ARTIFACT_POLICIES",
     "BuildAnalytics",
     "BuildPlan",
     "BuildRequest",
@@ -6228,6 +6437,8 @@ __all__ = [
     "BuildValidationError",
     "StateLockError",
     "CAPABILITY_SCHEMA_VERSION",
+    "COMPATIBILITY_KIND",
+    "COMPATIBILITY_SCHEMA_VERSION",
     "CommandResult",
     "CompilerEngine",
     "DIAGNOSTICS_KIND",
@@ -6251,6 +6462,7 @@ __all__ = [
     "MessageCatalog",
     "VerificationResult",
     "backend_status",
+    "compatibility_matrix",
     "artifact_manifest_path",
     "adapter_catalog",
     "adapter_diagnostics",
