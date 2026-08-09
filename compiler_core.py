@@ -451,6 +451,8 @@ PROJECT_MANIFEST_PROFILE_FIELDS = frozenset(
         "copyright",
         "description",
         "product",
+        "assets",
+        "permissions",
         "prefetch",
         "verify",
         "cache",
@@ -485,6 +487,16 @@ BACKEND_CATALOG: dict[str, dict[str, Any]] = {
         "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
         "architectures": ("native", "x86", "x64", "arm64"), "required_sdks": ("Python",),
     },
+    "python-zipapp": {
+        "name": "Python zipapp", "extensions": ("py", "pyw"), "status": "experimental",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows", "linux", "darwin"),
+        "architectures": ("native",), "required_sdks": ("Python",), "auto_select": False,
+    },
+    "pex": {
+        "name": "Python PEX", "extensions": ("py", "pyw"), "status": "experimental",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows", "linux", "darwin"),
+        "architectures": ("native",), "required_sdks": ("Python", "PEX"), "auto_select": False,
+    },
     "nuitka": {
         "name": "Python Nuitka", "extensions": ("py", "pyw"), "status": "stable",
         "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
@@ -509,6 +521,12 @@ BACKEND_CATALOG: dict[str, dict[str, Any]] = {
         "name": "Node.js pkg", "extensions": ("js",), "status": "deprecated",
         "host_platforms": ("windows",), "target_platforms": ("native", "windows", "linux", "darwin"),
         "architectures": ("native", "x86", "x64", "arm64"), "required_sdks": ("Node.js",),
+    },
+    "node-sea": {
+        "name": "Node.js Single Executable Applications", "extensions": ("js",), "status": "experimental",
+        "host_platforms": ("windows",), "target_platforms": ("native", "windows"),
+        "architectures": ("native", "x64", "arm64"), "required_sdks": ("Node.js", "postject"),
+        "auto_select": False,
     },
     "ahk2exe": {
         "name": "AutoHotkey Ahk2Exe", "extensions": ("ahk",), "status": "stable",
@@ -557,7 +575,7 @@ BACKEND_CATALOG: dict[str, dict[str, Any]] = {
     },
     "wat2wasm": {
         "name": "WebAssembly wat2wasm", "extensions": ("wat",), "status": "stable",
-        "host_platforms": ("windows",), "target_platforms": ("native", "wasm"),
+        "host_platforms": ("windows",), "target_platforms": ("native", "wasm", "wasi"),
         "architectures": ("native",), "required_sdks": ("WABT",),
     },
     "upx": {
@@ -579,6 +597,18 @@ BACKEND_ARTIFACT_POLICIES: dict[str, dict[str, str]] = {
         "runtime": "Python runtime is bundled by PyInstaller",
         "assets": "Imports and data files must be collected by the packaging plan",
         "verification": "Static PE/container structure and optional sidecar",
+    },
+    "python-zipapp": {
+        "type": "python-zipapp",
+        "runtime": "The invoking Python interpreter supplies the runtime",
+        "assets": "Declared files are copied into the archive under assets/",
+        "verification": "Static ZIP structure and optional sidecar",
+    },
+    "pex": {
+        "type": "python-pex",
+        "runtime": "PEX selects or bootstraps a Python runtime at launch",
+        "assets": "Declared files are copied into the PEX source tree under assets/",
+        "verification": "Static ZIP structure and optional sidecar",
     },
     "nuitka": {
         "type": "windows-pe",
@@ -609,6 +639,12 @@ BACKEND_ARTIFACT_POLICIES: dict[str, dict[str, str]] = {
         "runtime": "Node.js runtime is bundled by the archived pkg toolchain",
         "assets": "Dynamic modules and assets require explicit pkg configuration",
         "verification": "Static executable/container structure and optional sidecar",
+    },
+    "node-sea": {
+        "type": "platform-executable",
+        "runtime": "Node.js runtime is embedded through SEA and postject",
+        "assets": "Declared files are encoded in the SEA assets map",
+        "verification": "Static PE/container structure and optional sidecar",
     },
     "ahk2exe": {
         "type": "windows-pe",
@@ -677,6 +713,21 @@ BACKEND_ARTIFACT_POLICIES: dict[str, dict[str, str]] = {
         "verification": "Static container/PE structure and optional sidecar",
     },
 }
+
+
+def artifact_policy_for_backend(backend: str) -> dict[str, str]:
+    """Return an immutable-shaped artifact policy for a backend identifier."""
+
+    policy = BACKEND_ARTIFACT_POLICIES.get(
+        backend,
+        {
+            "type": "adapter-defined",
+            "runtime": "Defined by the external adapter",
+            "assets": "Defined by the external adapter contract",
+            "verification": "Static verification required by the adapter contract",
+        },
+    )
+    return {str(key): str(value) for key, value in policy.items()}
 
 EXTENSION_BACKENDS: dict[str, tuple[str, ...]] = {}
 for _backend_name, _backend_spec in BACKEND_CATALOG.items():
@@ -1110,6 +1161,8 @@ class BuildRequest:
     admin: bool = False
     single_file: bool = True
     icon: Path | None = None
+    assets: tuple[Path, ...] = ()
+    permissions: tuple[str, ...] = ()
     metadata: Mapping[str, str] = field(default_factory=dict)
     profile_name: str = "Default"
     prefetch: bool = False
@@ -1150,6 +1203,12 @@ class BuildRequest:
             admin=bool(self.admin),
             single_file=bool(self.single_file),
             icon=icon,
+            assets=tuple(Path(value).expanduser() for value in self.assets),
+            permissions=tuple(
+                str(value).strip().lower()
+                for value in self.permissions
+                if str(value).strip()
+            ),
             metadata=metadata,
             profile_name=self.profile_name,
             prefetch=bool(self.prefetch),
@@ -1400,6 +1459,8 @@ class BuildResult:
         result["request"]["icon"] = (
             str(self.request.icon) if self.request.icon else None
         )
+        result["request"]["assets"] = [str(asset) for asset in self.request.assets]
+        result["request"]["permissions"] = list(self.request.permissions)
         result["request"]["dependency_lockfile"] = (
             str(self.request.dependency_lockfile)
             if self.request.dependency_lockfile
@@ -1433,6 +1494,7 @@ class BuildPlan:
     artifact_candidates: tuple[Path, ...] = ()
     cleanup_paths: tuple[Path, ...] = ()
     environment: Mapping[str, str] = field(default_factory=dict)
+    post_commands: tuple[tuple[str, ...], ...] = ()
 
 
 class BackendAdapter(Protocol):
@@ -1467,6 +1529,7 @@ class AdapterDescriptor:
     name: str
     extensions: tuple[str, ...]
     lifecycle: str = "experimental"
+    auto_select: bool = True
     host_platforms: tuple[str, ...] = ("windows",)
     target_platforms: tuple[str, ...] = ("native",)
     architectures: tuple[str, ...] = ("native",)
@@ -1530,6 +1593,7 @@ def _builtin_adapter_descriptors() -> tuple[AdapterDescriptor, ...]:
             name=backend,
             extensions=tuple(str(value) for value in spec["extensions"]),
             lifecycle=str(spec["status"]),
+            auto_select=bool(spec.get("auto_select", spec["status"] == "stable")),
             host_platforms=tuple(str(value) for value in spec["host_platforms"]),
             target_platforms=tuple(str(value) for value in spec["target_platforms"]),
             architectures=tuple(str(value) for value in spec["architectures"]),
@@ -2177,6 +2241,11 @@ def validate_project_manifest(
             raise BuildValidationError(
                 f"Manifest field profiles.{name}.extra_args must be an array"
             )
+        for declaration_key in ("assets", "permissions"):
+            if not isinstance(base.get(declaration_key, []), (list, tuple)):
+                raise BuildValidationError(
+                    f"Manifest field profiles.{name}.{declaration_key} must be an array"
+                )
         for path_key in (
             "dependency_lockfile",
             "dependency_cache_dir",
@@ -2187,6 +2256,8 @@ def validate_project_manifest(
                     f"Manifest field profiles.{name}.{path_key} must be a string or null"
                 )
         base["extra_args"] = [str(item) for item in base.get("extra_args", [])]
+        base["assets"] = [str(item) for item in base.get("assets", [])]
+        base["permissions"] = [str(item) for item in base.get("permissions", [])]
         base["toolchain_versions"] = {
             str(key): str(value)
             for key, value in dict(base.get("toolchain_versions", {})).items()
@@ -2996,10 +3067,13 @@ def resolve_backend_executable(backend: str) -> str | None:
     direct = {
         "pyinstaller": ("pyinstaller",),
         "nuitka": (),
+        "python-zipapp": (),
+        "pex": ("pex",),
         "iexpress": (),
         "bun": ("bun",),
         "pkg": ("pkg",),
         "deno": ("deno",),
+        "node-sea": ("node",),
         "csc": (),
         "go": ("go",),
         "ocra": ("ocra",),
@@ -3034,6 +3108,15 @@ def resolve_backend_executable(backend: str) -> str | None:
         return next((str(path) for path in csc_candidates if path.exists()), None)
     if backend == "nuitka":
         return sys.executable if importlib.util.find_spec("nuitka") else None
+    if backend == "python-zipapp":
+        return sys.executable
+    if backend == "pex":
+        return _find_first(("pex",)) or (
+            sys.executable if importlib.util.find_spec("pex") else None
+        )
+    if backend == "node-sea":
+        node = _find_first(("node",))
+        return node if node and _find_first(("postject",)) else None
     names = direct.get(backend)
     return _find_first(names) if names else None
 
@@ -3066,6 +3149,8 @@ def _verified_backend_version(backend: str) -> str | None:
     command: tuple[str, ...]
     if backend == "nuitka":
         command = (sys.executable, "-m", "nuitka", "--version")
+    elif backend == "pex" and executable == sys.executable:
+        command = (sys.executable, "-m", "pex", "--version")
     elif backend == "ps2exe":
         command = (
             executable,
@@ -3108,7 +3193,10 @@ def backend_status(
             "target_platforms": list(spec["target_platforms"]),
             "architectures": list(spec["architectures"]),
             "required_sdks": list(spec["required_sdks"]),
-            "default": backend != "pkg",
+            "artifact": artifact_policy_for_backend(backend),
+            "default": bool(
+                spec.get("auto_select", spec["status"] == "stable")
+            ),
             "verified_version": _verified_backend_version(backend),
         }
     for adapter in adapter_catalog(adapters).values():
@@ -3126,6 +3214,7 @@ def backend_status(
             "name": adapter.name,
             "namespace": adapter.namespace,
             "lifecycle": adapter.lifecycle,
+            "auto_select": adapter.auto_select,
             "available": bool(identity.get("available", True)),
             "executable": identity.get("executable"),
             "extensions": list(adapter.extensions),
@@ -3134,7 +3223,8 @@ def backend_status(
             "target_platforms": list(adapter.target_platforms),
             "architectures": list(adapter.architectures),
             "required_sdks": list(adapter.required_sdks),
-            "default": adapter.lifecycle != "deprecated",
+            "artifact": artifact_policy_for_backend(adapter.backend_id),
+            "default": adapter.auto_select and adapter.lifecycle != "deprecated",
             "verified_version": identity.get("version"),
             "adapter_api": adapter.api_version,
             "adapter_policy": ADAPTER_POLICY_VERSION,
@@ -3157,17 +3247,7 @@ def compatibility_matrix(
     entries: list[dict[str, Any]] = []
     for backend, capability in sorted(capabilities.items()):
         entry = dict(capability)
-        entry["artifact"] = dict(
-            BACKEND_ARTIFACT_POLICIES.get(
-                backend,
-                {
-                    "type": "adapter-defined",
-                    "runtime": "Defined by the external adapter",
-                    "assets": "Defined by the external adapter contract",
-                    "verification": "Static verification required by the adapter contract",
-                },
-            )
-        )
+        entry["artifact"] = artifact_policy_for_backend(backend)
         entries.append(entry)
     return {
         "schema_version": COMPATIBILITY_SCHEMA_VERSION,
@@ -3233,6 +3313,42 @@ def _target_for(backend: str, architecture: str, platform: str = "native") -> st
 
 def _metadata(request: BuildRequest, key: str) -> str:
     return str(request.metadata.get(key, ""))
+
+
+def _stage_declared_assets(request: BuildRequest, destination: Path) -> None:
+    """Copy declared asset files into a deterministic portable artifact tree."""
+
+    if not request.assets:
+        return
+    asset_root = destination / "assets"
+    asset_root.mkdir(parents=True, exist_ok=True)
+    names: set[str] = set()
+    for asset in request.assets:
+        name = asset.name
+        if not name or name in names:
+            raise BuildValidationError(
+                f"Declared asset names must be unique: {name or asset}"
+            )
+        names.add(name)
+        shutil.copy2(asset, asset_root / name)
+
+
+def _deno_permission_arguments(permissions: Sequence[str]) -> tuple[str, ...]:
+    """Translate declared permissions to Deno compile flags."""
+
+    supported = {"read", "write", "net", "env", "run", "ffi", "sys"}
+    flags: list[str] = []
+    for permission in permissions:
+        name, separator, scope = permission.partition("=")
+        if name == "all" and not separator:
+            flags.append("--allow-all")
+            continue
+        if name not in supported:
+            raise BuildValidationError(
+                f"Deno does not support declared permission: {permission}"
+            )
+        flags.append(f"--allow-{name}{f'={scope}' if separator else ''}")
+    return tuple(flags)
 
 
 def _write_pyinstaller_version_file(path: Path, metadata: Mapping[str, str]) -> None:
@@ -3363,7 +3479,8 @@ class CompilerEngine:
         auto_choices = tuple(
             backend
             for backend in choices
-            if self.adapters[backend].lifecycle != "deprecated"
+            if self.adapters[backend].auto_select
+            and self.adapters[backend].lifecycle != "deprecated"
         )
         for backend in auto_choices:
             adapter = self.adapters[backend]
@@ -3416,6 +3533,8 @@ class CompilerEngine:
             return None
         if backend == "nuitka":
             return (sys.executable, "-m", "nuitka", "--version")
+        if backend == "pex" and executable == sys.executable:
+            return (sys.executable, "-m", "pex", "--version")
         if backend == "ps2exe":
             return (
                 executable,
@@ -3446,6 +3565,12 @@ class CompilerEngine:
         self, request: BuildRequest, allow_missing_source: bool = False
     ) -> BuildRequest:
         normalized = request.normalized()
+        normalized = replace(
+            normalized,
+            source=normalized.source.resolve(),
+            output=normalized.output.resolve(),
+            assets=tuple(asset.resolve() for asset in normalized.assets),
+        )
         if not normalized.file_type:
             suffix = normalized.source.suffix.lower().lstrip(".")
             adapter_extensions = {
@@ -3472,6 +3597,25 @@ class CompilerEngine:
             raise BuildValidationError(f"Source file not found: {normalized.source}")
         if normalized.icon and not normalized.icon.is_file():
             raise BuildValidationError(f"Icon file not found: {normalized.icon}")
+        asset_names: set[str] = set()
+        for asset in normalized.assets:
+            if asset.name in asset_names:
+                raise BuildValidationError(
+                    f"Declared asset names must be unique: {asset.name}"
+                )
+            asset_names.add(asset.name)
+            if not allow_missing_source:
+                if not asset.is_file():
+                    raise BuildValidationError(f"Declared asset file not found: {asset}")
+                if asset.resolve() == normalized.output.resolve():
+                    raise BuildValidationError("Declared asset cannot be the output artifact")
+        if any(
+            not re.fullmatch(r"[a-z][a-z0-9_-]*(?:=[^\x00]+)?", permission)
+            for permission in normalized.permissions
+        ):
+            raise BuildValidationError(
+                "Permissions must use names such as read, write, net, or env"
+            )
         backend = self.choose_backend(normalized.file_type, normalized.backend)
         if not backend:
             if normalized.backend != "auto":
@@ -3479,6 +3623,19 @@ class CompilerEngine:
                     f"Backend {normalized.backend} is not compatible with .{normalized.file_type}"
                 )
             raise BuildValidationError(f"No backend supports .{normalized.file_type}")
+        output_suffix = normalized.output.suffix.lower()
+        expected_suffixes = {
+            "python-zipapp": {".pyz", ".zip"},
+            "pex": {".pex", ".zip"},
+            "wat2wasm": {".wasm"},
+            "node-sea": {".exe"},
+        }
+        if backend in expected_suffixes and output_suffix not in expected_suffixes[backend]:
+            expected = ", ".join(sorted(expected_suffixes[backend]))
+            raise BuildValidationError(
+                f"Backend {backend} requires an output suffix of {expected}; "
+                f"got {normalized.output.suffix or '<none>'}"
+            )
         self._validate_capability(normalized, backend)
         if normalized.backend == "auto" or normalized.backend != backend:
             normalized = replace(normalized, backend=backend)
@@ -3572,6 +3729,14 @@ class CompilerEngine:
                 "icon_hash": sha256_file(request.icon)
                 if request.icon and request.icon.exists()
                 else None,
+                "assets": [
+                    {
+                        "path": str(asset.resolve()),
+                        "sha256": sha256_file(asset),
+                    }
+                    for asset in request.assets
+                ],
+                "permissions": list(request.permissions),
                 "metadata": dict(request.metadata),
                 "extra_args": list(request.extra_args),
                 "toolchain_versions": dict(request.toolchain_versions),
@@ -3652,6 +3817,15 @@ class CompilerEngine:
                 "single_file": request.single_file,
                 "profile": request.profile_name,
                 "icon": str(request.icon.resolve()) if request.icon else None,
+                "assets": [
+                    {
+                        "path": str(asset.resolve()),
+                        "sha256": sha256_file(asset),
+                        "size_bytes": asset.stat().st_size,
+                    }
+                    for asset in request.assets
+                ],
+                "permissions": list(request.permissions),
                 "metadata": {
                     str(key): redact_text(str(value))
                     for key, value in request.metadata.items()
@@ -3672,7 +3846,13 @@ class CompilerEngine:
                 "allow_dependency_install": request.allow_dependency_install,
             },
             "artifact": {
+                "family": plan.backend,
+                "policy": artifact_policy_for_backend(plan.backend),
                 "path": str(output),
+                "target": request.target,
+                "architecture": request.architecture,
+                "declared_assets": [str(asset.resolve()) for asset in request.assets],
+                "declared_permissions": list(request.permissions),
                 "output_type": verification.kind
                 if verification
                 else output.suffix.lower().lstrip(".") or "file",
@@ -3746,6 +3926,7 @@ class CompilerEngine:
         cleanup: list[Path] = []
         candidates: list[Path] = [output]
         environment: dict[str, str] = {}
+        post_commands: tuple[tuple[str, ...], ...] = ()
         target = _target_for(backend, request.architecture, request.target)
         command: tuple[str, ...]
 
@@ -3808,6 +3989,40 @@ class CompilerEngine:
                 pyinstaller_command_parts.extend(("--version-file", str(version_file)))
             pyinstaller_command_parts.extend((str(source), *request.extra_args))
             command = tuple(pyinstaller_command_parts)
+        elif backend == "python-zipapp":
+            work = output.parent / ".uc-build" / output.stem
+            if not allow_missing_source:
+                work.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, work / "__main__.py")
+                _stage_declared_assets(request, work)
+            cleanup.append(work)
+            command = (
+                sys.executable,
+                "-m",
+                "zipapp",
+                str(work),
+                "-o",
+                str(output),
+                *request.extra_args,
+            )
+        elif backend == "pex":
+            work = output.parent / ".uc-build" / output.stem
+            if not allow_missing_source:
+                work.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, work / "__main__.py")
+                _stage_declared_assets(request, work)
+            cleanup.append(work)
+            pex_executable = resolve_backend_executable("pex")
+            pex_command = (
+                [sys.executable, "-m", "pex"]
+                if not pex_executable or pex_executable == sys.executable
+                else [pex_executable]
+            )
+            command = tuple(
+                pex_command
+                + ["-D", str(work), "-o", str(output), "-m", "__main__"]
+                + list(request.extra_args)
+            )
         elif backend == "nuitka":
             work = output.parent / ".uc-build" / output.stem
             if not allow_missing_source:
@@ -3847,7 +4062,7 @@ class CompilerEngine:
                 nuitka_command_parts.append(f"--copyright={_metadata(request, 'copyright')}")
             nuitka_command_parts.extend((str(source), *request.extra_args))
             command = tuple(nuitka_command_parts)
-        elif backend in {"bun", "pkg", "deno"}:
+        elif backend in {"bun", "pkg", "deno", "node-sea"}:
             command_parts: list[str]
             if backend == "bun":
                 command_parts = [
@@ -3858,6 +4073,8 @@ class CompilerEngine:
                     "--outfile",
                     str(output),
                 ]
+                for asset in request.assets:
+                    command_parts.extend(("--asset", str(asset)))
                 if target != "native":
                     command_parts.extend(("--target", target))
             elif backend == "pkg":
@@ -3869,8 +4086,47 @@ class CompilerEngine:
                     "--output",
                     str(output),
                 ]
+            elif backend == "node-sea":
+                node = _find_first(("node",)) or "node"
+                postject = _find_first(("postject",)) or "postject"
+                blob = output.with_suffix(".sea.blob")
+                config = output.with_suffix(".sea-config.json")
+                cleanup.extend((blob, config))
+                if not allow_missing_source:
+                    assets = {
+                        asset.name: str(asset.resolve()) for asset in request.assets
+                    }
+                    config.write_text(
+                        json.dumps(
+                            {
+                                "main": str(source),
+                                "output": str(blob),
+                                "disableExperimentalSEAWarning": True,
+                                "useCodeCache": True,
+                                "assets": assets,
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                    if Path(node).is_file():
+                        shutil.copy2(node, output)
+                command_parts = [node, "--experimental-sea-config", str(config)]
+                post_commands = (
+                    (
+                        postject,
+                        str(output),
+                        "NODE_SEA_BLOB",
+                        str(blob),
+                        "--sentinel-fuse",
+                        "NODE_SEA_FUSE",
+                    ),
+                )
             else:
                 command_parts = [executable, "compile", "--output", str(output)]
+                for asset in request.assets:
+                    command_parts.extend(("--include", str(asset)))
+                command_parts.extend(_deno_permission_arguments(request.permissions))
                 if target != "native":
                     command_parts.extend(("--target", target))
                 command_parts.append(str(source))
@@ -3995,6 +4251,7 @@ class CompilerEngine:
             artifact_candidates=tuple(candidates),
             cleanup_paths=tuple(cleanup),
             environment=environment,
+            post_commands=post_commands,
         )
 
     def prefetch_dependencies(
@@ -4201,32 +4458,36 @@ class CompilerEngine:
                         ),
                         duration_seconds=time.monotonic() - started,
                     )
-            result = self._run(
-                staged_request,
-                plan.command,
-                cwd=plan.cwd,
-                environment=plan.environment,
-                phase="compile",
+            planned_commands = ((plan.command, "compile"),) + tuple(
+                (command, "postprocess") for command in plan.post_commands
             )
-            commands.append(result)
-            if not result.success:
-                status = "cancelled" if result.cancelled else "failed"
-                return BuildResult(
-                    False,
-                    status,
-                    normalized,
-                    normalized.output,
-                    plan.backend,
-                    commands=commands,
-                    source_hash=source_hash,
-                    cache_key=cache_key,
-                    message=(
-                        "Build cancelled"
-                        if result.cancelled
-                        else result.output or "Compiler command failed"
-                    ),
-                    duration_seconds=time.monotonic() - started,
+            for command, phase in planned_commands:
+                result = self._run(
+                    staged_request,
+                    command,
+                    cwd=plan.cwd,
+                    environment=plan.environment,
+                    phase=phase,
                 )
+                commands.append(result)
+                if not result.success:
+                    status = "cancelled" if result.cancelled else "failed"
+                    return BuildResult(
+                        False,
+                        status,
+                        normalized,
+                        normalized.output,
+                        plan.backend,
+                        commands=commands,
+                        source_hash=source_hash,
+                        cache_key=cache_key,
+                        message=(
+                            f"Build cancelled during {phase}"
+                            if result.cancelled
+                            else result.output or f"{phase.title()} command failed"
+                        ),
+                        duration_seconds=time.monotonic() - started,
+                    )
             if normalized.cancel_event and normalized.cancel_event.is_set():
                 return BuildResult(
                     False,
@@ -4627,7 +4888,7 @@ def _verify_artifact_structure(path: os.PathLike[str] | str) -> VerificationResu
     suffix = artifact.suffix.lower()
     if suffix == ".exe":
         return _verify_pe_structure(artifact, header)
-    if suffix in {".jar", ".zip", ".msix", ".appx"}:
+    if suffix in {".jar", ".zip", ".pyz", ".pex", ".msix", ".appx"}:
         return _verify_zip_structure(artifact)
     if suffix == ".wasm":
         return _verify_wasm_structure(artifact)
@@ -4679,6 +4940,16 @@ def verify_artifact_manifest(
     artifact_record = manifest.get("artifact")
     if not isinstance(artifact_record, Mapping):
         return VerificationResult(False, "manifest", "Manifest has no artifact record")
+    family = artifact_record.get("family")
+    policy = artifact_record.get("policy")
+    if family is not None:
+        if not isinstance(family, str) or not isinstance(policy, Mapping):
+            return VerificationResult(False, "manifest", "Artifact policy record is invalid")
+        if dict(policy) != artifact_policy_for_backend(family):
+            return VerificationResult(False, "manifest", "Artifact policy does not match the capability catalog")
+        for declaration_key in ("declared_assets", "declared_permissions"):
+            if not isinstance(artifact_record.get(declaration_key, []), list):
+                return VerificationResult(False, "manifest", f"Artifact {declaration_key} must be an array")
     recorded_path = Path(str(artifact_record.get("path", "")))
     if not recorded_path.is_absolute():
         recorded_path = manifest_path.parent / recorded_path
@@ -5591,6 +5862,12 @@ jobs:
 def _profile_request(
     profile: Mapping[str, Any], args: argparse.Namespace, source: Path, output: Path
 ) -> BuildRequest:
+    profile_assets = profile.get("assets") or []
+    if isinstance(profile_assets, str):
+        profile_assets = [profile_assets]
+    profile_permissions = profile.get("permissions") or []
+    if isinstance(profile_permissions, str):
+        profile_permissions = [profile_permissions]
     metadata = {
         key: str(profile.get(key, ""))
         for key in ("product", "version", "company", "copyright", "description")
@@ -5618,6 +5895,14 @@ def _profile_request(
         if args.no_single_file
         else bool(profile.get("single_file", True)),
         icon=Path(args.icon) if args.icon else None,
+        assets=tuple(
+            Path(value)
+            for value in [*profile_assets, *(args.asset or [])]
+        ),
+        permissions=tuple(
+            str(value)
+            for value in [*profile_permissions, *(args.permission or [])]
+        ),
         metadata=metadata,
         profile_name=args.profile,
         prefetch=args.prefetch or bool(profile.get("prefetch", False)),
@@ -5687,6 +5972,18 @@ def _add_build_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-single-file", action="store_true")
     parser.add_argument("--icon")
     parser.add_argument("--metadata", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument(
+        "--asset",
+        action="append",
+        default=[],
+        help="Declare a file to embed or package (repeatable; backend-specific)",
+    )
+    parser.add_argument(
+        "--permission",
+        action="append",
+        default=[],
+        help="Declare a runtime permission such as read, write, net, or env (repeatable)",
+    )
     parser.add_argument(
         "--prefetch",
         action="store_true",
@@ -5965,8 +6262,13 @@ def create_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _default_output(source: Path) -> Path:
-    return source.with_suffix(".exe")
+def _default_output(source: Path, backend: str = "auto") -> Path:
+    suffix = {
+        "python-zipapp": ".pyz",
+        "pex": ".pex",
+        "wat2wasm": ".wasm",
+    }.get(str(backend).lower(), ".exe")
+    return source.with_suffix(suffix)
 
 
 def _cli_error(catalog: MessageCatalog, error: BaseException) -> None:
@@ -6304,7 +6606,11 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     if args.command == "build":
         source = Path(args.source).expanduser()
         output = (
-            Path(args.output).expanduser() if args.output else _default_output(source)
+            Path(args.output).expanduser()
+            if args.output
+            else _default_output(
+                source, args.backend or str(profile.get("backend", "auto"))
+            )
         )
         request = _profile_request(profile, args, source, output)
         if args.preview:
@@ -6377,9 +6683,17 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         for source_value in args.sources:
             source = Path(source_value).expanduser()
             output = (
-                (output_dir / f"{source.stem}.exe")
+                (
+                    output_dir
+                    / _default_output(
+                        source,
+                        args.backend or str(profile.get("backend", "auto")),
+                    ).name
+                )
                 if output_dir
-                else _default_output(source)
+                else _default_output(
+                    source, args.backend or str(profile.get("backend", "auto"))
+                )
             )
             requests.append(_profile_request(profile, args, source, output))
         if args.matrix:
@@ -6464,6 +6778,7 @@ __all__ = [
     "backend_status",
     "compatibility_matrix",
     "artifact_manifest_path",
+    "artifact_policy_for_backend",
     "adapter_catalog",
     "adapter_diagnostics",
     "cli_main",

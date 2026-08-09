@@ -24,9 +24,11 @@
 |----------|-----------|-----------------|--------------------------------|
 | PowerShell | `.ps1` | PS2EXE | Stable; capability-gated Windows PE output |
 | Python | `.py`, `.pyw` | PyInstaller / Nuitka | Stable; capability-gated Windows PE output with packaging/runtime inputs |
+| Python portable | `.py`, `.pyw` | zipapp / PEX | Experimental; emits `.pyz`/`.pex` archives that depend on a Python runtime or PEX bootstrap |
 | Batch | `.bat`, `.cmd` | IExpress | Stable; capability-gated self-extracting Windows package |
 | Node.js | `.js` | Bun / Deno | Stable; capability-gated platform executable with bundled runtime semantics |
 | Node.js (legacy) | `.js` | pkg | Deprecated; explicit-only and never auto-selected |
+| Node.js SEA | `.js` | Node SEA + postject | Experimental; explicit-only platform executable with a Node runtime and SEA asset map |
 | TypeScript | `.ts` | Bun | Stable; capability-gated platform executable |
 | C# | `.cs` | CSC (.NET) | Stable; managed executable with framework/deployment dependencies |
 | Go | `.go` | go build | Stable; capability-gated native platform executable |
@@ -37,7 +39,7 @@
 | Lua | `.lua` | srlua / luastatic | Experimental; capability-gated Windows PE packaging |
 | Perl | `.pl`, `.pm` | PAR::Packer | Experimental; capability-gated Windows PE packaging |
 | Kotlin | `.kt`, `.kts` | Kotlin/Native | Experimental; capability-gated native platform executable |
-| WebAssembly Text | `.wat` | wat2wasm | Stable; emits a `.wasm` module requiring a host/WASI runtime, not a Windows EXE |
+| WebAssembly Text | `.wat` | wat2wasm | Stable; emits a `.wasm` module for `wasm`/explicit `wasi` hosting, not a Windows EXE |
 
 The table describes backend policy, not installed-tool availability. Generate
 the current host-specific matrix with `python .\UniversalCompiler.py
@@ -134,8 +136,11 @@ archive or launches an untracked installer. The current catalog pins PS2EXE
 |----------|-----|-------------|
 | PS2EXE | PowerShell scripts | Pinned PowerShell Gallery package, or manual/offline verification |
 | PyInstaller | Python scripts | Pinned pip package, or manual/offline verification |
+| Python zipapp | Portable Python archive | Built into Python; explicit `--backend python-zipapp` |
+| PEX | Portable Python archive | Manual/SDK-managed; capability-gated and experimental |
 | Bun / Deno | JavaScript and TypeScript scripts | Manual/SDK-managed; capability-gated |
 | pkg (legacy) | JavaScript scripts | Deprecated; never selected or installed automatically |
+| Node SEA + postject | JavaScript single executable | Manual/SDK-managed; explicit and experimental |
 | Go | Go scripts | Pinned winget package, or manual/offline verification |
 | Ruby + Ocra | Ruby scripts | Pinned RubyGems package, or manual/offline verification |
 | AutoHotkey | AHK scripts | Pinned winget package, or manual/offline verification |
@@ -208,6 +213,16 @@ python .\UniversalCompiler.py build .\myscript.go --matrix x86 x64 arm64 --jobs 
 # Cross-target Go/Rust/Bun builds when the installed SDK has that target
 python .\UniversalCompiler.py build .\main.go --target linux --arch x64 --output .\dist\main
 
+# Explicit portable Python artifacts; output suffix selects static ZIP verification
+python .\UniversalCompiler.py build .\main.py --backend python-zipapp --output .\dist\main.pyz --asset .\runtime-data.json
+python .\UniversalCompiler.py build .\main.py --backend pex --output .\dist\main.pex
+
+# Deno permissions and assets are declared rather than inferred
+python .\UniversalCompiler.py build .\main.js --backend deno --permission read --permission net --asset .\runtime-data.json
+
+# Node SEA is experimental and requires locally managed Node.js and postject
+python .\UniversalCompiler.py build .\main.js --backend node-sea --preview
+
 # Coalesce watch changes; Ctrl+C cancels the active process tree
 python .\UniversalCompiler.py build .\myscript.py --watch --watch-debounce 0.35
 
@@ -271,6 +286,22 @@ required SDKs, and a structured artifact policy:
   explicit-only and remains in the matrix so migrations can identify it.
 - Optional means the tool transforms an already-built artifact, such as UPX;
   it is not a source compiler.
+
+Portable plans expose repeatable `--asset` and `--permission` declarations.
+Asset paths and SHA-256 identities are recorded in the artifact sidecar;
+Bun passes assets to its compile command, Deno maps supported permissions and
+includes to its compile command, Python zipapp/PEX stage assets under
+`assets/`, and Node SEA writes an explicit SEA asset map. Dynamic imports and
+modules are not guessed from source text: provide backend-specific
+`--extra-arg` values and verify the resulting package. Permissions not
+understood by a backend remain recorded metadata and do not become an implied
+security sandbox.
+
+Python zipapp and PEX are portable archives, not cross-compilers: their target
+names describe the runtime/deployment family and the invoking interpreter or
+PEX bootstrap remains a deployment requirement. Node SEA requires both Node.js
+and `postject` and is explicit/experimental. Archived `pkg` remains visible
+for migration but is excluded from automatic selection.
 
 Windows PE and native/platform executable entries still depend on their
 declared runtime, SDK, library, permission, and asset inputs. A `.wasm` entry

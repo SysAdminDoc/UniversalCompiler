@@ -27,6 +27,7 @@ from compiler_core import (
     BuildValidationError,
     ARTIFACT_MANIFEST_SCHEMA_VERSION,
     BACKEND_CATALOG,
+    BACKEND_ARTIFACT_POLICIES,
     CAPABILITY_SCHEMA_VERSION,
     COMPATIBILITY_KIND,
     COMPATIBILITY_SCHEMA_VERSION,
@@ -990,6 +991,73 @@ def test_capability_registry_rejects_incompatible_backend_and_target(tmp_path: P
     assert BACKEND_CATALOG["pkg"]["status"] == "deprecated"
 
 
+def test_portable_artifact_contract_records_assets_permissions_and_targets(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "main.js"
+    source.write_text("import './dynamic-module.js';\n", encoding="utf-8")
+    asset = tmp_path / "runtime-data.json"
+    asset.write_text('{"enabled":true}\n', encoding="utf-8")
+
+    def fake_runner(command, cwd=None, environment=None, timeout=None):
+        if "--outfile" in command:
+            _fake_pe(Path(command[command.index("--outfile") + 1]))
+        return CommandResult(tuple(command), 0)
+
+    request = BuildRequest(
+        source=source,
+        output=tmp_path / "main.exe",
+        backend="bun",
+        assets=(asset,),
+        permissions=("read", "net"),
+        extra_args=("--external", "dynamic-module.js"),
+    )
+    result = CompilerEngine(runner=fake_runner, require_available=False).build(request)
+    assert result.success is True
+    assert result.manifest is not None
+    manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
+    assert manifest["artifact"]["family"] == "bun"
+    assert manifest["artifact"]["policy"]["type"] == "platform-executable"
+    assert manifest["artifact"]["declared_permissions"] == ["read", "net"]
+    assert manifest["artifact"]["declared_assets"] == [str(asset.resolve())]
+    assert manifest["request"]["assets"][0]["sha256"] == compiler_core.sha256_file(asset)
+    assert "dynamic-module.js" in manifest["request"]["extra_args"]
+    assert verify_artifact_manifest(result.manifest, result.output).passed
+
+    engine = CompilerEngine(require_available=False)
+    with pytest.raises(BuildValidationError, match="does not support target wasi"):
+        engine.plan(
+            BuildRequest(
+                source=source,
+                output=tmp_path / "main.exe",
+                backend="bun",
+                target="wasi",
+            ),
+            allow_missing_source=True,
+        )
+    wasm_plan = engine.plan(
+        BuildRequest(
+            source=tmp_path / "module.wat",
+            output=tmp_path / "module.wasm",
+            backend="wat2wasm",
+            target="wasi",
+        ),
+        allow_missing_source=True,
+    )
+    assert wasm_plan.backend == "wat2wasm"
+    assert "-o" in wasm_plan.command
+    sea_plan = engine.plan(
+        BuildRequest(
+            source=source,
+            output=tmp_path / "main.exe",
+            backend="node-sea",
+        ),
+        allow_missing_source=True,
+    )
+    assert len(sea_plan.post_commands) == 1
+    assert "NODE_SEA_BLOB" in sea_plan.post_commands[0]
+
+
 _BACKEND_PLAN_CASES = tuple(
     (extension, backend)
     for backend, spec in BACKEND_CATALOG.items()
@@ -1015,7 +1083,12 @@ def test_every_catalog_backend_has_a_side_effect_free_plan_contract(
     plan = CompilerEngine(require_available=False).plan(
         BuildRequest(
             source=source,
-            output=tmp_path / "artifact.exe",
+            output=tmp_path
+            / {
+                "python-zipapp": "artifact.pyz",
+                "pex": "artifact.pex",
+                "wat2wasm": "artifact.wasm",
+            }.get(backend, "artifact.exe"),
             file_type=extension,
             backend=backend,
         ),
@@ -1160,8 +1233,20 @@ def test_compatibility_matrix_and_cli_json_are_schema_versioned(
     entries = {entry["backend"]: entry for entry in matrix["entries"]}
     assert entries["pyinstaller"]["artifact"]["type"] == "windows-pe"
     assert entries["wat2wasm"]["artifact"]["type"] == "wasm-module"
+    assert entries["python-zipapp"]["artifact"]["type"] == "python-zipapp"
+    assert entries["pex"]["artifact"]["type"] == "python-pex"
+    assert entries["node-sea"]["artifact"]["type"] == "platform-executable"
+    assert entries["node-sea"]["default"] is False
     assert entries["pkg"]["lifecycle"] == "deprecated"
     assert entries["pkg"]["default"] is False
+    assert set(BACKEND_CATALOG) <= set(BACKEND_ARTIFACT_POLICIES)
+    for entry in entries.values():
+        assert {
+            "type",
+            "runtime",
+            "assets",
+            "verification",
+        } <= set(entry["artifact"])
 
     assert cli_main(["compatibility", "--json"]) == 0
     output = json.loads(capsys.readouterr().out)

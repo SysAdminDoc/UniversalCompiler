@@ -80,6 +80,10 @@ All notable changes to UniversalCompiler will be documented in this file.
   deprecated-backend behavior, a canonical Python CLI quick start, and a
   single `version.json` source for release metadata; document offline,
   privacy, migration, recovery, and unsigned-package boundaries.
+- Add explicit portable artifact policies and sidecar declarations for assets,
+  runtime permissions, dynamic modules, Python zipapp/PEX archives, Node SEA
+  plus postject, Bun/Deno targets, and WASI output; experimental families are
+  opt-in and archived pkg remains excluded from automatic selection.
 
 ## [v0.1.0] - 2026-04-13
 
