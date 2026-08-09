@@ -42,6 +42,10 @@ All notable changes to UniversalCompiler will be documented in this file.
 - Add a versioned `uc.project.v1` manifest with strict validation, explicit
   user/workspace scopes, legacy YAML/JSON migration, atomic backups, rollback,
   and recovery support across the CLI and GUI shells.
+- Add the versioned `uc.adapter.v1` backend/plugin boundary with deterministic,
+  namespaced, allowlisted entry-point discovery, capability metadata, planner
+  contracts, tool identity, and redacted adapter diagnostics; external adapters
+  remain disabled unless explicitly enabled.
 - Require approved, hash-addressed dependency locks for prefetch, enforce
   explicit offline/online mirror and cache policies, and record dependency and
   toolchain snapshots in cache metadata and artifact manifests.

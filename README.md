@@ -167,6 +167,7 @@ python .\UniversalCompiler.py analytics --recent 10
 # Inspect available toolchains or verify an artifact without running it
 python .\UniversalCompiler.py list-toolchains
 python .\UniversalCompiler.py list-toolchains --json
+python .\UniversalCompiler.py list-toolchains --adapter vendor.backend --json
 python .\UniversalCompiler.py inspect .\myscript.py --json
 python .\UniversalCompiler.py verify .\dist\myscript.exe
 python .\UniversalCompiler.py verify .\dist\myscript.exe.manifest.json
@@ -245,6 +246,11 @@ Automatic selection excludes deprecated backends; `pkg` remains available only
 when explicitly requested. The PowerShell GUI also delegates builds to this
 Python CLI and consumes its versioned JSON request/result contract; it remains
 useful as a Windows shell and explicit toolchain setup surface.
+External backend adapters use the versioned `uc.adapter.v1` contract and are
+disabled by default. Enable an installed, namespaced entry point explicitly
+with repeatable `--adapter namespace.name` options (or the
+`UC_ADAPTER_ALLOWLIST` environment variable); discovery is deterministic and
+conflicts fail closed.
 
 The repository contract gate is `.github/workflows/ci.yml`. It runs the full
 fake-runner/backend-plan matrix, artifact and migration tests, lint, and mypy

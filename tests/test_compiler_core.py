@@ -15,7 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import compiler_core
 from compiler_core import (
+    ADAPTER_API_VERSION,
+    AdapterDescriptor,
     BuildAnalytics,
+    BuildPlan,
     BuildValidationError,
     ARTIFACT_MANIFEST_SCHEMA_VERSION,
     BACKEND_CATALOG,
@@ -44,6 +47,9 @@ from compiler_core import (
     project_manifest_backup_path,
     project_manifest_path,
     release_bundle,
+    adapter_diagnostics,
+    backend_status,
+    discover_adapters,
     rollback_project_manifest,
     run_command,
     save_profiles,
@@ -805,6 +811,108 @@ def test_every_catalog_backend_has_a_side_effect_free_plan_contract(
     assert plan.backend == backend
     assert plan.command
     assert plan.cwd == source.resolve().parent
+
+
+def test_allowlisted_namespaced_external_adapter_contract(tmp_path: Path) -> None:
+    def sample_planner(request: BuildRequest, context: dict[str, object]) -> BuildPlan:
+        return BuildPlan(
+            command=(sys.executable, "-c", "print('sample adapter')"),
+            cwd=request.source.parent,
+            backend=str(context["backend"]),
+            artifact_candidates=(request.output,),
+            cleanup_paths=(),
+        )
+
+    def sample_identity() -> dict[str, object]:
+        return {"available": True, "executable": sys.executable, "version": "1.0"}
+
+    sample = AdapterDescriptor(
+        api_version=ADAPTER_API_VERSION,
+        namespace="sample",
+        name="text",
+        extensions=("txt",),
+        planner=sample_planner,
+        tool_identity=sample_identity,
+        diagnostics=lambda command: {
+            "classification": "sample",
+            "success": command.success,
+            "token": "token=secret-value",
+        },
+    )
+
+    class EntryPoint:
+        name = "sample.text"
+
+        def load(self):
+            return sample
+
+    adapters = discover_adapters(["sample.text"], [EntryPoint()])
+    engine = CompilerEngine(require_available=False, adapters=adapters)
+    source = tmp_path / "input.txt"
+    source.write_text("sample\n", encoding="utf-8")
+    plan = engine.plan(
+        BuildRequest(source=source, output=tmp_path / "sample.out"),
+        allow_missing_source=True,
+    )
+
+    assert engine.choose_backend("txt") == "sample.text"
+    assert plan.backend == "sample.text"
+    assert backend_status(adapters)["sample.text"]["adapter_api"] == ADAPTER_API_VERSION
+    diagnostic = adapter_diagnostics(
+        sample, CommandResult(("sample",), 0, stdout="ok")
+    )
+    assert diagnostic["classification"] == "sample"
+    assert diagnostic["token"] == "token=[REDACTED]"
+
+
+def test_external_adapter_detector_selects_extensionless_source(tmp_path: Path) -> None:
+    adapter = AdapterDescriptor(
+        api_version=ADAPTER_API_VERSION,
+        namespace="sample",
+        name="detector",
+        extensions=("sample",),
+        detector=lambda source: source.name == "extensionless",
+        planner=lambda request, context: BuildPlan(
+            command=("sample-detector",),
+            cwd=request.source.parent,
+            backend=str(context["backend"]),
+        ),
+    )
+    source = tmp_path / "extensionless"
+    plan = CompilerEngine(
+        require_available=False,
+        adapters=(adapter,),
+    ).plan(
+        BuildRequest(source=source, output=tmp_path / "sample.out"),
+        allow_missing_source=True,
+    )
+
+    assert plan.backend == "sample.detector"
+
+
+def test_external_adapter_discovery_is_conflict_safe_and_disabled_by_default() -> None:
+    class EntryPoint:
+        name = "sample.text"
+
+        def load(self):
+            return AdapterDescriptor(
+                api_version=ADAPTER_API_VERSION,
+                namespace="sample",
+                name="text",
+                extensions=("txt",),
+                planner=lambda request, context: BuildPlan(
+                    command=("sample",),
+                    cwd=request.source.parent,
+                    backend=str(context["backend"]),
+                ),
+            )
+
+    assert all(not adapter.external for adapter in discover_adapters(entry_points=[EntryPoint()]))
+    with pytest.raises(BuildValidationError, match="Conflicting adapter"):
+        discover_adapters(
+            ["sample.text"],
+            [EntryPoint(), EntryPoint()],
+        )
 
 
 def test_auto_selection_never_falls_back_to_deprecated_backend(monkeypatch: pytest.MonkeyPatch) -> None:

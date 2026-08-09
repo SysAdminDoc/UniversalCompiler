@@ -12,6 +12,7 @@ import argparse
 import copy
 import concurrent.futures
 import hashlib
+import importlib.metadata as importlib_metadata
 import importlib.util
 import json
 import math
@@ -34,7 +35,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 APP_NAME = "Universal Compiler"
 APP_VERSION = "2.1.0"
@@ -53,6 +54,10 @@ RELEASE_SCHEMA_VERSION = "uc.release.v1"
 RELEASE_KIND = "universal-compiler.release"
 SBOM_SCHEMA_VERSION = "uc.sbom.v1"
 PROVENANCE_SCHEMA_VERSION = "uc.provenance.v1"
+ADAPTER_API_VERSION = "uc.adapter.v1"
+ADAPTER_ENTRY_POINT_GROUP = "universal_compiler.adapters"
+ADAPTER_ALLOWLIST_ENV = "UC_ADAPTER_ALLOWLIST"
+ADAPTER_POLICY_VERSION = "uc.adapter-policy.v1"
 
 
 DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
@@ -781,6 +786,253 @@ class BuildPlan:
     artifact_candidates: tuple[Path, ...] = ()
     cleanup_paths: tuple[Path, ...] = ()
     environment: Mapping[str, str] = field(default_factory=dict)
+
+
+class BackendAdapter(Protocol):
+    """Versioned external adapter shape consumed by the core engine."""
+
+    api_version: str
+    namespace: str
+    name: str
+    extensions: tuple[str, ...]
+    lifecycle: str
+    host_platforms: tuple[str, ...]
+    target_platforms: tuple[str, ...]
+    architectures: tuple[str, ...]
+    required_sdks: tuple[str, ...]
+    detector: Callable[[Path], bool] | None
+    tool_identity: Callable[[], Mapping[str, Any]] | None
+    diagnostics: Callable[[CommandResult], Mapping[str, Any]] | None
+
+    def detect(self, source: Path) -> bool: ...
+
+    def plan(
+        self, request: BuildRequest, context: Mapping[str, Any]
+    ) -> BuildPlan: ...
+
+
+@dataclass(frozen=True)
+class AdapterDescriptor:
+    """Validated adapter metadata and the side-effect-free planning hook."""
+
+    api_version: str
+    namespace: str
+    name: str
+    extensions: tuple[str, ...]
+    lifecycle: str = "experimental"
+    host_platforms: tuple[str, ...] = ("windows",)
+    target_platforms: tuple[str, ...] = ("native",)
+    architectures: tuple[str, ...] = ("native",)
+    required_sdks: tuple[str, ...] = ()
+    planner: Callable[[BuildRequest, Mapping[str, Any]], BuildPlan] | None = None
+    detector: Callable[[Path], bool] | None = field(default=None, compare=False, repr=False)
+    tool_identity: Callable[[], Mapping[str, Any]] | None = field(
+        default=None, compare=False, repr=False
+    )
+    diagnostics: Callable[[CommandResult], Mapping[str, Any]] | None = field(
+        default=None, compare=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        if self.api_version != ADAPTER_API_VERSION:
+            raise BuildValidationError(
+                f"Unsupported adapter API {self.api_version!r}; expected {ADAPTER_API_VERSION}"
+            )
+        identifier_pattern = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+        if not identifier_pattern.fullmatch(self.namespace) or not identifier_pattern.fullmatch(self.name):
+            raise BuildValidationError("Adapter namespace and name must be lowercase identifiers")
+        if self.namespace != "builtin" and self.planner is None:
+            raise BuildValidationError("External adapters must provide a planner")
+        normalized_extensions = tuple(
+            str(extension).lower().lstrip(".") for extension in self.extensions
+        )
+        if not normalized_extensions:
+            raise BuildValidationError("Adapters must declare at least one source extension")
+        object.__setattr__(self, "extensions", normalized_extensions)
+
+    @property
+    def backend_id(self) -> str:
+        return self.name if self.namespace == "builtin" else f"{self.namespace}.{self.name}"
+
+    @property
+    def external(self) -> bool:
+        return self.namespace != "builtin"
+
+    def plan(
+        self, request: BuildRequest, context: Mapping[str, Any]
+    ) -> BuildPlan:
+        """Invoke the adapter planner through the versioned adapter surface."""
+
+        if self.planner is None:
+            raise BuildValidationError(f"Adapter has no planner: {self.backend_id}")
+        return self.planner(request, context)
+
+    def detect(self, source: Path) -> bool:
+        """Detect a source through the adapter's optional content hook."""
+
+        if self.detector is None:
+            return source.suffix.lower().lstrip(".") in self.extensions
+        return bool(self.detector(source))
+
+
+def _builtin_adapter_descriptors() -> tuple[AdapterDescriptor, ...]:
+    return tuple(
+        AdapterDescriptor(
+            api_version=ADAPTER_API_VERSION,
+            namespace="builtin",
+            name=backend,
+            extensions=tuple(str(value) for value in spec["extensions"]),
+            lifecycle=str(spec["status"]),
+            host_platforms=tuple(str(value) for value in spec["host_platforms"]),
+            target_platforms=tuple(str(value) for value in spec["target_platforms"]),
+            architectures=tuple(str(value) for value in spec["architectures"]),
+            required_sdks=tuple(str(value) for value in spec.get("required_sdks", ())),
+        )
+        for backend, spec in BACKEND_CATALOG.items()
+        if spec["extensions"]
+    )
+
+
+def _adapter_allowlist(allowlist: Sequence[str] | None) -> frozenset[str]:
+    if allowlist is None:
+        raw = os.environ.get(ADAPTER_ALLOWLIST_ENV, "")
+        allowlist = tuple(value.strip() for value in raw.split(",") if value.strip())
+    return frozenset(str(value).strip().lower() for value in allowlist if str(value).strip())
+
+
+def discover_adapters(
+    allowlist: Sequence[str] | None = None,
+    entry_points: Sequence[Any] | None = None,
+) -> tuple[AdapterDescriptor, ...]:
+    """Discover only explicitly allowlisted, namespaced entry-point adapters."""
+
+    builtins = _builtin_adapter_descriptors()
+    allowed = _adapter_allowlist(allowlist)
+    if not allowed:
+        return builtins
+    if entry_points is None:
+        try:
+            selected = importlib_metadata.entry_points()
+            if hasattr(selected, "select"):
+                entry_points = tuple(selected.select(group=ADAPTER_ENTRY_POINT_GROUP))
+            else:
+                legacy_groups: Any = selected
+                entry_points = tuple(
+                    item
+                    for item in legacy_groups.get(ADAPTER_ENTRY_POINT_GROUP, ())
+                )
+        except Exception as error:
+            raise BuildValidationError(f"Could not inspect adapter entry points: {error}") from error
+    candidates = sorted(
+        (entry for entry in entry_points if str(getattr(entry, "name", "")).lower() in allowed),
+        key=lambda entry: str(getattr(entry, "name", "")).lower(),
+    )
+    found = {str(getattr(entry, "name", "")).lower() for entry in candidates}
+    missing = sorted(allowed - found)
+    if missing:
+        raise BuildValidationError(
+            f"Allowlisted adapter entry point(s) are unavailable: {', '.join(missing)}"
+        )
+    adapters = list(builtins)
+    identifiers = {adapter.backend_id for adapter in adapters}
+    for entry in candidates:
+        entry_name = str(getattr(entry, "name", "")).lower()
+        try:
+            loaded = entry.load()
+            adapter = loaded() if callable(loaded) and not isinstance(loaded, AdapterDescriptor) else loaded
+        except Exception as error:
+            raise BuildValidationError(
+                f"Could not load allowlisted adapter {entry_name}: {error}"
+            ) from error
+        if not isinstance(adapter, AdapterDescriptor):
+            raise BuildValidationError(
+                f"Adapter {entry_name} did not return an AdapterDescriptor"
+            )
+        if not adapter.external or adapter.backend_id != entry_name:
+            raise BuildValidationError(
+                f"Adapter {entry_name} must use its namespaced descriptor id"
+            )
+        if adapter.backend_id in identifiers:
+            raise BuildValidationError(f"Conflicting adapter identifier: {adapter.backend_id}")
+        identifiers.add(adapter.backend_id)
+        adapters.append(adapter)
+    return tuple(adapters)
+
+
+def adapter_catalog(
+    adapters: Sequence[AdapterDescriptor] | None = None,
+) -> dict[str, AdapterDescriptor]:
+    """Return deterministic backend-id to adapter metadata mappings."""
+
+    selected = tuple(adapters) if adapters is not None else discover_adapters()
+    catalog: dict[str, AdapterDescriptor] = {}
+    for adapter in selected:
+        if adapter.backend_id in catalog:
+            raise BuildValidationError(f"Conflicting adapter identifier: {adapter.backend_id}")
+        catalog[adapter.backend_id] = adapter
+    return catalog
+
+
+def _detect_adapter_file_type(
+    adapters: Mapping[str, AdapterDescriptor], source: Path
+) -> str | None:
+    matches: list[AdapterDescriptor] = []
+    for adapter in adapters.values():
+        if adapter.detector is None:
+            continue
+        try:
+            if adapter.detect(source):
+                matches.append(adapter)
+        except Exception as error:
+            raise BuildValidationError(
+                f"Adapter {adapter.backend_id} detector failed: {error}"
+            ) from error
+    if len(matches) > 1:
+        names = ", ".join(adapter.backend_id for adapter in matches)
+        raise BuildValidationError(f"Ambiguous adapter detection for {source}: {names}")
+    return matches[0].extensions[0] if matches else None
+
+
+def _redact_diagnostic_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _redact_diagnostic_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_diagnostic_value(item) for item in value]
+    if isinstance(value, Path):
+        return redact_text(str(value))
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
+
+
+def adapter_diagnostics(
+    adapter: AdapterDescriptor, command: CommandResult
+) -> dict[str, Any]:
+    """Normalize an adapter diagnostic callback without exposing raw secrets."""
+
+    if adapter.diagnostics is None:
+        return {
+            "adapter": adapter.backend_id,
+            "success": command.success,
+            "returncode": command.returncode,
+            "output": redact_text(command.output),
+        }
+    try:
+        redacted = _redact_diagnostic_value(adapter.diagnostics(command))
+        if not isinstance(redacted, dict):
+            raise ValueError("diagnostics callback must return a mapping")
+        value = redacted
+    except Exception as error:
+        return {
+            "adapter": adapter.backend_id,
+            "success": False,
+            "error": redact_text(str(error)),
+        }
+    value["adapter"] = adapter.backend_id
+    return value
 
 
 @dataclass(frozen=True)
@@ -2063,7 +2315,9 @@ def _verified_backend_version(backend: str) -> str | None:
     return redact_text(first_line) or None
 
 
-def backend_status() -> dict[str, dict[str, Any]]:
+def backend_status(
+    adapters: Sequence[AdapterDescriptor] | None = None,
+) -> dict[str, dict[str, Any]]:
     """Return the schema-versioned capability and availability catalog."""
 
     status: dict[str, dict[str, Any]] = {}
@@ -2085,6 +2339,34 @@ def backend_status() -> dict[str, dict[str, Any]]:
             "required_sdks": list(spec["required_sdks"]),
             "default": backend != "pkg",
             "verified_version": _verified_backend_version(backend),
+        }
+    for adapter in adapter_catalog(adapters).values():
+        if not adapter.external:
+            continue
+        identity: Mapping[str, Any] = {}
+        if adapter.tool_identity is not None:
+            try:
+                identity = dict(adapter.tool_identity())
+            except Exception:
+                identity = {}
+        status[adapter.backend_id] = {
+            "schema_version": CAPABILITY_SCHEMA_VERSION,
+            "backend": adapter.backend_id,
+            "name": adapter.name,
+            "namespace": adapter.namespace,
+            "lifecycle": adapter.lifecycle,
+            "available": bool(identity.get("available", True)),
+            "executable": identity.get("executable"),
+            "extensions": list(adapter.extensions),
+            "host_platforms": list(adapter.host_platforms),
+            "host_supported": host_platform in adapter.host_platforms,
+            "target_platforms": list(adapter.target_platforms),
+            "architectures": list(adapter.architectures),
+            "required_sdks": list(adapter.required_sdks),
+            "default": adapter.lifecycle != "deprecated",
+            "verified_version": identity.get("version"),
+            "adapter_api": adapter.api_version,
+            "adapter_policy": ADAPTER_POLICY_VERSION,
         }
     return status
 
@@ -2219,10 +2501,12 @@ class CompilerEngine:
         runner: Callable[..., CommandResult] = run_command,
         require_available: bool = True,
         policy: ExecutionPolicy | None = None,
+        adapters: Sequence[AdapterDescriptor] | None = None,
     ) -> None:
         self.runner = runner
         self.require_available = require_available
         self.policy = policy or ExecutionPolicy()
+        self.adapters = adapter_catalog(adapters)
 
     def _policy_for_request(self, request: BuildRequest) -> ExecutionPolicy:
         return self.policy.for_request(request)
@@ -2248,30 +2532,42 @@ class CompilerEngine:
         return self.runner(command, **kwargs)
 
     def choose_backend(self, file_type: str, requested: str = "auto") -> str | None:
-        choices = EXTENSION_BACKENDS.get(file_type.lower(), ())
+        normalized_type = file_type.lower().lstrip(".")
+        choices = tuple(
+            adapter.backend_id
+            for adapter in self.adapters.values()
+            if normalized_type in adapter.extensions
+        )
         if requested != "auto":
             return requested if requested in choices else None
         auto_choices = tuple(
             backend
             for backend in choices
-            if BACKEND_CATALOG.get(backend, {}).get("status") != "deprecated"
+            if self.adapters[backend].lifecycle != "deprecated"
         )
         for backend in auto_choices:
-            if resolve_backend_executable(backend):
+            adapter = self.adapters[backend]
+            available = resolve_backend_executable(backend) is not None
+            if adapter.external and adapter.tool_identity is not None:
+                try:
+                    available = bool(dict(adapter.tool_identity()).get("available", True))
+                except Exception:
+                    available = False
+            if available:
                 return backend
         return auto_choices[0] if auto_choices else None
 
     def _validate_capability(self, request: BuildRequest, backend: str) -> None:
-        capability = BACKEND_CATALOG.get(backend)
-        if capability is None:
+        adapter = self.adapters.get(backend)
+        if adapter is None:
             raise BuildValidationError(f"Backend is not in the capability catalog: {backend}")
         host_platform = "windows" if os.name == "nt" else sys.platform
-        if host_platform not in capability["host_platforms"]:
+        if host_platform not in adapter.host_platforms:
             raise BuildValidationError(
                 f"Backend {backend} is not supported on host platform {host_platform}"
             )
         target = request.target.lower()
-        target_platforms = tuple(str(value) for value in capability["target_platforms"])
+        target_platforms = adapter.target_platforms
         if target not in {"native", "auto"} and not (
             target in target_platforms
             or any(
@@ -2287,7 +2583,7 @@ class CompilerEngine:
                 f"supported targets: {', '.join(target_platforms)}"
             )
         architecture = request.architecture.lower()
-        architectures = tuple(str(value) for value in capability["architectures"])
+        architectures = adapter.architectures
         if architecture not in {"native", "auto"} and architecture not in architectures:
             raise BuildValidationError(
                 f"Backend {backend} does not support architecture {request.architecture}; "
@@ -2330,7 +2626,25 @@ class CompilerEngine:
         self, request: BuildRequest, allow_missing_source: bool = False
     ) -> BuildRequest:
         normalized = request.normalized()
-        if not normalized.file_type or normalized.file_type not in EXTENSION_BACKENDS:
+        if not normalized.file_type:
+            suffix = normalized.source.suffix.lower().lstrip(".")
+            adapter_extensions = {
+                extension
+                for adapter in self.adapters.values()
+                for extension in adapter.extensions
+            }
+            if suffix in adapter_extensions:
+                normalized = replace(normalized, file_type=suffix)
+            else:
+                detected_type = _detect_adapter_file_type(self.adapters, normalized.source)
+                if detected_type:
+                    normalized = replace(normalized, file_type=detected_type)
+        supported_extensions = {
+            extension
+            for adapter in self.adapters.values()
+            for extension in adapter.extensions
+        }
+        if not normalized.file_type or normalized.file_type not in supported_extensions:
             raise BuildValidationError(
                 f"Unsupported source type: {normalized.source.suffix or '<none>'}"
             )
@@ -2348,13 +2662,33 @@ class CompilerEngine:
         self._validate_capability(normalized, backend)
         if normalized.backend == "auto" or normalized.backend != backend:
             normalized = replace(normalized, backend=backend)
-        if self.require_available and not resolve_backend_executable(backend):
-            raise BuildValidationError(f"Compiler backend is not installed: {backend}")
+        if self.require_available:
+            adapter = self.adapters[backend]
+            available = resolve_backend_executable(backend) is not None
+            if adapter.external and adapter.tool_identity is not None:
+                try:
+                    available = bool(dict(adapter.tool_identity()).get("available", True))
+                except Exception:
+                    available = False
+            if not available:
+                raise BuildValidationError(f"Compiler backend is not installed: {backend}")
         if not allow_missing_source and normalized.toolchain_versions:
             self._validate_toolchain_versions(normalized)
         return normalized
 
     def _tool_identity(self, backend: str) -> dict[str, Any]:
+        adapter = self.adapters.get(backend)
+        if adapter and adapter.external and adapter.tool_identity is not None:
+            try:
+                return {
+                    "backend": backend,
+                    **{
+                        str(key): redact_text(str(value))
+                        for key, value in dict(adapter.tool_identity()).items()
+                    },
+                }
+            except Exception as error:
+                return {"backend": backend, "error": redact_text(str(error))}
         executable = resolve_backend_executable(backend)
         if not executable:
             return {"backend": backend, "executable": None}
@@ -2556,6 +2890,38 @@ class CompilerEngine:
         source = request.source.resolve()
         output = request.output.resolve()
         backend = request.backend
+        adapter = self.adapters[backend]
+        if adapter.external:
+            try:
+                adapter_plan = adapter.plan(
+                    request,
+                    {
+                        "api_version": ADAPTER_API_VERSION,
+                        "backend": adapter.backend_id,
+                        "source": source,
+                        "output": output,
+                        "engine": self,
+                    },
+                )
+            except (BuildValidationError, OSError, ValueError):
+                raise
+            except Exception as error:
+                raise BuildValidationError(
+                    f"Adapter {adapter.backend_id} planner failed: {error}"
+                ) from error
+            if not isinstance(adapter_plan, BuildPlan):
+                raise BuildValidationError(
+                    f"Adapter {adapter.backend_id} planner did not return BuildPlan"
+                )
+            if adapter_plan.backend != adapter.backend_id or not adapter_plan.command:
+                raise BuildValidationError(
+                    f"Adapter {adapter.backend_id} returned an invalid BuildPlan"
+                )
+            if len(adapter_plan.cleanup_paths) > MAX_CLEANUP_PATHS:
+                raise BuildValidationError(
+                    f"Adapter {adapter.backend_id} returned too many cleanup paths"
+                )
+            return adapter_plan
         executable = resolve_backend_executable(backend) or backend
         cleanup: list[Path] = []
         candidates: list[Path] = [output]
@@ -4317,6 +4683,15 @@ def _add_build_options(parser: argparse.ArgumentParser) -> None:
         help="Override the lock file's explicit package mirror",
     )
     parser.add_argument(
+        "--adapter",
+        action="append",
+        default=[],
+        help=(
+            "Explicitly allow an installed namespaced adapter entry point "
+            "(repeatable; external adapters are disabled by default)"
+        ),
+    )
+    parser.add_argument(
         "--verify",
         dest="verify_flag",
         action="store_true",
@@ -4373,6 +4748,7 @@ def create_cli_parser() -> argparse.ArgumentParser:
         "inspect", help="Inspect a source and its backend availability"
     )
     inspect_parser.add_argument("source")
+    inspect_parser.add_argument("--adapter", action="append", default=[])
     inspect_parser.add_argument("--json", action="store_true")
 
     verify_parser = subparsers.add_parser(
@@ -4384,6 +4760,7 @@ def create_cli_parser() -> argparse.ArgumentParser:
     list_parser = subparsers.add_parser(
         "list-toolchains", help="List supported backends and availability"
     )
+    list_parser.add_argument("--adapter", action="append", default=[])
     list_parser.add_argument("--json", action="store_true")
 
     init_parser = subparsers.add_parser(
@@ -4505,7 +4882,13 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     parser = create_cli_parser()
     args = parser.parse_args(argv)
     if args.command == "list-toolchains":
-        status_value = backend_status()
+        try:
+            status_value = backend_status(
+                discover_adapters(args.adapter or None)
+            )
+        except BuildValidationError as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
         print(
             json.dumps(status_value, indent=2)
             if args.json
@@ -4662,13 +5045,27 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         return 0 if verification_result.passed else 1
     if args.command == "inspect":
         source = Path(args.source).expanduser()
+        adapters = discover_adapters(args.adapter or None)
         file_type = detect_file_type(source)
-        choices = EXTENSION_BACKENDS.get(file_type or "", ())
+        if file_type is None:
+            suffix = source.suffix.lower().lstrip(".")
+            if any(suffix in adapter.extensions for adapter in adapters):
+                file_type = suffix
+            else:
+                detected_type = _detect_adapter_file_type(adapter_catalog(adapters), source)
+                if detected_type:
+                    file_type = detected_type
+        choices = tuple(
+            adapter.backend_id
+            for adapter in adapters
+            if file_type and file_type in adapter.extensions
+        )
+        status_catalog = backend_status(adapters)
         inspect_value = {
             "source": str(source),
             "file_type": file_type,
             "estimated_size": estimate_output_size(source, file_type),
-            "backends": {backend: backend_status()[backend] for backend in choices},
+            "backends": {backend: status_catalog[backend] for backend in choices},
         }
         print(json.dumps(inspect_value, indent=2) if args.json else json.dumps(inspect_value, indent=2))
         return 0
@@ -4694,7 +5091,12 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     profile = profiles.get(args.profile)
     if profile is None:
         parser.error(f"Profile not found: {args.profile}")
-    engine = CompilerEngine()
+    try:
+        adapters = discover_adapters(getattr(args, "adapter", None) or None)
+    except BuildValidationError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    engine = CompilerEngine(adapters=adapters)
     build_analytics: BuildAnalytics | None = (
         None if args.no_analytics else BuildAnalytics()
     )
@@ -4706,7 +5108,10 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         request = _profile_request(profile, args, source, output)
         if args.preview:
             try:
-                plan = CompilerEngine(require_available=False).plan(
+                plan = CompilerEngine(
+                    require_available=False,
+                    adapters=adapters,
+                ).plan(
                     request,
                     allow_missing_source=True,
                 )
@@ -4797,6 +5202,12 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "APP_NAME",
     "APP_VERSION",
+    "ADAPTER_ALLOWLIST_ENV",
+    "ADAPTER_API_VERSION",
+    "ADAPTER_ENTRY_POINT_GROUP",
+    "ADAPTER_POLICY_VERSION",
+    "AdapterDescriptor",
+    "BackendAdapter",
     "ARTIFACT_MANIFEST_SCHEMA_VERSION",
     "BACKEND_NAMES",
     "BACKEND_CATALOG",
@@ -4826,12 +5237,15 @@ __all__ = [
     "VerificationResult",
     "backend_status",
     "artifact_manifest_path",
+    "adapter_catalog",
+    "adapter_diagnostics",
     "cli_main",
     "command_display",
     "compile_bytecode",
     "config_dir",
     "detect_file_type",
     "dependency_lock_path",
+    "discover_adapters",
     "estimate_output_size",
     "extract_icon",
     "format_size",
