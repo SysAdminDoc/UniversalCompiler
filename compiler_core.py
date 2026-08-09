@@ -88,6 +88,8 @@ RESULT_SCHEMA_VERSION = "uc.result.v1"
 CAPABILITY_SCHEMA_VERSION = "uc.capability.v1"
 COMPATIBILITY_SCHEMA_VERSION = "uc.compatibility.v1"
 COMPATIBILITY_KIND = "universal-compiler.compatibility"
+TARGET_POLICY_SCHEMA_VERSION = "uc.target-policy.v1"
+TARGET_POLICY_KIND = "universal-compiler.target-policy"
 ARTIFACT_MANIFEST_SCHEMA_VERSION = "uc.artifact-manifest.v1"
 PROJECT_MANIFEST_SCHEMA_VERSION = "uc.project.v1"
 PROJECT_MANIFEST_KIND = "universal-compiler.project"
@@ -108,6 +110,86 @@ ADAPTER_API_VERSION = "uc.adapter.v1"
 ADAPTER_ENTRY_POINT_GROUP = "universal_compiler.adapters"
 ADAPTER_ALLOWLIST_ENV = "UC_ADAPTER_ALLOWLIST"
 ADAPTER_POLICY_VERSION = "uc.adapter-policy.v1"
+
+TARGET_POLICY: dict[str, Any] = {
+    "schema_version": TARGET_POLICY_SCHEMA_VERSION,
+    "kind": TARGET_POLICY_KIND,
+    "families": {
+        "windows-desktop": {
+            "status": "supported",
+            "host_platforms": ["windows"],
+            "targets": ["native", "windows"],
+            "artifact_model": "Windows PE or Windows package",
+            "mobile": False,
+        },
+        "non-windows-host": {
+            "status": "catalog-only",
+            "host_platforms": ["linux", "darwin"],
+            "targets": ["linux", "darwin"],
+            "artifact_model": "Non-Windows platform executable when an adapter provides CI proof",
+            "mobile": False,
+            "built_in_adapter_support": False,
+        },
+        "wasm-module": {
+            "status": "supported",
+            "host_platforms": ["windows"],
+            "targets": ["wasm"],
+            "artifact_model": "WebAssembly module requiring a host runtime",
+            "mobile": False,
+        },
+        "wasi-module": {
+            "status": "experimental",
+            "host_platforms": ["windows"],
+            "targets": ["wasi"],
+            "artifact_model": "WebAssembly module requiring a matching WASI host/profile",
+            "mobile": False,
+        },
+        "native-mobile": {
+            "status": "out-of-scope",
+            "host_platforms": ["windows", "linux", "darwin"],
+            "targets": ["android", "ios"],
+            "artifact_model": "Installable native mobile package",
+            "mobile": True,
+            "supported": False,
+            "installable_artifact": False,
+            "ci_proof": False,
+            "reason": "No platform-valid Android/iOS adapter and CI install proof exists in this major line",
+        },
+    },
+}
+NATIVE_MOBILE_TARGETS = frozenset({"android", "ios"})
+
+
+def target_policy() -> dict[str, Any]:
+    """Return a copy of the explicit host, portable, and mobile target policy."""
+
+    return copy.deepcopy(TARGET_POLICY)
+
+
+def target_family_for(value: str) -> str | None:
+    """Classify a target token without treating a name as build proof."""
+
+    token = str(value or "").strip().lower().replace("_", "-")
+    if not token or token in {"native", "auto"}:
+        return "windows-desktop"
+    if any(
+        token == mobile or token.startswith(f"{mobile}-") or token.endswith(f"-{mobile}")
+        or f"-{mobile}-" in token
+        for mobile in NATIVE_MOBILE_TARGETS
+    ):
+        return "native-mobile"
+    if "wasi" in token:
+        return "wasi-module"
+    if token == "wasm" or token.startswith("wasm-") or token.endswith("-wasm"):
+        return "wasm-module"
+    if token in {"windows", "win32", "win64"} or "windows" in token:
+        return "windows-desktop"
+    if token in {"linux", "darwin", "macos", "osx"} or any(
+        token.endswith(f"-{platform}") or f"-{platform}-" in token
+        for platform in ("linux", "darwin")
+    ):
+        return "non-windows-host"
+    return None
 
 
 _BUILTIN_I18N_CATALOG: dict[str, Any] = {
@@ -3256,6 +3338,7 @@ def compatibility_matrix(
             "+00:00", "Z"
         ),
         "host_platform": "windows" if os.name == "nt" else sys.platform,
+        "target_policy": target_policy(),
         "entries": entries,
     }
 
@@ -3504,6 +3587,11 @@ class CompilerEngine:
                 f"Backend {backend} is not supported on host platform {host_platform}"
             )
         target = request.target.lower()
+        if target_family_for(target) == "native-mobile":
+            raise BuildValidationError(
+                f"Native mobile target {request.target} is out of scope: "
+                "Android/iOS output needs a platform-valid adapter and CI install proof"
+            )
         target_platforms = adapter.target_platforms
         if target not in {"native", "auto"} and not (
             target in target_platforms
@@ -6138,6 +6226,11 @@ def create_cli_parser() -> argparse.ArgumentParser:
     compatibility_parser.add_argument("--adapter", action="append", default=[])
     compatibility_parser.add_argument("--json", action="store_true")
 
+    target_policy_parser = subparsers.add_parser(
+        "target-policy", help="Show Windows, portable, WASM/WASI, and mobile target policy"
+    )
+    target_policy_parser.add_argument("--json", action="store_true")
+
     init_parser = subparsers.add_parser(
         "init-profiles", help="Create a starter YAML profile file"
     )
@@ -6346,6 +6439,19 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                         f"artifact={entry['artifact']['type']}"
                     )
                     for entry in matrix["entries"]
+                )
+            )
+        return 0
+    if args.command == "target-policy":
+        policy = target_policy()
+        if args.json:
+            print(json.dumps(policy, indent=2))
+        else:
+            print(
+                "\n".join(
+                    f"{name}: {family['status']}; targets={','.join(family['targets'])}; "
+                    f"artifacts={family['artifact_model']}"
+                    for name, family in policy["families"].items()
                 )
             )
         return 0
@@ -6753,6 +6859,9 @@ __all__ = [
     "CAPABILITY_SCHEMA_VERSION",
     "COMPATIBILITY_KIND",
     "COMPATIBILITY_SCHEMA_VERSION",
+    "TARGET_POLICY",
+    "TARGET_POLICY_KIND",
+    "TARGET_POLICY_SCHEMA_VERSION",
     "CommandResult",
     "CompilerEngine",
     "DIAGNOSTICS_KIND",
@@ -6777,6 +6886,8 @@ __all__ = [
     "VerificationResult",
     "backend_status",
     "compatibility_matrix",
+    "target_family_for",
+    "target_policy",
     "artifact_manifest_path",
     "artifact_policy_for_backend",
     "adapter_catalog",

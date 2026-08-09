@@ -44,7 +44,7 @@ from compiler_core import (
 # install optional desktop packages.  The legacy GUI remains the default when
 # the script is launched without a command.
 _CLI_COMMANDS = {
-    "build", "batch", "inspect", "verify", "release", "list-toolchains", "compatibility", "diagnostics",
+    "build", "batch", "inspect", "verify", "release", "list-toolchains", "compatibility", "target-policy", "diagnostics",
     "init-profiles", "manifest", "bytecode", "extract-icon", "wrap-msix", "obfuscate",
     "analytics", "init-actions", "--help", "-h",
 }

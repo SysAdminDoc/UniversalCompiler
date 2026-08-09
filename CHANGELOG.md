@@ -84,6 +84,10 @@ All notable changes to UniversalCompiler will be documented in this file.
   runtime permissions, dynamic modules, Python zipapp/PEX archives, Node SEA
   plus postject, Bun/Deno targets, and WASI output; experimental families are
   opt-in and archived pkg remains excluded from automatic selection.
+- Add a machine-readable target-family policy and `target-policy` CLI view that
+  separates Windows desktop, non-Windows host/catalog targets, WASM, WASI, and
+  native mobile; Android/iOS targets are rejected as out of scope without an
+  installable artifact and CI proof.
 
 ## [v0.1.0] - 2026-04-13
 

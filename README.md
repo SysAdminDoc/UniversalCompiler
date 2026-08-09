@@ -240,6 +240,7 @@ python .\UniversalCompiler.py list-toolchains
 python .\UniversalCompiler.py list-toolchains --json
 python .\UniversalCompiler.py list-toolchains --adapter vendor.backend --json
 python .\UniversalCompiler.py compatibility --json
+python .\UniversalCompiler.py target-policy --json
 python .\UniversalCompiler.py inspect .\myscript.py --json
 python .\UniversalCompiler.py verify .\dist\myscript.exe
 python .\UniversalCompiler.py verify .\dist\myscript.exe.manifest.json
@@ -271,6 +272,7 @@ Generate the current matrix without installing or executing a source artifact:
 ```powershell
 python .\UniversalCompiler.py compatibility --json
 python .\UniversalCompiler.py compatibility
+python .\UniversalCompiler.py target-policy --json
 ```
 
 The `uc.compatibility.v1` matrix is evaluated on the current host. Each entry
@@ -302,6 +304,20 @@ names describe the runtime/deployment family and the invoking interpreter or
 PEX bootstrap remains a deployment requirement. Node SEA requires both Node.js
 and `postject` and is explicit/experimental. Archived `pkg` remains visible
 for migration but is excluded from automatic selection.
+
+The generated `target_policy` separates the supported delivery boundaries:
+
+- Windows desktop is the supported built-in host lane for PE and Windows
+  package artifacts.
+- Non-Windows host builds are a catalog-only family. A listed Linux or macOS
+  target does not claim that a Windows host can cross-compile it; an adapter
+  must report host support and provide CI proof.
+- `wasm` and `wasi` are separate module families. `wasi` requires a matching
+  WASI profile and host; neither family is a native mobile package.
+- Native Android and iOS output is explicitly out of scope in this major line.
+  The CLI rejects mobile target tokens because there is no installable,
+  platform-valid adapter and CI installation proof. No mobile support is
+  advertised by the target matrix.
 
 Windows PE and native/platform executable entries still depend on their
 declared runtime, SDK, library, permission, and asset inputs. A `.wasm` entry

@@ -67,6 +67,10 @@ from compiler_core import (
     discover_adapters,
     rollback_project_manifest,
     resolve_locale,
+    TARGET_POLICY_KIND,
+    TARGET_POLICY_SCHEMA_VERSION,
+    target_family_for,
+    target_policy,
     run_command,
     save_profiles,
     save_json,
@@ -1255,6 +1259,48 @@ def test_compatibility_matrix_and_cli_json_are_schema_versioned(
         "pyinstaller",
         "wat2wasm",
     }
+    assert set(output["target_policy"]["families"]) >= {
+        "windows-desktop",
+        "non-windows-host",
+        "wasm-module",
+        "wasi-module",
+        "native-mobile",
+    }
+
+
+def test_target_policy_is_explicit_and_rejects_native_mobile_targets(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    policy = target_policy()
+    assert policy["schema_version"] == TARGET_POLICY_SCHEMA_VERSION
+    assert policy["kind"] == TARGET_POLICY_KIND
+    assert policy["families"]["native-mobile"]["status"] == "out-of-scope"
+    assert policy["families"]["native-mobile"]["installable_artifact"] is False
+    assert target_family_for("aarch64-linux-android") == "native-mobile"
+    assert target_family_for("wasm32-wasi") == "wasi-module"
+    assert target_family_for("x86_64-unknown-linux-gnu") == "non-windows-host"
+
+    source = tmp_path / "main.go"
+    source.write_text("package main\nfunc main() {}\n", encoding="utf-8")
+    with pytest.raises(BuildValidationError, match="Native mobile target"):
+        CompilerEngine(require_available=False).plan(
+            BuildRequest(
+                source=source,
+                output=tmp_path / "main.exe",
+                backend="go",
+                target="aarch64-linux-android",
+            ),
+            allow_missing_source=True,
+        )
+
+    assert cli_main(["target-policy", "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["families"]["native-mobile"]["supported"] is False
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Android and iOS output is explicitly out of scope" in readme
+    assert "wasm` and `wasi` are separate module families" in readme
 
 
 def test_version_source_and_release_metadata_are_synchronized() -> None:
