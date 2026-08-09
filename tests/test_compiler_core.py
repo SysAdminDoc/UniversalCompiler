@@ -322,6 +322,23 @@ def test_shells_delegate_to_versioned_core_contract() -> None:
     assert "Get-PreferredCapability" in powershell
 
 
+def test_powershell_toolchain_acquisition_is_pinned_and_explicit() -> None:
+    root = Path(__file__).resolve().parents[1]
+    powershell = (root / "UniversalCompiler.ps1").read_text(encoding="utf-8")
+
+    assert "uc.toolchain-acquisition.v1" in powershell
+    assert "Invoke-ToolchainAcquisition" in powershell
+    assert "Get-FileHash" in powershell
+    assert "RequiredVersion" in powershell
+    assert "--exact" in powershell
+    assert "if ($SetupMode -eq 'Diagnostic')" in powershell
+    assert "WebClient" not in powershell
+    assert "DownloadFile" not in powershell
+    assert "master.zip" not in powershell
+    assert "if ($ForceSetup -and -not $SkipSetup)" in powershell
+    assert "Install-Module $($definition.Package) -RequiredVersion" in powershell
+
+
 def test_profiles_round_trip_without_extra_dependency(tmp_path: Path) -> None:
     path = tmp_path / "profiles.yaml"
     profiles = dict(DEFAULT_PROFILES)

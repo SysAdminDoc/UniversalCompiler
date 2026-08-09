@@ -94,7 +94,7 @@
 
 1. **Download** `UniversalCompiler.ps1`
 2. **Right-click** → "Run with PowerShell"
-3. **Install compilers explicitly** with `-ForceSetup` when you want the setup wizard; normal launches never download or install tools
+3. Build with the Python CLI or GUI; normal launches never download or install tools
 
 ### Requirements
 
@@ -105,19 +105,50 @@
 
 ### Optional Dependencies
 
-The explicitly launched setup wizard can install these for you:
+The setup wizard is opt-in. `-ForceSetup -SetupMode Install` uses the pinned
+catalog and the selected package manager; it never downloads a mutable branch
+archive or launches an untracked installer. The current catalog pins PS2EXE
+1.12.0, PyInstaller 6.20.0, Go 1.22.5, Ocra 1.3.11, and AutoHotkey 2.0.18.
 
-| Compiler | For | Auto-Install |
-|----------|-----|--------------|
-| PS2EXE | PowerShell scripts | ✅ Yes |
-| PyInstaller | Python scripts | ✅ Yes (requires Python) |
+| Compiler | For | Acquisition |
+|----------|-----|-------------|
+| PS2EXE | PowerShell scripts | Pinned PowerShell Gallery package, or manual/offline verification |
+| PyInstaller | Python scripts | Pinned pip package, or manual/offline verification |
 | Bun / Deno | JavaScript and TypeScript scripts | Manual/SDK-managed; capability-gated |
-| pkg (legacy) | JavaScript scripts | ✅ Yes when explicitly requested |
-| Go | Go scripts | ✅ Yes |
-| Ruby + Ocra | Ruby scripts | ✅ Yes |
-| AutoHotkey | AHK scripts | ✅ Yes |
+| pkg (legacy) | JavaScript scripts | Deprecated; never selected or installed automatically |
+| Go | Go scripts | Pinned winget package, or manual/offline verification |
+| Ruby + Ocra | Ruby scripts | Pinned RubyGems package, or manual/offline verification |
+| AutoHotkey | AHK scripts | Pinned winget package, or manual/offline verification |
 | CSC | C# scripts | ✅ Built-in |
 | IExpress | Batch/VBS | ✅ Built-in |
+
+Setup modes are explicit and emit JSON suitable for support or automation:
+
+```powershell
+# Read-only capability and acquisition diagnostic; no setup state is written
+.\UniversalCompiler.ps1 -SetupMode Diagnostic
+
+# Plan all pinned acquisitions and write bounded provenance records; no package action
+.\UniversalCompiler.ps1 -SetupMode DryRun
+
+# Record manual acquisition instructions without changing installed tools
+.\UniversalCompiler.ps1 -SetupMode Manual
+
+# Verify an offline artifact; it is never executed or installed by this command
+.\UniversalCompiler.ps1 -SetupMode OfflineArtifact -Toolchain pyinstaller `
+  -ArtifactPath .\pyinstaller.whl -ExpectedSha256 <64-hex-sha256>
+
+# The only mode that can invoke package-manager installation
+.\UniversalCompiler.ps1 -ForceSetup -SetupMode Install
+```
+
+Acquisition records are retained at
+`%APPDATA%\UniversalCompiler\toolchain-acquisitions.json` using the
+`uc.toolchain-acquisition.v1` schema. Records include source URL, pinned
+version, license, expected and observed SHA-256 fields, acquisition mode, and
+result. Package-manager records identify package-manager integrity; offline
+verification requires an explicit 64-character SHA-256 and records a measured
+hash. No network telemetry is sent.
 
 ---
 
@@ -417,7 +448,11 @@ Remove-Item "$env:APPDATA\UniversalCompiler" -Recurse -Force
 .\UniversalCompiler.ps1 -SkipSetup
 
 # Force re-run setup
-.\UniversalCompiler.ps1 -ForceSetup
+.\UniversalCompiler.ps1 -ForceSetup -SetupMode Install
+
+# Inspect setup without installing anything
+.\UniversalCompiler.ps1 -SetupMode Diagnostic
+.\UniversalCompiler.ps1 -SetupMode DryRun
 ```
 
 ---

@@ -7,7 +7,18 @@
     Features: Drag & Drop, Batch Compilation, Build Profiles, Recent Files, Theme Toggle, and unsigned builds.
 #>
 
-param([switch]$ForceSetup, [switch]$SkipSetup, [string]$File, [string]$Output, [string]$Profile)
+param(
+    [switch]$ForceSetup,
+    [switch]$SkipSetup,
+    [string]$File,
+    [string]$Output,
+    [string]$Profile,
+    [ValidateSet('Install', 'DryRun', 'Diagnostic', 'Manual', 'OfflineArtifact')]
+    [string]$SetupMode = 'Install',
+    [string]$Toolchain = 'pyinstaller',
+    [string]$ArtifactPath,
+    [string]$ExpectedSha256
+)
 
 # ============================================================================
 # GLOBAL CONFIGURATION
@@ -23,6 +34,9 @@ $script:HistoryFile = Join-Path $script:ConfigDir "history.json"
 $script:RecentFile = Join-Path $script:ConfigDir "recent.json"
 $script:SettingsFile = Join-Path $script:ConfigDir "settings.json"
 $script:LogFile = Join-Path $script:ConfigDir "install.log"
+$script:ToolchainAcquisitionFile = Join-Path $script:ConfigDir "toolchain-acquisitions.json"
+$script:ToolchainAcquisitionSchema = 'uc.toolchain-acquisition.v1'
+$script:ToolchainAcquisitionKind = 'universal-compiler.toolchain-acquisition'
 $script:TemplatesDir = Join-Path $script:ConfigDir "Templates"
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -254,8 +268,8 @@ function Get-PreferredCapability {
     return $preferred | Select-Object -First 1
 }
 
-# Ensure config directory
-if (-not (Test-Path $script:ConfigDir)) { New-Item -ItemType Directory -Path $script:ConfigDir -Force | Out-Null }
+# Ensure config directory for modes that may persist setup records or run the GUI.
+if ($SetupMode -ne 'Diagnostic' -and -not (Test-Path $script:ConfigDir)) { New-Item -ItemType Directory -Path $script:ConfigDir -Force | Out-Null }
 
 # ============================================================================
 # SETTINGS & THEMES
@@ -427,7 +441,7 @@ function Initialize-Templates {
     foreach ($f in $templates.Keys) { $p = Join-Path $script:TemplatesDir $f; if (-not (Test-Path $p)) { Set-Content -Path $p -Value $templates[$f] -Encoding UTF8 } }
 }
 
-Initialize-Templates
+if ($SetupMode -notin @('Diagnostic', 'DryRun', 'Manual', 'OfflineArtifact')) { Initialize-Templates }
 
 # ============================================================================
 # DEPENDENCY MANAGEMENT
@@ -436,61 +450,139 @@ Initialize-Templates
 function Write-InstallLog { param([string]$M); Add-Content -Path $script:LogFile -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] $M" -ErrorAction SilentlyContinue }
 function Test-PS2EXEInstalled { $m = Get-Module -ListAvailable -Name ps2exe -EA SilentlyContinue; if ($m) { return $true }; $paths = @((Join-Path ([Environment]::GetFolderPath('MyDocuments')) "WindowsPowerShell\Modules\ps2exe")); foreach ($p in $paths) { if (Test-Path (Join-Path $p "ps2exe.psm1")) { return $true } }; return $false }
 
-function Install-PS2EXEDirect {
-    $modPath = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "WindowsPowerShell\Modules\ps2exe"
-    if (-not (Test-Path $modPath)) { New-Item -ItemType Directory -Path $modPath -Force | Out-Null }
-    $zipUrl = "https://github.com/MScholtes/PS2EXE/archive/refs/heads/master.zip"; $zipFile = Join-Path $env:TEMP "ps2exe_$(Get-Random).zip"; $extractDir = Join-Path $env:TEMP "ps2exe_ext_$(Get-Random)"
-    try {
-        $wc = New-Object System.Net.WebClient; $wc.Headers.Add("User-Agent", "PowerShell"); $wc.DownloadFile($zipUrl, $zipFile)
-        Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile, $extractDir)
-        $inner = Get-ChildItem -Path $extractDir -Directory | Select-Object -First 1; $src = Join-Path $inner.FullName "Module"
-        if (-not (Test-Path $src)) { $src = $inner.FullName }
-        Get-ChildItem -Path $src -File | ForEach-Object { Copy-Item $_.FullName $modPath -Force }
-        return (Test-Path (Join-Path $modPath "ps2exe.psm1"))
-    } catch { return $false } finally { Remove-Item $zipFile -Force -EA SilentlyContinue; Remove-Item $extractDir -Recurse -Force -EA SilentlyContinue }
+function Get-ToolchainCatalog {
+    return [ordered]@{
+        ps2exe = [ordered]@{ Backend='ps2exe'; Name='PS2EXE'; Version='1.12.0'; SourceUrl='https://www.powershellgallery.com/packages/ps2exe/1.12.0'; License='MIT'; SourceType='package-manager'; PackageManager='PowerShellGet'; Package='ps2exe'; ExpectedSha256=$null }
+        pyinstaller = [ordered]@{ Backend='pyinstaller'; Name='PyInstaller'; Version='6.20.0'; SourceUrl='https://pypi.org/project/pyinstaller/6.20.0/'; License='GPL-2.0-or-later'; SourceType='package-manager'; PackageManager='pip'; Package='pyinstaller'; ExpectedSha256=$null }
+        go = [ordered]@{ Backend='go'; Name='Go'; Version='1.22.5'; SourceUrl='https://go.dev/dl/go1.22.5.windows-amd64.zip'; License='BSD-3-Clause'; SourceType='package-manager'; PackageManager='winget'; Package='GoLang.Go'; ExpectedSha256=$null }
+        ocra = [ordered]@{ Backend='ocra'; Name='Ruby+Ocra'; Version='1.3.11'; SourceUrl='https://rubygems.org/gems/ocra/versions/1.3.11'; License='MIT'; SourceType='package-manager'; PackageManager='RubyGems'; Package='ocra'; ExpectedSha256=$null }
+        ahk2exe = [ordered]@{ Backend='ahk2exe'; Name='AutoHotkey'; Version='2.0.18'; SourceUrl='https://github.com/AutoHotkey/AutoHotkey/releases/tag/v2.0.18'; License='GPL-2.0-or-later'; SourceType='package-manager'; PackageManager='winget'; Package='AutoHotkey.AutoHotkey'; ExpectedSha256=$null }
+    }
 }
 
-function Install-GoDirect {
-    try {
-        $zipUrl = "https://go.dev/dl/go1.22.5.windows-amd64.zip"; $installDir = "$env:LOCALAPPDATA\Programs\Go"; $zipFile = Join-Path $env:TEMP "go_$(Get-Random).zip"
-        $wc = New-Object System.Net.WebClient; $wc.Headers.Add("User-Agent", "PowerShell"); $wc.DownloadFile($zipUrl, $zipFile)
-        $parent = Split-Path $installDir; if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-        if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
-        Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile, $parent)
-        $goBin = Join-Path $installDir "bin"; $env:PATH = "$goBin;$env:PATH"
-        $userPath = [Environment]::GetEnvironmentVariable("PATH", "User"); if ($userPath -notlike "*$goBin*") { [Environment]::SetEnvironmentVariable("PATH", "$goBin;$userPath", "User") }
-        Remove-Item $zipFile -Force -EA SilentlyContinue; return (Test-Path (Join-Path $goBin "go.exe"))
-    } catch { return $false }
+function Save-ToolchainAcquisitionRecord {
+    param([Parameter(Mandatory)]$Record)
+    $records = @()
+    if (Test-Path -LiteralPath $script:ToolchainAcquisitionFile) {
+        try {
+            $loaded = Get-Content -LiteralPath $script:ToolchainAcquisitionFile -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($loaded.records) { $records = @($loaded.records) }
+        } catch { $records = @() }
+    }
+    $records += $Record
+    $records = @($records | Select-Object -Last 100)
+    $payload = [ordered]@{ schema_version=$script:ToolchainAcquisitionSchema; kind=$script:ToolchainAcquisitionKind; records=$records }
+    $temporary = "$($script:ToolchainAcquisitionFile).$PID.tmp"
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($temporary, ($payload | ConvertTo-Json -Depth 12), $utf8)
+    Move-Item -LiteralPath $temporary -Destination $script:ToolchainAcquisitionFile -Force
 }
 
-function Install-RubyDirect {
-    try {
-        $url = "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-3.2.4-1/rubyinstaller-3.2.4-1-x64.exe"; $inst = Join-Path $env:TEMP "ruby_$(Get-Random).exe"
-        $wc = New-Object System.Net.WebClient; $wc.Headers.Add("User-Agent", "PowerShell"); $wc.DownloadFile($url, $inst)
-        $installResult = Invoke-PolicyCommand -FilePath $inst -Arguments @('/verysilent', '/norestart', '/tasks=modpath') -AllowNetwork -AllowDependencyInstall -AllowTemporaryExecutable
-        Remove-Item $inst -Force -EA SilentlyContinue; if (-not $installResult.Success) { return $false }
-        $rubyPaths = @("C:\Ruby32-x64\bin", "C:\Ruby31-x64\bin"); foreach ($rp in $rubyPaths) { if (Test-Path (Join-Path $rp "ruby.exe")) { $env:PATH = "$rp;$env:PATH"; return $true } }
-        return $false
-    } catch { return $false }
+function New-ToolchainAcquisitionRecord {
+    param(
+        [Parameter(Mandatory)]$Definition,
+        [Parameter(Mandatory)][string]$Mode,
+        [Parameter(Mandatory)][string]$Status,
+        [int]$ResultCode = 0,
+        [string]$Message = '',
+        [string]$ArtifactPath,
+        [string]$ObservedVersion
+    )
+    $sha256 = $null
+    $hashStatus = 'not-verified'
+    if ($ArtifactPath -and (Test-Path -LiteralPath $ArtifactPath -PathType Leaf)) {
+        try { $sha256 = (Get-FileHash -LiteralPath $ArtifactPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant(); $hashStatus = 'measured' } catch { $hashStatus = 'hash-failed' }
+    } elseif ($Mode -eq 'package-manager') {
+        $hashStatus = 'package-manager-integrity'
+    }
+    return [ordered]@{
+        schema_version=$script:ToolchainAcquisitionSchema
+        kind=$script:ToolchainAcquisitionKind
+        recorded_at=(Get-Date).ToUniversalTime().ToString('o')
+        backend=$Definition.Backend
+        name=$Definition.Name
+        version=if ($ObservedVersion) { $ObservedVersion } else { $Definition.Version }
+        source_url=$Definition.SourceUrl
+        source_type=$Definition.SourceType
+        package_manager=$Definition.PackageManager
+        license=$Definition.License
+        expected_sha256=$Definition.ExpectedSha256
+        sha256=$sha256
+        hash_status=$hashStatus
+        mode=$Mode
+        install_result=$Status
+        result_code=$ResultCode
+        message=(Redact-ExecutionText $Message)
+    }
 }
 
-function Install-AutoHotkeyDirect {
-    try {
-        $url = "https://www.autohotkey.com/download/ahk-v2.exe"; $inst = Join-Path $env:TEMP "ahk_$(Get-Random).exe"
-        $wc = New-Object System.Net.WebClient; $wc.Headers.Add("User-Agent", "PowerShell"); $wc.DownloadFile($url, $inst)
-        $installResult = Invoke-PolicyCommand -FilePath $inst -Arguments @('/silent') -AllowNetwork -AllowDependencyInstall -AllowTemporaryExecutable
-        Remove-Item $inst -Force -EA SilentlyContinue; if (-not $installResult.Success) { return $false }
-        $ahkPaths = @("${env:ProgramFiles}\AutoHotkey\Compiler\Ahk2Exe.exe", "${env:ProgramFiles}\AutoHotkey\v2\Compiler\Ahk2Exe.exe")
-        foreach ($ap in $ahkPaths) { if (Test-Path $ap) { return $true } }; return $false
-    } catch { return $false }
+function Invoke-ToolchainAcquisition {
+    param(
+        [Parameter(Mandatory)][string]$Backend,
+        [ValidateSet('package-manager', 'offline-artifact', 'manual', 'dry-run', 'diagnostic')]
+        [string]$Mode = 'dry-run',
+        [string]$ArtifactPath,
+        [string]$ExpectedSha256
+    )
+    $catalog = Get-ToolchainCatalog
+    if (-not $catalog.Contains($Backend)) { return [ordered]@{ backend=$Backend; install_result='unsupported'; message='No acquisition definition exists' } }
+    $definition = $catalog[$Backend]
+    if ($Mode -eq 'dry-run') {
+        $record = New-ToolchainAcquisitionRecord $definition $Mode 'planned' -Message 'No network, package manager, or installer action was executed'
+        Save-ToolchainAcquisitionRecord $record; return $record
+    }
+    if ($Mode -eq 'diagnostic') { return New-ToolchainAcquisitionRecord $definition $Mode 'diagnostic' -Message 'Detection-only diagnostic; no state change was requested' }
+    if ($Mode -eq 'manual') {
+        $record = New-ToolchainAcquisitionRecord $definition $Mode 'manual-required' -Message "Install $($definition.Name) $($definition.Version) manually from $($definition.SourceUrl)"
+        Save-ToolchainAcquisitionRecord $record; return $record
+    }
+    if ($Mode -eq 'offline-artifact') {
+        $expected = if ($ExpectedSha256) { $ExpectedSha256 } else { $definition.ExpectedSha256 }
+        if (-not $ArtifactPath -or -not (Test-Path -LiteralPath $ArtifactPath -PathType Leaf)) {
+            $record = New-ToolchainAcquisitionRecord $definition $Mode 'failed' 2 -Message 'Offline artifact path is missing'; Save-ToolchainAcquisitionRecord $record; return $record
+        }
+        if ($expected -notmatch '^[0-9a-fA-F]{64}$') {
+            $record = New-ToolchainAcquisitionRecord $definition $Mode 'blocked' 2 -ArtifactPath $ArtifactPath -Message 'Offline acquisition requires an expected SHA-256 in the pinned manifest'; Save-ToolchainAcquisitionRecord $record; return $record
+        }
+        try { $actual = (Get-FileHash -LiteralPath $ArtifactPath -Algorithm SHA256 -ErrorAction Stop).Hash }
+        catch {
+            $record = New-ToolchainAcquisitionRecord $definition $Mode 'failed' 2 -ArtifactPath $ArtifactPath -Message 'Offline artifact hashing failed'; Save-ToolchainAcquisitionRecord $record; return $record
+        }
+        $status = if ($actual -ieq $expected) { 'verified-offline-artifact' } else { 'hash-mismatch' }
+        $record = New-ToolchainAcquisitionRecord $definition $Mode $status $(if ($status -eq 'hash-mismatch') { 1 } else { 0 }) -ArtifactPath $ArtifactPath -Message "Offline artifact SHA-256 measured as $actual"
+        Save-ToolchainAcquisitionRecord $record; return $record
+    }
+    $result = $null
+    switch ($definition.PackageManager) {
+        'PowerShellGet' {
+            $result = Invoke-PolicyCommand -FilePath 'powershell' -Arguments @('-NoProfile', '-NonInteractive', '-Command', "Install-Module $($definition.Package) -RequiredVersion $($definition.Version) -Scope CurrentUser -Force -Repository PSGallery") -AllowNetwork -AllowDependencyInstall
+        }
+        'pip' {
+            $pythonCommand = Get-CorePythonCommand
+            if (-not $pythonCommand) { $result = [pscustomobject]@{ Success=$false; Output='Python was not found'; ReturnCode=127 } }
+            else { $result = Invoke-PolicyCommand -FilePath $pythonCommand.Source -Arguments @('-m', 'pip', 'install', "$($definition.Package)==$($definition.Version)", '--only-binary=:all:') -AllowNetwork -AllowDependencyInstall }
+        }
+        'winget' {
+            $result = Invoke-PolicyCommand -FilePath 'winget' -Arguments @('install', '--id', $definition.Package, '--exact', '--version', $definition.Version, '--silent', '--accept-source-agreements', '--accept-package-agreements') -AllowNetwork -AllowDependencyInstall
+        }
+        'RubyGems' {
+            $result = Invoke-PolicyCommand -FilePath 'gem' -Arguments @('install', $definition.Package, '--version', $definition.Version, '--no-document') -AllowNetwork -AllowDependencyInstall
+        }
+        default { $result = [pscustomobject]@{ Success=$false; Output="Unsupported package manager: $($definition.PackageManager)"; ReturnCode=2 } }
+    }
+    $status = if ($result.Success) { 'installed' } else { 'failed' }
+    $record = New-ToolchainAcquisitionRecord $definition $Mode $status $result.ReturnCode -Message $result.Output
+    Save-ToolchainAcquisitionRecord $record
+    return $record
 }
 
 function Get-DependencyStatus {
-    $caps = Get-CoreCapabilities
+    param([switch]$SkipProbe)
+    $caps = if ($SkipProbe) { [pscustomobject]@{} } else { Get-CoreCapabilities }
+    $catalog = Get-ToolchainCatalog
     $definitions = @(
         @{ Backend='ps2exe'; Key='PS2EXE'; Func='Install-PS2EXE'; Size='~2 MB' },
         @{ Backend='pyinstaller'; Key='PyInstaller'; Func='Install-PyInstaller'; Size='~15 MB' },
-        @{ Backend='pkg'; Key='pkg'; Func='Install-Pkg'; Size='~50 MB' },
         @{ Backend='go'; Key='Go'; Func='Install-Go'; Size='~150 MB' },
         @{ Backend='ocra'; Key='Ruby+Ocra'; Func='Install-Ruby'; Size='~120 MB' },
         @{ Backend='ahk2exe'; Key='AutoHotkey'; Func='Install-AutoHotkey'; Size='~5 MB' },
@@ -502,26 +594,32 @@ function Get-DependencyStatus {
         $property = $caps.PSObject.Properties | Where-Object { $_.Name -eq $definition.Backend } | Select-Object -First 1
         $capability = if ($property) { $property.Value } else { $null }
         $extensions = if ($capability) { @($capability.extensions) -join ', ' } else { '' }
-        $entry = @{ Name=$definition.Key; Desc=$extensions; Installed=[bool]($capability -and $capability.available); Size=$definition.Size }
+        $entry = @{ Name=$definition.Key; Backend=$definition.Backend; Desc=$extensions; Installed=if ($SkipProbe) { $null } else { [bool]($capability -and $capability.available) }; Size=$definition.Size }
         if ($definition.Func) { $entry.Func = $definition.Func }
         if ($definition.BuiltIn) { $entry.BuiltIn = $true }
+        if ($SkipProbe) { $entry.Probe = 'skipped-read-only' }
+        if ($catalog.Contains($definition.Backend)) { $entry.Version=$catalog[$definition.Backend].Version; $entry.SourceUrl=$catalog[$definition.Backend].SourceUrl; $entry.License=$catalog[$definition.Backend].License; $entry.Sha256=$catalog[$definition.Backend].ExpectedSha256; $entry.AcquisitionMode=$catalog[$definition.Backend].SourceType }
         $deps[$definition.Key] = $entry
     }
     return $deps
 }
 
-function Install-PS2EXE { $ok = Install-PS2EXEDirect; if (-not $ok) { $result = Invoke-PolicyCommand -FilePath 'powershell' -Arguments @('-NoProfile', '-NonInteractive', '-Command', 'Install-Module ps2exe -Scope CurrentUser -Force') -AllowNetwork -AllowDependencyInstall; $ok = $result.Success }; return $ok }
-function Install-PyInstaller { $result = Invoke-PolicyCommand -FilePath 'pip' -Arguments @('install', 'pyinstaller', '--quiet') -AllowNetwork -AllowDependencyInstall; if (-not $result.Success) { return $false }; return ((Invoke-PolicyCommand -FilePath 'pip' -Arguments @('show', 'pyinstaller')).Output -match "Name: pyinstaller") }
-function Install-Pkg { $result = Invoke-PolicyCommand -FilePath 'npm' -Arguments @('install', '-g', 'pkg') -AllowNetwork -AllowDependencyInstall; if (-not $result.Success) { return $false }; return ((Invoke-PolicyCommand -FilePath 'npm' -Arguments @('list', '-g', 'pkg')).Output -match "pkg@") }
-function Install-Go { return Install-GoDirect }
-function Install-Ruby { $ok = Install-RubyDirect; if ($ok) { Start-Sleep -Seconds 2; [void](Invoke-PolicyCommand -FilePath 'gem' -Arguments @('install', 'ocra', '--no-document') -AllowNetwork -AllowDependencyInstall) }; return $ok }
-function Install-AutoHotkey { return Install-AutoHotkeyDirect }
+function Install-PS2EXE { return [bool]((Invoke-ToolchainAcquisition -Backend 'ps2exe' -Mode 'package-manager').install_result -eq 'installed') }
+function Install-PyInstaller { return [bool]((Invoke-ToolchainAcquisition -Backend 'pyinstaller' -Mode 'package-manager').install_result -eq 'installed') }
+function Install-Pkg { return [bool]((Invoke-ToolchainAcquisition -Backend 'pkg' -Mode 'manual').install_result -eq 'installed') }
+function Install-Go { return [bool]((Invoke-ToolchainAcquisition -Backend 'go' -Mode 'package-manager').install_result -eq 'installed') }
+function Install-Ruby { return [bool]((Invoke-ToolchainAcquisition -Backend 'ocra' -Mode 'package-manager').install_result -eq 'installed') }
+function Install-AutoHotkey { return [bool]((Invoke-ToolchainAcquisition -Backend 'ahk2exe' -Mode 'package-manager').install_result -eq 'installed') }
 
 # ============================================================================
 # SETUP GUI
 # ============================================================================
 
 function Show-SetupWindow {
+    param(
+        [ValidateSet('package-manager', 'dry-run', 'manual')]
+        [string]$Mode = 'package-manager'
+    )
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     
     # Enable DPI Awareness
@@ -538,6 +636,13 @@ public class SetupDpiAwareness {
     try { [SetupDpiAwareness]::SetProcessDpiAwareness(2) | Out-Null } catch { try { [SetupDpiAwareness]::SetProcessDPIAware() | Out-Null } catch { } }
     
     $deps = Get-DependencyStatus
+    $script:SetupAcquisitionMode = $Mode
+    $setupDescription = switch ($Mode) {
+        'dry-run' { 'Preview pinned acquisitions without changing the system' }
+        'manual' { 'Record manual acquisition instructions without changing the system' }
+        default { 'Install exact tool versions through an explicitly authorized package manager' }
+    }
+    $installButtonText = if ($Mode -eq 'package-manager') { 'Install Selected' } else { 'Review Selected' }
     $th = $script:Themes[$script:Settings.Theme]
     
     $xaml = @"
@@ -548,7 +653,7 @@ public class SetupDpiAwareness {
             <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
             <Border Background="$($th.Card)" CornerRadius="12,12,0,0" Padding="20,15">
                 <Grid><StackPanel><StackPanel Orientation="Horizontal"><TextBlock Text="⚡" FontSize="22" Foreground="$($th.Green)" Margin="0,0,10,0"/><TextBlock Text="Universal Compiler" FontSize="20" FontWeight="Bold" Foreground="$($th.T1)"/><TextBlock Text="v$($script:AppVersion)" FontSize="10" Foreground="$($th.T3)" VerticalAlignment="Bottom" Margin="8,0,0,4"/></StackPanel>
-                <TextBlock Text="Select compilers to install" FontSize="11" Foreground="$($th.T2)" Margin="32,4,0,0"/></StackPanel>
+                <TextBlock Text="$setupDescription" FontSize="11" Foreground="$($th.T2)" Margin="32,4,0,0"/></StackPanel>
                 <Button x:Name="btnClose" Content="✕" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Foreground="$($th.T3)" BorderThickness="0" FontSize="14" Cursor="Hand" Padding="8,4"/></Grid>
             </Border>
             <ScrollViewer Grid.Row="1" Margin="15,10" VerticalScrollBarVisibility="Auto"><StackPanel x:Name="depList"/></ScrollViewer>
@@ -557,7 +662,7 @@ public class SetupDpiAwareness {
                 <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                 <TextBlock x:Name="lblSel" Text="0 selected" Foreground="$($th.T3)" FontSize="11" VerticalAlignment="Center"/>
                 <Button x:Name="btnSkip" Grid.Column="1" Content="Skip" Padding="16,10" Margin="0,0,8,0" Background="$($th.Border)" Foreground="$($th.T1)" BorderThickness="0" Cursor="Hand"/>
-                <Button x:Name="btnInstall" Grid.Column="2" Content="Install Selected" Padding="16,10" Background="$($th.Green)" Foreground="$($th.Bg)" FontWeight="SemiBold" BorderThickness="0" Cursor="Hand"/></Grid>
+                <Button x:Name="btnInstall" Grid.Column="2" Content="$installButtonText" Padding="16,10" Background="$($th.Green)" Foreground="$($th.Bg)" FontWeight="SemiBold" BorderThickness="0" Cursor="Hand"/></Grid>
             </Border>
         </Grid>
     </Border>
@@ -566,7 +671,7 @@ public class SetupDpiAwareness {
     $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml)); $win = [Windows.Markup.XamlReader]::Load($reader)
     $btnClose = $win.FindName("btnClose"); $depList = $win.FindName("depList"); $progSection = $win.FindName("progSection"); $progText = $win.FindName("progText"); $progBar = $win.FindName("progBar"); $lblSel = $win.FindName("lblSel"); $btnSkip = $win.FindName("btnSkip"); $btnInstall = $win.FindName("btnInstall")
     
-    $script:depCbs = @{}; $script:setupDone = $false
+    $script:depCbs = @{}; $script:setupDone = $false; $script:setupSucceeded = $true
     
     foreach ($key in $deps.Keys) {
         $d = $deps[$key]
@@ -595,14 +700,17 @@ public class SetupDpiAwareness {
         if ($toInstall.Count -eq 0) { $script:setupDone=$true; $win.Close(); return }
         $progBar.Maximum=$toInstall.Count; $cur=0
         foreach ($inst in $toInstall) {
-            $cur++; $progBar.Value=$cur; $progText.Text="Installing $($inst.D.Name)..."; $win.Dispatcher.Invoke([Action]{},[System.Windows.Threading.DispatcherPriority]::Background)
-            $fn = $inst.D.Func; if ($fn) { try { & $fn | Out-Null } catch { } }
+            $cur++; $progBar.Value=$cur; $progText.Text="Processing $($inst.D.Name)..."; $win.Dispatcher.Invoke([Action]{},[System.Windows.Threading.DispatcherPriority]::Background)
+            try {
+                $record = Invoke-ToolchainAcquisition -Backend $inst.D.Backend -Mode $script:SetupAcquisitionMode
+                if ($script:SetupAcquisitionMode -eq 'package-manager' -and $record.install_result -ne 'installed') { $script:setupSucceeded = $false }
+            } catch { $script:setupSucceeded = $false }
         }
-        $progText.Text="Complete!"; Start-Sleep -Seconds 1; $script:setupDone=$true; $win.Close()
+        $progText.Text=if ($script:SetupAcquisitionMode -eq 'package-manager' -and -not $script:setupSucceeded) { "One or more acquisitions failed." } elseif ($script:SetupAcquisitionMode -eq 'package-manager') { "Complete!" } else { "Records written." }; Start-Sleep -Seconds 1; $script:setupDone=$true; $win.Close()
     })
     
     $win.ShowDialog() | Out-Null
-    @{ DependenciesInstalled=$true; SetupDate=(Get-Date).ToString("o") } | ConvertTo-Json | Set-Content -Path $script:ConfigFile -Force
+    if ($Mode -eq 'package-manager' -and $script:setupSucceeded) { @{ DependenciesInstalled=$true; SetupDate=(Get-Date).ToString("o") } | ConvertTo-Json | Set-Content -Path $script:ConfigFile -Force }
     return $script:setupDone
 }
 
@@ -613,8 +721,44 @@ public class SetupDpiAwareness {
 # Check for first run
 $needSetup = $true
 if (Test-Path $script:ConfigFile) { try { $cfg = Get-Content $script:ConfigFile -Raw | ConvertFrom-Json; if ($cfg.DependenciesInstalled) { $needSetup = $false } } catch { } }
+# Diagnostic mode is headless and read-only: it reports capability and acquisition
+# metadata without loading WPF or invoking an installer.
+if ($SetupMode -eq 'Diagnostic') {
+    [ordered]@{
+        schema_version = $script:ToolchainAcquisitionSchema
+        kind = $script:ToolchainAcquisitionKind
+        mode = 'diagnostic'
+        generated_at = (Get-Date).ToUniversalTime().ToString('o')
+        dependencies = Get-DependencyStatus -SkipProbe
+    } | ConvertTo-Json -Depth 12
+    exit 0
+}
+if (($SetupMode -eq 'DryRun' -or $SetupMode -eq 'Manual') -and -not $ForceSetup) {
+    $catalog = Get-ToolchainCatalog
+    $records = @()
+    $mode = if ($SetupMode -eq 'DryRun') { 'dry-run' } else { 'manual' }
+    foreach ($backend in $catalog.Keys) { $records += Invoke-ToolchainAcquisition -Backend $backend -Mode $mode }
+    [ordered]@{
+        schema_version = $script:ToolchainAcquisitionSchema
+        kind = $script:ToolchainAcquisitionKind
+        mode = $mode
+        records = $records
+    } | ConvertTo-Json -Depth 12
+    exit 0
+}
+if ($SetupMode -eq 'OfflineArtifact') {
+    $record = Invoke-ToolchainAcquisition -Backend $Toolchain -Mode 'offline-artifact' -ArtifactPath $ArtifactPath -ExpectedSha256 $ExpectedSha256
+    $record | ConvertTo-Json -Depth 12
+    if ($record.install_result -ne 'verified-offline-artifact') { exit 1 }
+    exit 0
+}
 # Setup is an explicit operator action; normal launches never download/install tools.
-if ($ForceSetup -and -not $SkipSetup) { Show-SetupWindow | Out-Null }
+$setupAcquisitionMode = switch ($SetupMode) {
+    'DryRun' { 'dry-run' }
+    'Manual' { 'manual' }
+    default { 'package-manager' }
+}
+if ($ForceSetup -and -not $SkipSetup) { Show-SetupWindow -Mode $setupAcquisitionMode | Out-Null }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
 

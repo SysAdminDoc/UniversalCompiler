@@ -63,6 +63,10 @@ All notable changes to UniversalCompiler will be documented in this file.
 - Add a local `release` dry-run and verification command that emits unsigned
   artifacts, SHA-256 checksums, CycloneDX SBOM data, SLSA-shaped provenance,
   and a static verification report without credentials or publishing.
+- Replace mutable setup downloads and direct installer launches with a pinned,
+  package-manager-only acquisition catalog, explicit dry-run/manual/diagnostic
+  modes, offline SHA-256 verification, bounded provenance records, and no
+  implicit setup during script startup.
 
 ## [v0.1.0] - %Y->- (HEAD -> main, origin/main, origin/HEAD)
 
