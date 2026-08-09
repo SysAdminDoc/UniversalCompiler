@@ -197,6 +197,9 @@ python .\UniversalCompiler.py analytics --recent 10
 python .\UniversalCompiler.py diagnostics --recent 10 --json
 python .\UniversalCompiler.py diagnostics --export .\diagnostics-export.json --allow-telemetry --json
 
+# Select a message locale explicitly; English is the fallback for missing keys
+python .\UniversalCompiler.py --locale es list-toolchains
+
 # Inspect available toolchains or verify an artifact without running it
 python .\UniversalCompiler.py list-toolchains
 python .\UniversalCompiler.py list-toolchains --json
@@ -338,6 +341,37 @@ Save your favorite settings as profiles:
 | `Drag & Drop` | Load file(s) |
 | `Browse Button` | Open file dialog |
 | `▼ Button` | Recent files menu |
+| `F5` | Start the current build |
+| `Escape` | Request cancellation of the active Python-shell build |
+| `Alt+B` | Open the source-file picker |
+| `Ctrl+L` | Focus the build log |
+
+## ♿ Accessibility and Localization
+
+Both GUI shells load the shared `resources\i18n\catalog.json` catalog. Locale
+selection is explicit setting/command-line value first, then `UC_LOCALE`,
+`UNIVERSAL_COMPILER_LOCALE`, `LC_ALL`/`LANG`, and the Windows UI culture;
+unsupported regional variants fall back to their language and finally English.
+Catalog messages use named placeholders and one/other plural forms. Number,
+binary-size, and timestamp formatting use catalog separators and patterns
+without changing the process-wide system locale. Use `--locale es` for the
+Python CLI or `-Locale es` for PowerShell.
+
+The Python shell declares semantic names and roles for its interactive controls,
+uses a deterministic tab order, shows a two-pixel keyboard focus treatment,
+and provides the F5/Escape/Alt+B/Ctrl+L golden-path bindings. Escape passes a
+cancellation event into the bounded core process policy. The WPF shell exposes
+`AutomationProperties.Name`, native control roles, a focus visual style,
+keyboard tab navigation, and a high-contrast palette. Native WPF UI Automation
+peers are the assistive-technology surface; the Python shell's semantic
+registry is the cross-platform fallback for Tk/customtkinter bridges.
+
+The headless contract suite validates catalog fallback/plurals/formatting,
+keyboard bindings, semantic role declarations, WPF automation names, focus
+styles, high-contrast branches, and WCAG relative-luminance contrast ratios for
+the normal and high-contrast palettes. Interactive screen-reader checks remain a
+Windows UI Automation/manual acceptance step because launching a GUI is not
+part of the noninteractive build/test suite.
 
 ---
 

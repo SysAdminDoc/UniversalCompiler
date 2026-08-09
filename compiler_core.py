@@ -16,6 +16,7 @@ import hashlib
 import importlib.metadata as importlib_metadata
 import importlib.util
 import json
+import locale as _system_locale
 import math
 import os
 import py_compile
@@ -53,6 +54,9 @@ except ImportError:  # pragma: no cover - POSIX uses fcntl.
 
 APP_NAME = "Universal Compiler"
 APP_VERSION = "2.1.0"
+I18N_SCHEMA_VERSION = "uc.i18n.v1"
+DEFAULT_LOCALE = "en"
+I18N_CATALOG_FILENAME = "catalog.json"
 REQUEST_SCHEMA_VERSION = "uc.request.v1"
 RESULT_SCHEMA_VERSION = "uc.result.v1"
 CAPABILITY_SCHEMA_VERSION = "uc.capability.v1"
@@ -76,6 +80,248 @@ ADAPTER_API_VERSION = "uc.adapter.v1"
 ADAPTER_ENTRY_POINT_GROUP = "universal_compiler.adapters"
 ADAPTER_ALLOWLIST_ENV = "UC_ADAPTER_ALLOWLIST"
 ADAPTER_POLICY_VERSION = "uc.adapter-policy.v1"
+
+
+_BUILTIN_I18N_CATALOG: dict[str, Any] = {
+    "schema_version": I18N_SCHEMA_VERSION,
+    "default_locale": DEFAULT_LOCALE,
+    "locales": {
+        "en": {
+            "messages": {
+                "app.title": APP_NAME,
+                "status.ready": "Ready",
+                "status.compiling": "Compiling...",
+                "status.cancelling": "Cancelling...",
+                "status.complete": "Complete!",
+                "status.failed": "Failed",
+                "cli.error": "ERROR: {error}",
+                "cli.warning": "WARNING: {warning}",
+            },
+            "plurals": {
+                "queue.files": {"one": "{count} file", "other": "{count} files"}
+            },
+            "format": {
+                "decimal_separator": ".",
+                "group_separator": ",",
+                "date_format": "%Y-%m-%d",
+                "time_format": "%H:%M:%S",
+            },
+        }
+    },
+}
+
+
+def normalize_locale(value: str | None) -> str:
+    """Normalize a BCP-47/POSIX locale token for catalog lookup."""
+
+    if not value:
+        return ""
+    token = str(value).strip().replace("_", "-")
+    if not token or token.lower() in {"auto", "c", "posix"}:
+        return ""
+    parts = token.split("-")
+    return "-".join(
+        [parts[0].lower(), *[part.upper() if len(part) == 2 else part for part in parts[1:]]]
+    )
+
+
+def resolve_locale(
+    preferred: str | None = None,
+    environment: Mapping[str, str] | None = None,
+    available: Iterable[str] | None = None,
+) -> str:
+    """Choose a catalog locale using explicit, environment, then OS settings.
+
+    ``UC_LOCALE`` and ``UNIVERSAL_COMPILER_LOCALE`` are intentionally first-class
+    overrides so CLI, Tk, and PowerShell launches can select the same locale
+    without mutating the process-wide C/POSIX locale.
+    """
+
+    values = {normalize_locale(value) for value in (available or (DEFAULT_LOCALE,))}
+    values.discard("")
+    default = normalize_locale(DEFAULT_LOCALE) or DEFAULT_LOCALE
+    if default not in values:
+        values.add(default)
+    env = os.environ if environment is None else environment
+    candidates = [preferred]
+    candidates.extend(
+        env.get(name)
+        for name in ("UC_LOCALE", "UNIVERSAL_COMPILER_LOCALE", "LC_ALL", "LANG")
+    )
+    try:
+        candidates.append(_system_locale.getlocale()[0])
+    except ValueError:
+        pass
+    for candidate in candidates:
+        normalized = normalize_locale(candidate)
+        if not normalized:
+            continue
+        if normalized in values:
+            return normalized
+        base = normalized.split("-", 1)[0]
+        if base in values:
+            return base
+    return default
+
+
+def _catalog_value(mapping: Any, key: str) -> Any:
+    if isinstance(mapping, Mapping):
+        return mapping.get(key)
+    return None
+
+
+class MessageCatalog:
+    """Shared, dependency-free message and locale formatting catalog."""
+
+    def __init__(
+        self,
+        locale_name: str | None = None,
+        catalog_path: os.PathLike[str] | str | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
+        source = (
+            Path(catalog_path).expanduser()
+            if catalog_path
+            else Path(__file__).resolve().parent / "resources" / "i18n" / I18N_CATALOG_FILENAME
+        )
+        payload: Mapping[str, Any] = _BUILTIN_I18N_CATALOG
+        try:
+            loaded = json.loads(source.read_text(encoding="utf-8"))
+            if (
+                isinstance(loaded, Mapping)
+                and loaded.get("schema_version") == I18N_SCHEMA_VERSION
+                and isinstance(loaded.get("locales"), Mapping)
+            ):
+                payload = loaded
+        except (OSError, ValueError, TypeError):
+            pass
+        self.source = source
+        self.default_locale = normalize_locale(
+            str(payload.get("default_locale", DEFAULT_LOCALE))
+        ) or DEFAULT_LOCALE
+        raw_locales = payload.get("locales", {})
+        self.locales: dict[str, Mapping[str, Any]] = {
+            normalize_locale(str(name)): value
+            for name, value in raw_locales.items()
+            if normalize_locale(str(name)) and isinstance(value, Mapping)
+        }
+        if self.default_locale not in self.locales:
+            self.locales[DEFAULT_LOCALE] = _BUILTIN_I18N_CATALOG["locales"]["en"]
+        self.locale = resolve_locale(
+            locale_name,
+            environment=environment,
+            available=self.locales,
+        )
+
+    @property
+    def available_locales(self) -> tuple[str, ...]:
+        return tuple(sorted(self.locales))
+
+    def _locale_data(self) -> Mapping[str, Any]:
+        return self.locales.get(self.locale, self.locales[self.default_locale])
+
+    def message(self, key: str, default: str | None = None, **values: Any) -> str:
+        """Return a translated message, falling back to English and the key."""
+
+        localized = _catalog_value(self._locale_data().get("messages"), key)
+        fallback = _catalog_value(self.locales[self.default_locale].get("messages"), key)
+        template = localized or fallback or default or key
+        if not isinstance(template, str):
+            template = str(template)
+        try:
+            return template.format(**values)
+        except (IndexError, KeyError, ValueError):
+            return template
+
+    def plural(
+        self,
+        key: str,
+        quantity: int | float,
+        default: str | None = None,
+        **values: Any,
+    ) -> str:
+        """Format a two-form plural message with an English fallback."""
+
+        forms = _catalog_value(self._locale_data().get("plurals"), key)
+        if not isinstance(forms, Mapping):
+            forms = _catalog_value(
+                self.locales[self.default_locale].get("plurals"), key
+            )
+        template = forms.get("one" if quantity == 1 else "other") if forms else None
+        if not isinstance(template, str):
+            template = default or key
+        values.setdefault("count", quantity)
+        return self.message_from_template(template, **values)
+
+    @staticmethod
+    def message_from_template(template: str, **values: Any) -> str:
+        try:
+            return template.format(**values)
+        except (IndexError, KeyError, ValueError):
+            return template
+
+    def format_number(self, value: int | float, decimals: int = 0) -> str:
+        """Format a number using catalog separators without changing global locale."""
+
+        formatting = self._locale_data().get("format", {})
+        decimal_separator = str(formatting.get("decimal_separator", "."))
+        group_separator = str(formatting.get("group_separator", ","))
+        rendered = f"{float(value):,.{max(0, int(decimals))}f}"
+        integer, _, fraction = rendered.partition(".")
+        integer = integer.replace(",", group_separator)
+        return integer if not fraction else integer + decimal_separator + fraction
+
+    def format_size(self, size: int) -> str:
+        """Format bytes with locale-aware separators and stable binary units."""
+
+        value = float(size)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if abs(value) < 1024 or unit == "TB":
+                decimals = 0 if unit == "B" else 1
+                return f"{self.format_number(value, decimals)} {unit}"
+            value /= 1024
+        return f"{self.format_number(value, 1)} TB"
+
+    def format_datetime(self, value: datetime) -> str:
+        """Format a timestamp using the catalog's locale date/time pattern."""
+
+        formatting = self._locale_data().get("format", {})
+        date_format = str(formatting.get("date_format", "%Y-%m-%d"))
+        time_format = str(formatting.get("time_format", "%H:%M:%S"))
+        return value.strftime(f"{date_format} {time_format}")
+
+
+def get_message_catalog(
+    locale_name: str | None = None,
+    catalog_path: os.PathLike[str] | str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> MessageCatalog:
+    """Return the shared catalog used by CLI and graphical shells."""
+
+    return MessageCatalog(locale_name, catalog_path, environment)
+
+
+def contrast_ratio(foreground: str, background: str) -> float:
+    """Return the WCAG relative-luminance contrast ratio for two hex colors."""
+
+    def luminance(color: str) -> float:
+        token = color.strip().lstrip("#")
+        if len(token) == 3:
+            token = "".join(character * 2 for character in token)
+        if len(token) != 6:
+            raise ValueError(f"Expected a six-digit hex color, got {color!r}")
+        channels = [int(token[index : index + 2], 16) / 255 for index in (0, 2, 4)]
+        linear = [
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
+            for channel in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    lighter = max(luminance(foreground), luminance(background))
+    darker = min(luminance(foreground), luminance(background))
+    return (lighter + 0.05) / (darker + 0.05)
 
 
 DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
@@ -155,6 +401,7 @@ DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
 
 DEFAULT_MANIFEST_SETTINGS: dict[str, Any] = {
     "theme": "Dark",
+    "locale": "",
     "post_build_action": "None",
     "post_build_copy_path": "",
     "show_notifications": True,
@@ -5369,6 +5616,10 @@ def create_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="UniversalCompiler", description="Build scripts into Windows executables."
     )
+    parser.add_argument(
+        "--locale",
+        help="Message locale (for example: en, es); defaults to UC_LOCALE/system locale",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     build_parser = subparsers.add_parser("build", help="Build one source file")
@@ -5535,8 +5786,24 @@ def _default_output(source: Path) -> Path:
     return source.with_suffix(".exe")
 
 
-def _result_text(result: BuildResult) -> str:
-    lines = [f"{result.status}: {result.output}"]
+def _cli_error(catalog: MessageCatalog, error: BaseException) -> None:
+    print(
+        catalog.message("cli.error", "ERROR: {error}", error=redact_text(str(error))),
+        file=sys.stderr,
+    )
+
+
+def _cli_warning(catalog: MessageCatalog, warning: str) -> None:
+    print(
+        catalog.message("cli.warning", "WARNING: {warning}", warning=warning),
+        file=sys.stderr,
+    )
+
+
+def _result_text(result: BuildResult, catalog: MessageCatalog | None = None) -> str:
+    messages = catalog or get_message_catalog()
+    status = messages.message(f"status.{result.status}", result.status)
+    lines = [f"{status}: {result.output}"]
     if result.backend:
         lines.append(f"backend: {result.backend}")
     if result.message:
@@ -5557,13 +5824,14 @@ def _result_text(result: BuildResult) -> str:
 def cli_main(argv: Sequence[str] | None = None) -> int:
     parser = create_cli_parser()
     args = parser.parse_args(argv)
+    catalog = get_message_catalog(args.locale)
     if args.command == "list-toolchains":
         try:
             status_value = backend_status(
                 discover_adapters(args.adapter or None)
             )
         except BuildValidationError as error:
-            print(f"ERROR: {error}", file=sys.stderr)
+            _cli_error(catalog, error)
             return 1
         print(
             json.dumps(status_value, indent=2)
@@ -5600,10 +5868,10 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                     expected_scope=args.scope if args.path is None else None,
                 )
         except (BuildValidationError, OSError, ValueError) as error:
-            print(f"ERROR: {error}", file=sys.stderr)
+            _cli_error(catalog, error)
             return 1
         for warning in manifest_result.warnings:
-            print(f"WARNING: {warning}", file=sys.stderr)
+            _cli_warning(catalog, warning)
         if args.json:
             print(json.dumps(manifest_result.manifest, indent=2, default=str))
         else:
@@ -5632,7 +5900,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                     dry_run=True,
                 )
         except (BuildValidationError, OSError, ValueError) as error:
-            print(f"ERROR: {error}", file=sys.stderr)
+            _cli_error(catalog, error)
             return 1
         print(
             json.dumps(release_result, indent=2, default=str)
@@ -5661,7 +5929,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         try:
             output = compile_bytecode(args.source, args.output)
         except (BuildValidationError, OSError, py_compile.PyCompileError) as error:
-            print(f"ERROR: {error}", file=sys.stderr)
+            _cli_error(catalog, error)
             return 1
         bytecode_value = {"source": args.source, "output": str(output)}
         print(json.dumps(bytecode_value, indent=2) if args.json else str(output))
@@ -5670,7 +5938,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         try:
             output = extract_icon(args.executable, args.output)
         except (BuildValidationError, OSError) as error:
-            print(f"ERROR: {error}", file=sys.stderr)
+            _cli_error(catalog, error)
             return 1
         print(output)
         return 0
@@ -5684,7 +5952,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                 version=args.version,
             )
         except (BuildValidationError, OSError, zipfile.BadZipFile) as error:
-            print(f"ERROR: {error}", file=sys.stderr)
+            _cli_error(catalog, error)
             return 1
         print(output)
         return 0
@@ -5692,7 +5960,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         try:
             output = obfuscate_source(args.source, args.method, args.output)
         except (BuildValidationError, OSError) as error:
-            print(f"ERROR: {error}", file=sys.stderr)
+            _cli_error(catalog, error)
             return 1
         print(output)
         return 0
@@ -5714,7 +5982,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             if args.recent:
                 analytics_value["recent"] = analytics_store.recent(args.recent)
         except (BuildValidationError, OSError, sqlite3.DatabaseError) as error:
-            print(f"ERROR: {error}", file=sys.stderr)
+            _cli_error(catalog, error)
             return 1
         print(
             json.dumps(analytics_value, indent=2, default=str)
@@ -5734,7 +6002,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                 else None
             )
         except (BuildValidationError, OSError, ValueError) as error:
-            print(f"ERROR: {error}", file=sys.stderr)
+            _cli_error(catalog, error)
             return 1
         diagnostics_value = {
             "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
@@ -5798,11 +6066,11 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             )
             profiles = manifest_result.manifest["profiles"]
             for warning in manifest_result.warnings:
-                print(f"WARNING: {warning}", file=sys.stderr)
+                _cli_warning(catalog, warning)
         else:
             profiles = load_profiles(profile_file)
     except (BuildValidationError, OSError, ValueError) as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        _cli_error(catalog, error)
         return 1
     profile = profiles.get(args.profile)
     if profile is None:
@@ -5810,7 +6078,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     try:
         adapters = discover_adapters(getattr(args, "adapter", None) or None)
     except BuildValidationError as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        _cli_error(catalog, error)
         return 1
     engine = CompilerEngine(adapters=adapters)
     build_analytics: BuildAnalytics | None = (
@@ -5826,7 +6094,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             )
         )
     except (BuildValidationError, OSError, ValueError) as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        _cli_error(catalog, error)
         return 1
     if args.command == "build":
         source = Path(args.source).expanduser()
@@ -5844,7 +6112,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                     allow_missing_source=True,
                 )
             except BuildValidationError as error:
-                print(f"ERROR: {error}", file=sys.stderr)
+                _cli_error(catalog, error)
                 return 2
             print(command_display(plan.command))
             return 0
@@ -5862,7 +6130,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                     print(
                         json.dumps(result.as_dict(), indent=2, default=str)
                         if args.json
-                        else _result_text(result),
+                        else _result_text(result, catalog),
                         flush=True,
                     )
             except KeyboardInterrupt:
@@ -5885,7 +6153,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                     )
                 )
             else:
-                print("\n\n".join(_result_text(result) for result in results))
+                print("\n\n".join(_result_text(result, catalog) for result in results))
             return 0 if all(result.success for result in results) else 1
         build_result = engine.build(request)
         if build_analytics:
@@ -5895,7 +6163,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         print(
             json.dumps(build_result.as_dict(), indent=2, default=str)
             if args.json
-            else _result_text(build_result)
+            else _result_text(build_result, catalog)
         )
         return 0 if build_result.success else 1
     if args.command == "batch":
@@ -5931,7 +6199,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                 )
             )
         else:
-            print("\n\n".join(_result_text(result) for result in results))
+            print("\n\n".join(_result_text(result, catalog) for result in results))
         return 0 if all(result.success for result in results) else 1
     parser.error(f"Unsupported command: {args.command}")
     return 2
@@ -5940,6 +6208,9 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "APP_NAME",
     "APP_VERSION",
+    "DEFAULT_LOCALE",
+    "I18N_CATALOG_FILENAME",
+    "I18N_SCHEMA_VERSION",
     "ADAPTER_ALLOWLIST_ENV",
     "ADAPTER_API_VERSION",
     "ADAPTER_ENTRY_POINT_GROUP",
@@ -5977,6 +6248,7 @@ __all__ = [
     "ExecutionPolicy",
     "EXTENSION_BACKENDS",
     "ManifestLoadResult",
+    "MessageCatalog",
     "VerificationResult",
     "backend_status",
     "artifact_manifest_path",
@@ -5986,13 +6258,16 @@ __all__ = [
     "command_display",
     "compile_bytecode",
     "config_dir",
+    "contrast_ratio",
     "detect_file_type",
     "dependency_lock_path",
     "discover_adapters",
     "estimate_output_size",
     "extract_icon",
     "format_size",
+    "get_message_catalog",
     "new_correlation_id",
+    "normalize_locale",
     "github_actions_template",
     "obfuscate_source",
     "load_json",
@@ -6013,6 +6288,7 @@ __all__ = [
     "redact_command",
     "redact_text",
     "release_bundle",
+    "resolve_locale",
     "RESULT_SCHEMA_VERSION",
     "save_json",
     "save_project_manifest",

@@ -9,6 +9,7 @@ import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,7 @@ from compiler_core import (
     BuildResult,
     CommandResult,
     CompilerEngine,
+    contrast_ratio,
     ExecutionPolicy,
     PROJECT_MANIFEST_SCHEMA_VERSION,
     REQUEST_SCHEMA_VERSION,
@@ -49,6 +51,7 @@ from compiler_core import (
     github_actions_template,
     load_profiles,
     load_json,
+    get_message_catalog,
     load_project_manifest,
     default_project_manifest,
     project_manifest_backup_path,
@@ -58,6 +61,7 @@ from compiler_core import (
     backend_status,
     discover_adapters,
     rollback_project_manifest,
+    resolve_locale,
     run_command,
     save_profiles,
     save_json,
@@ -347,6 +351,49 @@ def test_powershell_toolchain_acquisition_is_pinned_and_explicit() -> None:
     assert "Invoke-WithStateLock" in powershell
     assert "Write-AtomicText" in powershell
     assert '("." + [IO.Path]::GetFileName($destination) + ".lock")' in powershell
+
+
+def test_localization_catalog_has_fallback_plural_and_locale_formatting() -> None:
+    catalog = get_message_catalog("es-MX")
+
+    assert catalog.locale == "es"
+    assert catalog.message("source.file") == "📁 Archivo de origen"
+    assert catalog.message("actions.from_exe") == "From EXE"
+    assert catalog.plural("queue.files", 1) == "1 archivo"
+    assert catalog.plural("queue.files", 3) == "3 archivos"
+    assert catalog.format_number(12345.6, 1) == "12.345,6"
+    assert catalog.format_size(1536) == "1,5 KB"
+    assert catalog.format_datetime(datetime(2026, 8, 8, 13, 4, 5, tzinfo=UTC)) == (
+        "08/08/2026 13:04:05"
+    )
+    assert contrast_ratio("#f8fafc", "#020617") >= 4.5
+    assert contrast_ratio("#ffffff", "#000000") == 21.0
+    assert resolve_locale("fr-CA", environment={}, available=("en", "es")) == "en"
+
+
+def test_gui_accessibility_and_localization_contracts_are_declared() -> None:
+    root = Path(__file__).resolve().parents[1]
+    python_shell = (root / "UniversalCompiler.py").read_text(encoding="utf-8")
+    powershell = (root / "UniversalCompiler.ps1").read_text(encoding="utf-8")
+    catalog = json.loads(
+        (root / "resources" / "i18n" / "catalog.json").read_text(encoding="utf-8")
+    )
+
+    assert catalog["schema_version"] == "uc.i18n.v1"
+    assert {"en", "es"} <= set(catalog["locales"])
+    assert "plural" in json.dumps(catalog["locales"]["en"])
+    assert "get_message_catalog" in python_shell
+    assert 'self.root.bind("<F5>"' in python_shell
+    assert 'self.root.bind("<Escape>"' in python_shell
+    assert 'self.root.bind("<Control-l>"' in python_shell
+    assert "_register_accessible" in python_shell
+    assert "high_contrast_enabled" in python_shell
+    assert "AutomationProperties.Name" in powershell
+    assert "KeyboardNavigation.TabNavigation" in powershell
+    assert "FocusVisual" in powershell
+    assert "HighContrast" in powershell
+    assert "Get-LocalizedMessage" in powershell
+    assert "[string]$Locale" in powershell
 
 
 def test_profiles_round_trip_without_extra_dependency(tmp_path: Path) -> None:

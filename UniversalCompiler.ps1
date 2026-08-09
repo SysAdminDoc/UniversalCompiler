@@ -17,7 +17,8 @@ param(
     [string]$SetupMode = 'Install',
     [string]$Toolchain = 'pyinstaller',
     [string]$ArtifactPath,
-    [string]$ExpectedSha256
+    [string]$ExpectedSha256,
+    [string]$Locale
 )
 
 # ============================================================================
@@ -37,6 +38,10 @@ $script:LogFile = Join-Path $script:ConfigDir "install.log"
 $script:ToolchainAcquisitionFile = Join-Path $script:ConfigDir "toolchain-acquisitions.json"
 $script:ToolchainAcquisitionSchema = 'uc.toolchain-acquisition.v1'
 $script:ToolchainAcquisitionKind = 'universal-compiler.toolchain-acquisition'
+$script:ResourceCatalogFile = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'resources\i18n\catalog.json' } else { Join-Path (Get-Location).Path 'resources\i18n\catalog.json' }
+$script:LocalePreference = $Locale
+$script:Locale = 'en'
+$script:Catalog = $null
 $script:TemplatesDir = Join-Path $script:ConfigDir "Templates"
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -52,6 +57,83 @@ $script:ExecutionInheritedEnvironment = @(
     'VIRTUAL_ENV', 'WINDIR'
 )
 $script:ExecutionAllowedRoots = @($PSHOME, (Join-Path $env:WINDIR 'System32')) + @($env:PATH -split ';' | Where-Object { $_ })
+
+function Get-CatalogProperty {
+    param($Object, [string]$Key)
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Key]
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function Normalize-CompilerLocale {
+    param([string]$Value)
+    if (-not $Value) { return '' }
+    $token = $Value.Trim().Replace('_', '-')
+    if (-not $token -or $token.ToLowerInvariant() -in @('auto', 'c', 'posix')) { return '' }
+    $parts = $token.Split('-')
+    $normalized = @($parts[0].ToLowerInvariant())
+    for ($i = 1; $i -lt $parts.Count; $i++) {
+        $normalized += if ($parts[$i].Length -eq 2) { $parts[$i].ToUpperInvariant() } else { $parts[$i] }
+    }
+    return ($normalized -join '-')
+}
+
+function Resolve-CompilerLocale {
+    param([string]$Preferred, [string[]]$Available = @('en'))
+    $availableNormalized = @($Available | ForEach-Object { Normalize-CompilerLocale $_ } | Where-Object { $_ })
+    $candidates = @($Preferred, $env:UC_LOCALE, $env:UNIVERSAL_COMPILER_LOCALE, [Globalization.CultureInfo]::CurrentUICulture.Name)
+    foreach ($candidate in $candidates) {
+        $normalized = Normalize-CompilerLocale $candidate
+        if (-not $normalized) { continue }
+        if ($availableNormalized -contains $normalized) { return $normalized }
+        $base = $normalized.Split('-')[0]
+        if ($availableNormalized -contains $base) { return $base }
+    }
+    return if ($availableNormalized -contains 'en') { 'en' } else { $availableNormalized | Select-Object -First 1 }
+}
+
+function Initialize-CompilerLocalization {
+    param([string]$PreferredLocale)
+    $fallback = [pscustomobject]@{
+        schema_version = 'uc.i18n.v1'
+        default_locale = 'en'
+        locales = [pscustomobject]@{ en = [pscustomobject]@{ messages = [pscustomobject]@{}; plurals = [pscustomobject]@{}; format = [pscustomobject]@{} } }
+    }
+    try {
+        if (Test-Path -LiteralPath $script:ResourceCatalogFile -PathType Leaf) {
+            $loaded = Get-Content -LiteralPath $script:ResourceCatalogFile -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($loaded.schema_version -eq 'uc.i18n.v1' -and $loaded.locales) { $fallback = $loaded }
+        }
+    } catch { }
+    $script:Catalog = $fallback
+    $available = @($script:Catalog.locales.PSObject.Properties.Name)
+    $script:Locale = Resolve-CompilerLocale -Preferred $PreferredLocale -Available $available
+}
+
+function Get-LocalizedMessage {
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [string]$Default,
+        [int]$Count = -1,
+        [hashtable]$Values = @{}
+    )
+    $defaultData = Get-CatalogProperty $script:Catalog.locales (Get-CatalogProperty $script:Catalog 'default_locale')
+    $localeData = Get-CatalogProperty $script:Catalog.locales $script:Locale
+    if (-not $localeData) { $localeData = $defaultData }
+    $text = Get-CatalogProperty (Get-CatalogProperty $localeData 'messages') $Key
+    if (-not $text) { $text = Get-CatalogProperty (Get-CatalogProperty $defaultData 'messages') $Key }
+    if ($Count -ge 0) {
+        $forms = Get-CatalogProperty (Get-CatalogProperty $localeData 'plurals') $Key
+        if (-not $forms) { $forms = Get-CatalogProperty (Get-CatalogProperty $defaultData 'plurals') $Key }
+        if ($forms) { $text = Get-CatalogProperty $forms $(if ($Count -eq 1) { 'one' } else { 'other' }) }
+    }
+    if (-not $text) { $text = if ($Default) { $Default } else { $Key } }
+    foreach ($name in $Values.Keys) { $text = $text.Replace("{$name}", [string]$Values[$name]) }
+    return $text
+}
+
+Initialize-CompilerLocalization -PreferredLocale $script:LocalePreference
 
 function ConvertTo-ProcessArgument {
     param([AllowNull()][string]$Value)
@@ -335,7 +417,7 @@ if ($SetupMode -ne 'Diagnostic' -and -not (Test-Path $script:ConfigDir)) { New-I
 # SETTINGS & THEMES
 # ============================================================================
 
-$script:DefaultSettings = @{ Theme = 'Dark'; PostBuildAction = 'None'; PostBuildCopyPath = ''; ShowNotifications = $true; AutoCheckUpdates = $true; MaxRecentFiles = 10; MaxHistoryItems = 50; DefaultProfile = 'Default' }
+$script:DefaultSettings = @{ Theme = 'Dark'; Locale = $script:Locale; PostBuildAction = 'None'; PostBuildCopyPath = ''; ShowNotifications = $true; AutoCheckUpdates = $true; MaxRecentFiles = 10; MaxHistoryItems = 50; DefaultProfile = 'Default' }
 
 function Get-ObjectEntries {
     param($Value)
@@ -352,7 +434,7 @@ function Get-ObjectEntries {
 
 function ConvertTo-CanonicalSettings {
     param($Value)
-    $map = @{ Theme='theme'; PostBuildAction='post_build_action'; PostBuildCopyPath='post_build_copy_path'; ShowNotifications='show_notifications'; AutoCheckUpdates='auto_check_updates'; MaxRecentFiles='max_recent_files'; MaxHistoryItems='max_history_items'; DefaultProfile='default_profile' }
+    $map = @{ Theme='theme'; Locale='locale'; PostBuildAction='post_build_action'; PostBuildCopyPath='post_build_copy_path'; ShowNotifications='show_notifications'; AutoCheckUpdates='auto_check_updates'; MaxRecentFiles='max_recent_files'; MaxHistoryItems='max_history_items'; DefaultProfile='default_profile' }
     $result = [ordered]@{}
     foreach ($property in Get-ObjectEntries $Value) { if ($map.ContainsKey($property.Name)) { $result[$map[$property.Name]] = $property.Value } }
     return $result
@@ -360,7 +442,7 @@ function ConvertTo-CanonicalSettings {
 
 function ConvertFrom-CanonicalSettings {
     param($Value)
-    $map = @{ theme='Theme'; post_build_action='PostBuildAction'; post_build_copy_path='PostBuildCopyPath'; show_notifications='ShowNotifications'; auto_check_updates='AutoCheckUpdates'; max_recent_files='MaxRecentFiles'; max_history_items='MaxHistoryItems'; default_profile='DefaultProfile' }
+    $map = @{ theme='Theme'; locale='Locale'; post_build_action='PostBuildAction'; post_build_copy_path='PostBuildCopyPath'; show_notifications='ShowNotifications'; auto_check_updates='AutoCheckUpdates'; max_recent_files='MaxRecentFiles'; max_history_items='MaxHistoryItems'; default_profile='DefaultProfile' }
     $result = @{}
     foreach ($property in Get-ObjectEntries $Value) { if ($map.ContainsKey($property.Name)) { $result[$map[$property.Name]] = $property.Value } }
     return $result
@@ -411,6 +493,7 @@ function Get-AppSettings {
 function Save-AppSettings { param([hashtable]$S); Update-CanonicalManifest -Updater { param($manifest); $manifest.settings = ConvertTo-CanonicalSettings $S; return $manifest } }
 
 $script:Settings = Get-AppSettings
+$script:Locale = Resolve-CompilerLocale -Preferred $script:Settings.Locale -Available @($script:Catalog.locales.PSObject.Properties.Name)
 
 $script:Themes = @{
     Dark = @{ Bg='#020617'; Card='#0f172a'; CardHover='#1e293b'; Border='#1e293b'; Input='#0f172a'; Green='#22c55e'; GreenHover='#16a34a'; Blue='#60a5fa'; Red='#ef4444'; Yellow='#eab308'; T1='#f8fafc'; T2='#94a3b8'; T3='#64748b'; LogBg='#0a0f1a' }
@@ -480,7 +563,15 @@ function Get-EstimatedOutputSize { param([string]$Src, [string]$Type)
     return "Unknown"
 }
 
-function FmtSize { param([long]$S); if ($S -gt 1GB) { "{0:N1} GB" -f ($S/1GB) } elseif ($S -gt 1MB) { "{0:N1} MB" -f ($S/1MB) } elseif ($S -gt 1KB) { "{0:N1} KB" -f ($S/1KB) } else { "$S bytes" } }
+function FmtSize {
+    param([long]$S)
+    $cultureName = if ($script:Locale -eq 'en') { 'en-US' } else { $script:Locale }
+    try { $culture = [Globalization.CultureInfo]::GetCultureInfo($cultureName) } catch { $culture = [Globalization.CultureInfo]::InvariantCulture }
+    if ($S -gt 1GB) { return ([double]($S / 1GB)).ToString('N1', $culture) + ' GB' }
+    if ($S -gt 1MB) { return ([double]($S / 1MB)).ToString('N1', $culture) + ' MB' }
+    if ($S -gt 1KB) { return ([double]($S / 1KB)).ToString('N1', $culture) + ' KB' }
+    return ([double]$S).ToString('N0', $culture) + ' bytes'
+}
 
 function Export-BuildLog { param([string]$Log, [string]$Src)
     $ts = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"; $bn = [IO.Path]::GetFileNameWithoutExtension($Src)
@@ -716,27 +807,30 @@ public class SetupDpiAwareness {
         'manual' { 'Record manual acquisition instructions without changing the system' }
         default { 'Install exact tool versions through an explicitly authorized package manager' }
     }
-    $installButtonText = if ($Mode -eq 'package-manager') { 'Install Selected' } else { 'Review Selected' }
+    $installButtonText = if ($Mode -eq 'package-manager') { Get-LocalizedMessage 'setup.install_selected' 'Install Selected' } else { Get-LocalizedMessage 'setup.review_selected' 'Review Selected' }
     $th = $script:Themes[$script:Settings.Theme]
+    if ([SystemParameters]::HighContrast) {
+        $th = @{ Bg='#000000'; Card='#000000'; CardHover='#333333'; Border='#ffffff'; Input='#000000'; Green='#00ff00'; GreenHover='#00cc00'; Blue='#00ffff'; Red='#ff6666'; Yellow='#ffff00'; T1='#ffffff'; T2='#ffffff'; T3='#cccccc'; LogBg='#000000' }
+    }
     
     $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Setup" Height="600" Width="650" WindowStartupLocation="CenterScreen" Background="$($th.Bg)" WindowStyle="None" AllowsTransparency="True" ResizeMode="NoResize">
+        Title="$(Get-LocalizedMessage 'app.title' 'Universal Compiler') - Setup" Height="600" Width="650" WindowStartupLocation="CenterScreen" Background="$($th.Bg)" WindowStyle="None" AllowsTransparency="True" ResizeMode="NoResize" KeyboardNavigation.TabNavigation="Continue" AutomationProperties.Name="Setup">
     <Border Background="$($th.Bg)" CornerRadius="12" BorderBrush="$($th.Border)" BorderThickness="1">
         <Grid>
             <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
             <Border Background="$($th.Card)" CornerRadius="12,12,0,0" Padding="20,15">
-                <Grid><StackPanel><StackPanel Orientation="Horizontal"><TextBlock Text="⚡" FontSize="22" Foreground="$($th.Green)" Margin="0,0,10,0"/><TextBlock Text="Universal Compiler" FontSize="20" FontWeight="Bold" Foreground="$($th.T1)"/><TextBlock Text="v$($script:AppVersion)" FontSize="10" Foreground="$($th.T3)" VerticalAlignment="Bottom" Margin="8,0,0,4"/></StackPanel>
+                <Grid><StackPanel><StackPanel Orientation="Horizontal"><TextBlock Text="⚡" FontSize="22" Foreground="$($th.Green)" Margin="0,0,10,0"/><TextBlock Text="$(Get-LocalizedMessage 'app.title' 'Universal Compiler')" FontSize="20" FontWeight="Bold" Foreground="$($th.T1)"/><TextBlock Text="v$($script:AppVersion)" FontSize="10" Foreground="$($th.T3)" VerticalAlignment="Bottom" Margin="8,0,0,4"/></StackPanel>
                 <TextBlock Text="$setupDescription" FontSize="11" Foreground="$($th.T2)" Margin="32,4,0,0"/></StackPanel>
-                <Button x:Name="btnClose" Content="✕" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Foreground="$($th.T3)" BorderThickness="0" FontSize="14" Cursor="Hand" Padding="8,4"/></Grid>
+                <Button x:Name="btnClose" Content="✕" AutomationProperties.Name="Close setup" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Foreground="$($th.T3)" BorderThickness="0" FontSize="14" Cursor="Hand" Padding="8,4"/></Grid>
             </Border>
             <ScrollViewer Grid.Row="1" Margin="15,10" VerticalScrollBarVisibility="Auto"><StackPanel x:Name="depList"/></ScrollViewer>
-            <Border x:Name="progSection" Grid.Row="2" Background="$($th.LogBg)" Padding="15" Visibility="Collapsed"><StackPanel><TextBlock x:Name="progText" Text="Installing..." Foreground="$($th.T2)" FontSize="11" Margin="0,0,0,6"/><ProgressBar x:Name="progBar" Height="5" Background="$($th.Border)" Foreground="$($th.Green)" BorderThickness="0"/></StackPanel></Border>
+            <Border x:Name="progSection" Grid.Row="2" Background="$($th.LogBg)" Padding="15" Visibility="Collapsed"><StackPanel><TextBlock x:Name="progText" Text="$(Get-LocalizedMessage 'setup.installing' 'Installing...')" Foreground="$($th.T2)" FontSize="11" Margin="0,0,0,6"/><ProgressBar x:Name="progBar" Height="5" Background="$($th.Border)" Foreground="$($th.Green)" BorderThickness="0"/></StackPanel></Border>
             <Border Grid.Row="3" Background="$($th.Card)" CornerRadius="0,0,12,12" Padding="15">
                 <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                <TextBlock x:Name="lblSel" Text="0 selected" Foreground="$($th.T3)" FontSize="11" VerticalAlignment="Center"/>
-                <Button x:Name="btnSkip" Grid.Column="1" Content="Skip" Padding="16,10" Margin="0,0,8,0" Background="$($th.Border)" Foreground="$($th.T1)" BorderThickness="0" Cursor="Hand"/>
-                <Button x:Name="btnInstall" Grid.Column="2" Content="$installButtonText" Padding="16,10" Background="$($th.Green)" Foreground="$($th.Bg)" FontWeight="SemiBold" BorderThickness="0" Cursor="Hand"/></Grid>
+                <TextBlock x:Name="lblSel" Text="$(Get-LocalizedMessage 'setup.selected' '{count} selected' -Count 0 -Values @{ count=0 })" Foreground="$($th.T3)" FontSize="11" VerticalAlignment="Center"/>
+                <Button x:Name="btnSkip" Grid.Column="1" Content="$(Get-LocalizedMessage 'setup.skip' 'Skip')" AutomationProperties.Name="Skip setup" Padding="16,10" Margin="0,0,8,0" Background="$($th.Border)" Foreground="$($th.T1)" BorderThickness="0" Cursor="Hand"/>
+                <Button x:Name="btnInstall" Grid.Column="2" Content="$installButtonText" AutomationProperties.Name="$installButtonText" Padding="16,10" Background="$($th.Green)" Foreground="$($th.Bg)" FontWeight="SemiBold" BorderThickness="0" Cursor="Hand"/></Grid>
             </Border>
         </Grid>
     </Border>
@@ -761,7 +855,7 @@ public class SetupDpiAwareness {
         $depList.Children.Add($card)
     }
     
-    $updateSel = { $c=0; foreach ($k in $script:depCbs.Keys) { if ($script:depCbs[$k].Cb.IsChecked -and $script:depCbs[$k].Cb.IsEnabled) { $c++ } }; $lblSel.Text="$c selected"; $btnInstall.IsEnabled=($c -gt 0) }
+    $updateSel = { $c=0; foreach ($k in $script:depCbs.Keys) { if ($script:depCbs[$k].Cb.IsChecked -and $script:depCbs[$k].Cb.IsEnabled) { $c++ } }; $lblSel.Text=(Get-LocalizedMessage 'setup.selected' '{count} selected' -Count $c -Values @{ count=$c }); $btnInstall.IsEnabled=($c -gt 0) }
     foreach ($k in $script:depCbs.Keys) { $script:depCbs[$k].Cb.Add_Checked($updateSel); $script:depCbs[$k].Cb.Add_Unchecked($updateSel) }
     & $updateSel
     
@@ -780,7 +874,7 @@ public class SetupDpiAwareness {
                 if ($script:SetupAcquisitionMode -eq 'package-manager' -and $record.install_result -ne 'installed') { $script:setupSucceeded = $false }
             } catch { $script:setupSucceeded = $false }
         }
-        $progText.Text=if ($script:SetupAcquisitionMode -eq 'package-manager' -and -not $script:setupSucceeded) { "One or more acquisitions failed." } elseif ($script:SetupAcquisitionMode -eq 'package-manager') { "Complete!" } else { "Records written." }; Start-Sleep -Seconds 1; $script:setupDone=$true; $win.Close()
+        $progText.Text=if ($script:SetupAcquisitionMode -eq 'package-manager' -and -not $script:setupSucceeded) { Get-LocalizedMessage 'status.failed' 'One or more acquisitions failed.' } elseif ($script:SetupAcquisitionMode -eq 'package-manager') { Get-LocalizedMessage 'status.complete' 'Complete!' } else { Get-LocalizedMessage 'setup.records_written' 'Records written.' }; Start-Sleep -Seconds 1; $script:setupDone=$true; $win.Close()
     })
     
     $win.ShowDialog() | Out-Null
@@ -806,6 +900,8 @@ if ($SetupMode -eq 'Diagnostic') {
         schema_version = $script:ToolchainAcquisitionSchema
         kind = $script:ToolchainAcquisitionKind
         mode = 'diagnostic'
+        requested_locale = $script:LocalePreference
+        locale = $script:Locale
         generated_at = (Get-Date).ToUniversalTime().ToString('o')
         dependencies = Get-DependencyStatus -SkipProbe
     } | ConvertTo-Json -Depth 12
@@ -820,6 +916,7 @@ if (($SetupMode -eq 'DryRun' -or $SetupMode -eq 'Manual') -and -not $ForceSetup)
         schema_version = $script:ToolchainAcquisitionSchema
         kind = $script:ToolchainAcquisitionKind
         mode = $mode
+        locale = $script:Locale
         records = $records
     } | ConvertTo-Json -Depth 12
     exit 0
@@ -864,6 +961,36 @@ try {
 }
 
 $th = $script:Themes[$script:Settings.Theme]
+if ([SystemParameters]::HighContrast) {
+    $th = @{ Bg='#000000'; Card='#000000'; CardHover='#333333'; Border='#ffffff'; Input='#000000'; Green='#00ff00'; GreenHover='#00cc00'; Blue='#00ffff'; Red='#ff6666'; Yellow='#ffff00'; T1='#ffffff'; T2='#ffffff'; T3='#cccccc'; LogBg='#000000' }
+}
+
+$script:UiText = @{
+    AppTitle = Get-LocalizedMessage 'app.title' 'Universal Compiler'
+    AppSubtitle = Get-LocalizedMessage 'app.subtitle' 'Drag files here or browse to compile'
+    Footer = (Get-LocalizedMessage 'app.footer' 'Universal Compiler v{version} • Drag & Drop • Batch Build • Profiles • Unsigned Builds' -Values @{ version=$script:AppVersion }).Replace('&', '&amp;')
+    SourceFile = Get-LocalizedMessage 'source.file' '📁 Source File'
+    Output = Get-LocalizedMessage 'output.title' '📤 Output'
+    OutputName = Get-LocalizedMessage 'output.name' 'Output Name'
+    OutputDirectory = Get-LocalizedMessage 'output.directory' 'Output Directory'
+    CustomIcon = Get-LocalizedMessage 'output.custom_icon' 'Custom Icon'
+    BuildOptions = Get-LocalizedMessage 'build.options' '🔧 Build Options'
+    Profile = Get-LocalizedMessage 'profile' 'Profile:'
+    Backend = Get-LocalizedMessage 'backend' 'Backend:'
+    PostBuild = Get-LocalizedMessage 'post_build.action' '⚡ Post-Build Action'
+    Metadata = Get-LocalizedMessage 'metadata' '📝 Metadata'
+    Queue = Get-LocalizedMessage 'queue.title' '📋 Batch Queue'
+    SourcePreview = Get-LocalizedMessage 'log.source_preview' '📄 Source Preview'
+    BuildLog = Get-LocalizedMessage 'log.title' '📜 Build Log'
+    Browse = Get-LocalizedMessage 'actions.browse' 'Browse'
+    ManageDeps = Get-LocalizedMessage 'actions.manage_dependencies' 'Manage Deps'
+    Compile = Get-LocalizedMessage 'actions.compile' '⚡ Compile'
+    Cancel = Get-LocalizedMessage 'actions.cancel' 'Cancel'
+    CompileAll = Get-LocalizedMessage 'actions.compile_all' 'Compile All in Queue'
+    Templates = Get-LocalizedMessage 'actions.templates' '📄 Templates'
+    History = Get-LocalizedMessage 'actions.history' '📊 History'
+    Ready = Get-LocalizedMessage 'status.ready' 'Ready'
+}
 
 # ============================================================================
 # MAIN WINDOW XAML
@@ -871,13 +998,15 @@ $th = $script:Themes[$script:Settings.Theme]
 
 $mainXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Universal Compiler v$($script:AppVersion)" Height="900" Width="1200" WindowStartupLocation="CenterScreen" Background="$($th.Bg)" AllowDrop="True" MinHeight="600" MinWidth="800" WindowState="Maximized">
+        Title="$($script:UiText.AppTitle) v$($script:AppVersion)" Height="900" Width="1200" WindowStartupLocation="CenterScreen" Background="$($th.Bg)" AllowDrop="True" MinHeight="600" MinWidth="800" WindowState="Maximized" KeyboardNavigation.TabNavigation="Continue" AutomationProperties.Name="$($script:UiText.AppTitle)">
     <Window.Resources>
-        <Style x:Key="BtnG" TargetType="Button"><Setter Property="Background" Value="$($th.Green)"/><Setter Property="Foreground" Value="$($th.Bg)"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Padding" Value="16,10"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="5" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="$($th.GreenHover)"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter TargetName="bd" Property="Background" Value="$($th.Border)"/><Setter Property="Foreground" Value="$($th.T3)"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
-        <Style x:Key="BtnS" TargetType="Button"><Setter Property="Background" Value="$($th.Border)"/><Setter Property="Foreground" Value="$($th.T1)"/><Setter Property="Padding" Value="12,8"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="5" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="$($th.CardHover)"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
-        <Style x:Key="Txt" TargetType="TextBox"><Setter Property="Background" Value="$($th.Input)"/><Setter Property="Foreground" Value="$($th.T1)"/><Setter Property="BorderBrush" Value="$($th.Border)"/><Setter Property="BorderThickness" Value="1"/><Setter Property="Padding" Value="10,8"/><Setter Property="CaretBrush" Value="$($th.Green)"/></Style>
-        <Style x:Key="Chk" TargetType="CheckBox"><Setter Property="Foreground" Value="$($th.T1)"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Margin" Value="0,0,0,6"/></Style>
+        <Style x:Key="FocusVisual" TargetType="{x:Type Control}"><Setter Property="Template"><Setter.Value><ControlTemplate><Border BorderBrush="$($th.Blue)" BorderThickness="2" CornerRadius="3"><AdornedElementPlaceholder/></Border></ControlTemplate></Setter.Value></Setter></Style>
+        <Style x:Key="BtnG" TargetType="Button"><Setter Property="FocusVisualStyle" Value="{StaticResource FocusVisual}"/><Setter Property="Background" Value="$($th.Green)"/><Setter Property="Foreground" Value="$($th.Bg)"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Padding" Value="16,10"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="5" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="$($th.GreenHover)"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter TargetName="bd" Property="Background" Value="$($th.Border)"/><Setter Property="Foreground" Value="$($th.T3)"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
+        <Style x:Key="BtnS" TargetType="Button"><Setter Property="FocusVisualStyle" Value="{StaticResource FocusVisual}"/><Setter Property="Background" Value="$($th.Border)"/><Setter Property="Foreground" Value="$($th.T1)"/><Setter Property="Padding" Value="12,8"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="5" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="$($th.CardHover)"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
+        <Style x:Key="Txt" TargetType="TextBox"><Setter Property="FocusVisualStyle" Value="{StaticResource FocusVisual}"/><Setter Property="Background" Value="$($th.Input)"/><Setter Property="Foreground" Value="$($th.T1)"/><Setter Property="BorderBrush" Value="$($th.Border)"/><Setter Property="BorderThickness" Value="1"/><Setter Property="Padding" Value="10,8"/><Setter Property="CaretBrush" Value="$($th.Green)"/></Style>
+        <Style x:Key="Chk" TargetType="CheckBox"><Setter Property="FocusVisualStyle" Value="{StaticResource FocusVisual}"/><Setter Property="Foreground" Value="$($th.T1)"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Margin" Value="0,0,0,6"/></Style>
         <Style x:Key="Cmb" TargetType="ComboBox">
+            <Setter Property="FocusVisualStyle" Value="{StaticResource FocusVisual}"/>
             <Setter Property="Background" Value="$($th.Input)"/>
             <Setter Property="Foreground" Value="$($th.T1)"/>
             <Setter Property="BorderBrush" Value="$($th.Border)"/>
@@ -942,10 +1071,10 @@ $mainXaml = @"
         <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
         <!-- Header -->
         <Grid Margin="0,0,0,15">
-            <StackPanel><StackPanel Orientation="Horizontal"><TextBlock Text="⚡" FontSize="26" Foreground="$($th.Green)" Margin="0,0,10,0"/><TextBlock Text="Universal Compiler" FontSize="24" FontWeight="Bold" Foreground="$($th.T1)"/><TextBlock Text="v$($script:AppVersion)" FontSize="10" Foreground="$($th.T3)" VerticalAlignment="Bottom" Margin="8,0,0,4"/></StackPanel><TextBlock Text="Drag files here or browse to compile" FontSize="11" Foreground="$($th.T2)" Margin="36,2,0,0"/></StackPanel>
+            <StackPanel><StackPanel Orientation="Horizontal"><TextBlock Text="⚡" FontSize="26" Foreground="$($th.Green)" Margin="0,0,10,0"/><TextBlock Text="$($script:UiText.AppTitle)" FontSize="24" FontWeight="Bold" Foreground="$($th.T1)"/><TextBlock Text="v$($script:AppVersion)" FontSize="10" Foreground="$($th.T3)" VerticalAlignment="Bottom" Margin="8,0,0,4"/></StackPanel><TextBlock Text="$($script:UiText.AppSubtitle)" FontSize="11" Foreground="$($th.T2)" Margin="36,2,0,0"/></StackPanel>
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top">
-                <Button x:Name="btnTheme" Content="🌙" Style="{StaticResource BtnS}" Padding="10,8" ToolTip="Toggle Theme" Margin="0,0,8,0"/>
-                <Button x:Name="btnSettings" Content="⚙" Style="{StaticResource BtnS}" Padding="10,8" ToolTip="Settings"/>
+                <Button x:Name="btnTheme" Content="🌙" Style="{StaticResource BtnS}" Padding="10,8" ToolTip="Toggle Theme" AutomationProperties.Name="Toggle theme" Margin="0,0,8,0"/>
+                <Button x:Name="btnSettings" Content="⚙" Style="{StaticResource BtnS}" Padding="10,8" ToolTip="Settings" AutomationProperties.Name="Settings"/>
             </StackPanel>
         </Grid>
         <!-- Main Content -->
@@ -956,10 +1085,10 @@ $mainXaml = @"
                     <!-- Drop Zone / Source -->
                     <Border x:Name="dropZone" Background="$($th.Card)" CornerRadius="8" Padding="20" Margin="0,0,0,12" BorderBrush="$($th.Green)" BorderThickness="2">
                         <StackPanel>
-                            <TextBlock Text="📁 Source File" FontSize="13" FontWeight="SemiBold" Foreground="$($th.T1)" Margin="0,0,0,10"/>
+                            <TextBlock Text="$($script:UiText.SourceFile)" FontSize="13" FontWeight="SemiBold" Foreground="$($th.T1)" Margin="0,0,0,10"/>
                             <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                                <TextBox x:Name="txtSource" Style="{StaticResource Txt}" IsReadOnly="True"/>
-                                <Button x:Name="btnBrowse" Grid.Column="1" Content="Browse" Style="{StaticResource BtnS}" Margin="8,0,0,0"/>
+                                <TextBox x:Name="txtSource" Style="{StaticResource Txt}" IsReadOnly="True" AutomationProperties.Name="Source file"/>
+                                <Button x:Name="btnBrowse" Grid.Column="1" Content="$($script:UiText.Browse)" Style="{StaticResource BtnS}" AutomationProperties.Name="$($script:UiText.Browse)" Margin="8,0,0,0"/>
                                 <Button x:Name="btnRecent" Grid.Column="2" Content="▼" Style="{StaticResource BtnS}" Margin="4,0,0,0" Padding="8,8" ToolTip="Recent Files"/>
                             </Grid>
                             <Border x:Name="pnlInfo" Background="$($th.Border)" CornerRadius="5" Padding="10" Margin="0,10,0,0" Visibility="Collapsed">
@@ -980,23 +1109,23 @@ $mainXaml = @"
                     <!-- Output -->
                     <Border Background="$($th.Card)" CornerRadius="8" Padding="16" Margin="0,0,0,12">
                         <StackPanel>
-                            <TextBlock Text="📤 Output" FontSize="13" FontWeight="SemiBold" Foreground="$($th.T1)" Margin="0,0,0,10"/>
+                            <TextBlock Text="$($script:UiText.Output)" FontSize="13" FontWeight="SemiBold" Foreground="$($th.T1)" Margin="0,0,0,10"/>
                             <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                                <StackPanel Margin="0,0,6,0"><TextBlock Text="Output Name" Foreground="$($th.T2)" FontSize="10" Margin="0,0,0,4"/><TextBox x:Name="txtOutName" Style="{StaticResource Txt}"/></StackPanel>
-                                <StackPanel Grid.Column="1" Margin="6,0,0,0"><TextBlock Text="Output Directory" Foreground="$($th.T2)" FontSize="10" Margin="0,0,0,4"/><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBox x:Name="txtOutDir" Style="{StaticResource Txt}" IsReadOnly="True"/><Button x:Name="btnOutDir" Grid.Column="1" Content="..." Style="{StaticResource BtnS}" Margin="4,0,0,0" Padding="10,8"/></Grid></StackPanel>
+                                <StackPanel Margin="0,0,6,0"><TextBlock Text="$($script:UiText.OutputName)" Foreground="$($th.T2)" FontSize="10" Margin="0,0,0,4"/><TextBox x:Name="txtOutName" Style="{StaticResource Txt}" AutomationProperties.Name="$($script:UiText.OutputName)"/></StackPanel>
+                                <StackPanel Grid.Column="1" Margin="6,0,0,0"><TextBlock Text="$($script:UiText.OutputDirectory)" Foreground="$($th.T2)" FontSize="10" Margin="0,0,0,4"/><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBox x:Name="txtOutDir" Style="{StaticResource Txt}" IsReadOnly="True" AutomationProperties.Name="$($script:UiText.OutputDirectory)"/><Button x:Name="btnOutDir" Grid.Column="1" Content="..." AutomationProperties.Name="$($script:UiText.OutputDirectory)" Style="{StaticResource BtnS}" Margin="4,0,0,0" Padding="10,8"/></Grid></StackPanel>
                             </Grid>
-                            <TextBlock Text="Custom Icon" Foreground="$($th.T2)" FontSize="10" Margin="0,10,0,4"/>
+                            <TextBlock Text="$($script:UiText.CustomIcon)" Foreground="$($th.T2)" FontSize="10" Margin="0,10,0,4"/>
                             <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                                <TextBox x:Name="txtIcon" Style="{StaticResource Txt}" IsReadOnly="True"/>
-                                <Button x:Name="btnIcon" Grid.Column="1" Content="Browse" Style="{StaticResource BtnS}" Margin="4,0,0,0"/>
-                                <Button x:Name="btnIconClear" Grid.Column="2" Content="✕" Style="{StaticResource BtnS}" Margin="4,0,0,0" Padding="8,8"/>
+                                <TextBox x:Name="txtIcon" Style="{StaticResource Txt}" IsReadOnly="True" AutomationProperties.Name="$($script:UiText.CustomIcon)"/>
+                                <Button x:Name="btnIcon" Grid.Column="1" Content="$($script:UiText.Browse)" AutomationProperties.Name="$($script:UiText.CustomIcon)" Style="{StaticResource BtnS}" Margin="4,0,0,0"/>
+                                <Button x:Name="btnIconClear" Grid.Column="2" Content="✕" AutomationProperties.Name="Clear icon" Style="{StaticResource BtnS}" Margin="4,0,0,0" Padding="8,8"/>
                             </Grid>
                         </StackPanel>
                     </Border>
                     <!-- Build Options -->
                     <Border Background="$($th.Card)" CornerRadius="8" Padding="16" Margin="0,0,0,12">
                         <StackPanel>
-                            <StackPanel Orientation="Horizontal" Margin="0,0,0,10"><TextBlock Text="🔧 Build Options" FontSize="13" FontWeight="SemiBold" Foreground="$($th.T1)"/><TextBlock Text="Profile:" Foreground="$($th.T3)" FontSize="10" VerticalAlignment="Center" Margin="20,0,6,0"/><ComboBox x:Name="cmbProfile" Style="{StaticResource Cmb}" Width="140"/><Button x:Name="btnSaveProfile" Content="💾" Style="{StaticResource BtnS}" Padding="6,4" Margin="4,0,0,0" ToolTip="Save Profile"/></StackPanel>
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,10"><TextBlock Text="$($script:UiText.BuildOptions)" FontSize="13" FontWeight="SemiBold" Foreground="$($th.T1)"/><TextBlock Text="$($script:UiText.Profile)" Foreground="$($th.T3)" FontSize="10" VerticalAlignment="Center" Margin="20,0,6,0"/><ComboBox x:Name="cmbProfile" Style="{StaticResource Cmb}" Width="140" AutomationProperties.Name="Profile"/><Button x:Name="btnSaveProfile" Content="💾" AutomationProperties.Name="Save profile" Style="{StaticResource BtnS}" Padding="6,4" Margin="4,0,0,0" ToolTip="Save Profile"/></StackPanel>
                             <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                                 <StackPanel Margin="0,0,8,0">
                                     <CheckBox x:Name="chkConsole" Content="Console Application" Style="{StaticResource Chk}" ToolTip="Show console window when running"/>
@@ -1041,36 +1170,36 @@ $mainXaml = @"
                 <!-- Batch Queue -->
                 <Border Background="$($th.Card)" CornerRadius="8" Padding="12" Margin="0,0,0,10">
                     <StackPanel>
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8"><TextBlock Text="📋 Batch Queue" FontSize="12" FontWeight="SemiBold" Foreground="$($th.T1)"/><TextBlock x:Name="lblQueueCount" Text=" (0)" Foreground="$($th.T3)" FontSize="12"/></StackPanel>
-                        <ListBox x:Name="lstQueue" Background="$($th.LogBg)" Foreground="$($th.T2)" BorderThickness="0" Height="60" FontSize="10"/>
-                        <StackPanel Orientation="Horizontal" Margin="0,6,0,0"><Button x:Name="btnAddQueue" Content="+ Add" Style="{StaticResource BtnS}" Padding="8,4" FontSize="10"/><Button x:Name="btnClearQueue" Content="Clear" Style="{StaticResource BtnS}" Padding="8,4" FontSize="10" Margin="4,0,0,0"/></StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8"><TextBlock Text="$($script:UiText.Queue)" FontSize="12" FontWeight="SemiBold" Foreground="$($th.T1)"/><TextBlock x:Name="lblQueueCount" Text=" (0)" Foreground="$($th.T3)" FontSize="12"/></StackPanel>
+                        <ListBox x:Name="lstQueue" Background="$($th.LogBg)" Foreground="$($th.T2)" BorderThickness="0" Height="60" FontSize="10" AutomationProperties.Name="Batch build queue"/>
+                        <StackPanel Orientation="Horizontal" Margin="0,6,0,0"><Button x:Name="btnAddQueue" Content="+ Add" AutomationProperties.Name="Add files to queue" Style="{StaticResource BtnS}" Padding="8,4" FontSize="10"/><Button x:Name="btnClearQueue" Content="Clear" AutomationProperties.Name="Clear queue" Style="{StaticResource BtnS}" Padding="8,4" FontSize="10" Margin="4,0,0,0"/></StackPanel>
                     </StackPanel>
                 </Border>
                 <!-- Build Log -->
                 <Border Grid.Row="1" Background="$($th.Card)" CornerRadius="8" Padding="12">
                     <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8"><TextBlock Text="📜 Build Log" FontSize="12" FontWeight="SemiBold" Foreground="$($th.T1)"/><Button x:Name="btnClearLog" Content="Clear" Style="{StaticResource BtnS}" Padding="6,2" FontSize="9" Margin="8,0,0,0"/><Button x:Name="btnExportLog" Content="Export" Style="{StaticResource BtnS}" Padding="6,2" FontSize="9" Margin="4,0,0,0"/></StackPanel>
-                        <Border Grid.Row="1" Background="$($th.LogBg)" CornerRadius="5"><ScrollViewer x:Name="logScroll" VerticalScrollBarVisibility="Auto"><TextBlock x:Name="txtLog" Foreground="$($th.T2)" FontFamily="Consolas" FontSize="10" Padding="10" TextWrapping="Wrap"/></ScrollViewer></Border>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,8"><TextBlock Text="$($script:UiText.BuildLog)" FontSize="12" FontWeight="SemiBold" Foreground="$($th.T1)"/><Button x:Name="btnClearLog" Content="Clear" AutomationProperties.Name="Clear build log" Style="{StaticResource BtnS}" Padding="6,2" FontSize="9" Margin="8,0,0,0"/><Button x:Name="btnExportLog" Content="Export" AutomationProperties.Name="Export build log" Style="{StaticResource BtnS}" Padding="6,2" FontSize="9" Margin="4,0,0,0"/></StackPanel>
+                        <Border Grid.Row="1" Background="$($th.LogBg)" CornerRadius="5"><ScrollViewer x:Name="logScroll" VerticalScrollBarVisibility="Auto"><TextBlock x:Name="txtLog" Foreground="$($th.T2)" FontFamily="Consolas" FontSize="10" Padding="10" TextWrapping="Wrap" AutomationProperties.Name="Build log"/></ScrollViewer></Border>
                     </Grid>
                 </Border>
                 <!-- Actions -->
                 <StackPanel Grid.Row="2" Margin="0,10,0,0">
                     <ProgressBar x:Name="progress" Height="4" Background="$($th.Border)" Foreground="$($th.Green)" BorderThickness="0" Visibility="Collapsed" Margin="0,0,0,8"/>
-                    <TextBlock x:Name="lblStatusBar" Text="Ready" Foreground="$($th.T3)" FontSize="10" HorizontalAlignment="Center" Margin="0,0,0,8"/>
+                    <TextBlock x:Name="lblStatusBar" Text="$($script:UiText.Ready)" Foreground="$($th.T3)" FontSize="10" HorizontalAlignment="Center" Margin="0,0,0,8" AutomationProperties.Name="Build status"/>
                     <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                        <Button x:Name="btnManageDeps" Content="Manage Deps" Style="{StaticResource BtnS}" Margin="0,0,4,0"/>
-                        <Button x:Name="btnCompile" Grid.Column="1" Content="⚡ Compile" Style="{StaticResource BtnG}" Margin="4,0,0,0" IsEnabled="False"/>
+                        <Button x:Name="btnManageDeps" Content="$($script:UiText.ManageDeps)" AutomationProperties.Name="$($script:UiText.ManageDeps)" Style="{StaticResource BtnS}" Margin="0,0,4,0"/>
+                        <Button x:Name="btnCompile" Grid.Column="1" Content="$($script:UiText.Compile)" AutomationProperties.Name="$($script:UiText.Compile)" Style="{StaticResource BtnG}" Margin="4,0,0,0" IsEnabled="False"/>
                     </Grid>
-                    <Button x:Name="btnCompileAll" Content="Compile All in Queue" Style="{StaticResource BtnS}" Margin="0,8,0,0" Visibility="Collapsed"/>
+                    <Button x:Name="btnCompileAll" Content="$($script:UiText.CompileAll)" AutomationProperties.Name="$($script:UiText.CompileAll)" Style="{StaticResource BtnS}" Margin="0,8,0,0" Visibility="Collapsed"/>
                     <Grid Margin="0,8,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                        <Button x:Name="btnTemplates" Content="📄 Templates" Style="{StaticResource BtnS}" Margin="0,0,4,0"/>
-                        <Button x:Name="btnHistory" Grid.Column="1" Content="📊 History" Style="{StaticResource BtnS}" Margin="4,0,0,0"/>
+                        <Button x:Name="btnTemplates" Content="$($script:UiText.Templates)" AutomationProperties.Name="$($script:UiText.Templates)" Style="{StaticResource BtnS}" Margin="0,0,4,0"/>
+                        <Button x:Name="btnHistory" Grid.Column="1" Content="$($script:UiText.History)" AutomationProperties.Name="$($script:UiText.History)" Style="{StaticResource BtnS}" Margin="4,0,0,0"/>
                     </Grid>
                 </StackPanel>
             </Grid>
         </Grid>
         <!-- Footer -->
-        <TextBlock Grid.Row="2" Text="Universal Compiler v$($script:AppVersion) • Drag &amp; Drop • Batch Build • Profiles • Unsigned Builds" Foreground="$($th.T3)" FontSize="9" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+        <TextBlock Grid.Row="2" Text="$($script:UiText.Footer)" Foreground="$($th.T3)" FontSize="9" HorizontalAlignment="Center" Margin="0,12,0,0"/>
     </Grid>
 </Window>
 "@

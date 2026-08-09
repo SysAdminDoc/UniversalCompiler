@@ -28,6 +28,7 @@ from compiler_core import (
     backend_status,
     estimate_output_size as core_estimate_output_size,
     extract_icon,
+    get_message_catalog,
     load_profiles,
     load_json as core_load_json,
     load_project_manifest,
@@ -41,16 +42,20 @@ from compiler_core import (
 # Keep automation side-effect free: CLI invocations must not import the GUI or
 # install optional desktop packages.  The legacy GUI remains the default when
 # the script is launched without a command.
-if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1].lower() in {
-    "build", "batch", "inspect", "verify", "release", "list-toolchains", "diagnostics", "init-profiles", "manifest",
-    "bytecode", "extract-icon", "wrap-msix", "obfuscate", "analytics", "init-actions", "--help", "-h"
-}:
+_CLI_COMMANDS = {
+    "build", "batch", "inspect", "verify", "release", "list-toolchains", "diagnostics",
+    "init-profiles", "manifest", "bytecode", "extract-icon", "wrap-msix", "obfuscate",
+    "analytics", "init-actions", "--help", "-h",
+}
+if __name__ == "__main__" and any(
+    argument.lower() in _CLI_COMMANDS for argument in sys.argv[1:]
+):
     from compiler_core import cli_main
 
     raise SystemExit(cli_main(sys.argv[1:]))
 
-import tkinter as tk
-from tkinter import filedialog, messagebox
+import tkinter as tk  # noqa: E402
+from tkinter import filedialog, messagebox  # noqa: E402
 
 # Optional drag & drop support
 try:
@@ -127,12 +132,54 @@ THEMES = {
     }
 }
 
+HIGH_CONTRAST_THEME = {
+    "bg": "#000000",
+    "card": "#000000",
+    "card_hover": "#333333",
+    "border": "#ffffff",
+    "input": "#000000",
+    "green": "#00ff00",
+    "green_hover": "#00cc00",
+    "blue": "#00ffff",
+    "red": "#ff6666",
+    "yellow": "#ffff00",
+    "text1": "#ffffff",
+    "text2": "#ffffff",
+    "text3": "#cccccc",
+    "log_bg": "#000000",
+}
+
+
+def high_contrast_enabled() -> bool:
+    """Read the Windows high-contrast preference without opening a window."""
+
+    if os.name != "nt":
+        return False
+    try:
+        class HighContrast(ctypes.Structure):
+            _fields_ = [
+                ("cb_size", ctypes.c_uint),
+                ("flags", ctypes.c_uint),
+                ("scheme", ctypes.c_void_p),
+            ]
+
+        value = HighContrast()
+        value.cb_size = ctypes.sizeof(HighContrast)
+        return bool(
+            ctypes.windll.user32.SystemParametersInfoW(
+                0x0042, value.cb_size, ctypes.byref(value), 0
+            )
+        )
+    except (AttributeError, OSError, TypeError):
+        return False
+
 # ============================================================================
 # DEFAULT SETTINGS & PROFILES
 # ============================================================================
 
 DEFAULT_SETTINGS = {
     "theme": "Dark",
+    "locale": "",
     "post_build_action": "None",
     "post_build_copy_path": "",
     "show_notifications": True,
@@ -827,6 +874,7 @@ class Compiler:
         prefetch: bool = False,
         verify: bool = True,
         force: bool = False,
+        cancel_event: Optional[threading.Event] = None,
     ) -> BuildResult:
         """Return the canonical structured result used by every Python shell."""
         request = BuildRequest(
@@ -842,6 +890,7 @@ class Compiler:
             prefetch=prefetch,
             verify=verify,
             force=force,
+            cancel_event=cancel_event,
         )
         return CompilerEngine().build(request)
 
@@ -1154,6 +1203,7 @@ class UniversalCompiler:
     def __init__(self):
         # Initialize managers
         self.settings = Settings()
+        self.catalog = get_message_catalog(self.settings.get("locale") or None)
         self.recent_files = RecentFiles(self.settings.get("max_recent_files", 10))
         self.profiles = BuildProfiles()
         self.history = CompilationHistory(self.settings.get("max_history_items", 50))
@@ -1165,6 +1215,8 @@ class UniversalCompiler:
         self.batch_queue: List[str] = []
         self.engine = CompilerEngine()
         self._ui_events: queue.Queue[Callable[[], None]] = queue.Queue(maxsize=128)
+        self._cancel_event = threading.Event()
+        self._accessibility_registry: Dict[str, Dict[str, str]] = {}
         
         # Initialize templates
         initialize_templates()
@@ -1174,6 +1226,41 @@ class UniversalCompiler:
         
         # Create window
         self._create_window()
+
+    def _tr(self, key: str, default: Optional[str] = None, **values: Any) -> str:
+        """Translate a GUI message while preserving a stable English fallback."""
+
+        return self.catalog.message(key, default, **values)
+
+    def _register_accessible(self, widget: Any, key: str, role: str) -> Any:
+        """Attach semantic metadata and a visible keyboard focus treatment."""
+
+        name = self._tr(key, key)
+        self._accessibility_registry[key] = {"name": name, "role": role}
+        try:
+            widget._uc_accessibility_name = name
+            widget._uc_accessibility_role = role
+            widget.configure(
+                takefocus=True,
+                highlightthickness=2,
+                highlightcolor=self.theme["blue"],
+                highlightbackground=self.theme["border"],
+            )
+        except (AttributeError, tk.TclError):
+            try:
+                widget.configure(takefocus=True)
+            except (AttributeError, tk.TclError):
+                pass
+        return widget
+
+    def _setup_keyboard_navigation(self) -> None:
+        """Expose deterministic keyboard-only shortcuts for the golden paths."""
+
+        self.root.bind("<F5>", lambda _event: self._compile())
+        self.root.bind("<Escape>", lambda _event: self._cancel_compile())
+        self.root.bind("<Alt-b>", lambda _event: self._browse_source())
+        self.root.bind("<Control-l>", lambda _event: self.log_text.focus_set())
+        self.root.option_add("*takeFocus", True)
     
     def _setup_dpi(self):
         """Enable DPI awareness."""
@@ -1198,7 +1285,7 @@ class UniversalCompiler:
         else:
             self.root = tk.Tk()
         
-        self.root.title(f"{APP_NAME} v{APP_VERSION}")
+        self.root.title(f"{self._tr('app.title', APP_NAME)} v{APP_VERSION}")
         self.root.geometry("1200x900")
         self.root.minsize(800, 600)
         
@@ -1206,7 +1293,8 @@ class UniversalCompiler:
         self.root.state("zoomed")
         
         # Get theme colors
-        self.theme = THEMES[self.settings.theme]
+        self.high_contrast = high_contrast_enabled()
+        self.theme = HIGH_CONTRAST_THEME if self.high_contrast else THEMES[self.settings.theme]
         
         # Configure CustomTkinter
         ctk.set_appearance_mode("dark" if self.settings.theme == "Dark" else "light")
@@ -1216,6 +1304,7 @@ class UniversalCompiler:
         self.root.configure(bg=self.theme["bg"])
         
         self._create_ui()
+        self._setup_keyboard_navigation()
         self._setup_drag_drop()
         self.root.after(50, self._drain_ui_events)
 
@@ -1282,7 +1371,11 @@ class UniversalCompiler:
         # Footer
         ctk.CTkLabel(
             main,
-            text=f"Universal Compiler v{APP_VERSION} • Drag & Drop • Batch Build • Profiles • Unsigned Builds",
+            text=self._tr(
+                "app.footer",
+                "Universal Compiler v{version} • Drag & Drop • Batch Build • Profiles • Unsigned Builds",
+                version=APP_VERSION,
+            ),
             font=("Segoe UI", 9),
             text_color=self.theme["text3"]
         ).pack(pady=(10, 0))
@@ -1303,7 +1396,7 @@ class UniversalCompiler:
         ).pack(side="left")
         
         ctk.CTkLabel(
-            title_frame, text="Universal Compiler",
+            title_frame, text=self._tr("app.title", APP_NAME),
             font=("Segoe UI", 24, "bold"),
             text_color=self.theme["text1"]
         ).pack(side="left", padx=(10, 0))
@@ -1316,7 +1409,7 @@ class UniversalCompiler:
         
         # Subtitle
         ctk.CTkLabel(
-            title_frame, text="Drag files here or browse to compile",
+            title_frame, text=self._tr("app.subtitle", "Drag files here or browse to compile"),
             font=("Segoe UI", 11),
             text_color=self.theme["text2"]
         ).pack(anchor="w", padx=(36, 0))
@@ -1325,24 +1418,25 @@ class UniversalCompiler:
         btn_frame = ctk.CTkFrame(header, fg_color="transparent")
         btn_frame.pack(side="right")
         
-        self.theme_btn = ctk.CTkButton(
+        self.theme_btn = self._register_accessible(ctk.CTkButton(
             btn_frame, text="🌙" if self.settings.theme == "Dark" else "☀️",
             width=40, height=40,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._toggle_theme
-        )
+        ), "actions.theme", "button")
         self.theme_btn.pack(side="left", padx=(0, 8))
         
-        ctk.CTkButton(
+        self.settings_btn = self._register_accessible(ctk.CTkButton(
             btn_frame, text="⚙",
             width=40, height=40,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._show_settings
-        ).pack(side="left")
+        ), "actions.settings", "button")
+        self.settings_btn.pack(side="left")
     
     def _create_source_section(self, parent):
         """Create source file section."""
@@ -1354,7 +1448,7 @@ class UniversalCompiler:
         
         # Title
         ctk.CTkLabel(
-            inner, text="📁 Source File",
+            inner, text=self._tr("source.file", "📁 Source File"),
             font=("Segoe UI", 13, "bold"),
             text_color=self.theme["text1"]
         ).pack(anchor="w", pady=(0, 10))
@@ -1363,30 +1457,31 @@ class UniversalCompiler:
         input_row = ctk.CTkFrame(inner, fg_color="transparent")
         input_row.pack(fill="x")
         
-        self.source_entry = ctk.CTkEntry(
+        self.source_entry = self._register_accessible(ctk.CTkEntry(
             input_row, height=38,
             fg_color=self.theme["input"],
             border_color=self.theme["border"],
             text_color=self.theme["text1"],
             state="readonly"
-        )
+        ), "source.file", "textbox")
         self.source_entry.pack(side="left", fill="x", expand=True)
         
-        ctk.CTkButton(
-            input_row, text="Browse", width=80,
+        self.browse_source_btn = self._register_accessible(ctk.CTkButton(
+            input_row, text=self._tr("actions.browse", "Browse"), width=80,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._browse_source
-        ).pack(side="left", padx=(8, 0))
+        ), "actions.browse", "button")
+        self.browse_source_btn.pack(side="left", padx=(8, 0))
         
-        self.recent_btn = ctk.CTkButton(
+        self.recent_btn = self._register_accessible(ctk.CTkButton(
             input_row, text="▼", width=40,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._show_recent_menu
-        )
+        ), "actions.recent", "button")
         self.recent_btn.pack(side="left", padx=(4, 0))
         
         # Info panel (hidden initially)
@@ -1447,7 +1542,7 @@ class UniversalCompiler:
         inner.pack(fill="x", padx=20, pady=16)
         
         ctk.CTkLabel(
-            inner, text="📤 Output",
+            inner, text=self._tr("output.title", "📤 Output"),
             font=("Segoe UI", 13, "bold"),
             text_color=self.theme["text1"]
         ).pack(anchor="w", pady=(0, 10))
@@ -1461,17 +1556,17 @@ class UniversalCompiler:
         name_frame.pack(side="left", fill="x", expand=True, padx=(0, 8))
         
         ctk.CTkLabel(
-            name_frame, text="Output Name",
+            name_frame, text=self._tr("output.name", "Output Name"),
             font=("Segoe UI", 10),
             text_color=self.theme["text2"]
         ).pack(anchor="w", pady=(0, 4))
         
-        self.output_name_entry = ctk.CTkEntry(
+        self.output_name_entry = self._register_accessible(ctk.CTkEntry(
             name_frame, height=38,
             fg_color=self.theme["input"],
             border_color=self.theme["border"],
             text_color=self.theme["text1"]
-        )
+        ), "output.name", "textbox")
         self.output_name_entry.pack(fill="x")
         
         # Output directory
@@ -1479,7 +1574,7 @@ class UniversalCompiler:
         dir_frame.pack(side="left", fill="x", expand=True)
         
         ctk.CTkLabel(
-            dir_frame, text="Output Directory",
+            dir_frame, text=self._tr("output.directory", "Output Directory"),
             font=("Segoe UI", 10),
             text_color=self.theme["text2"]
         ).pack(anchor="w", pady=(0, 4))
@@ -1487,26 +1582,27 @@ class UniversalCompiler:
         dir_input = ctk.CTkFrame(dir_frame, fg_color="transparent")
         dir_input.pack(fill="x")
         
-        self.output_dir_entry = ctk.CTkEntry(
+        self.output_dir_entry = self._register_accessible(ctk.CTkEntry(
             dir_input, height=38,
             fg_color=self.theme["input"],
             border_color=self.theme["border"],
             text_color=self.theme["text1"],
             state="readonly"
-        )
+        ), "output.directory", "textbox")
         self.output_dir_entry.pack(side="left", fill="x", expand=True)
         
-        ctk.CTkButton(
+        self.output_dir_btn = self._register_accessible(ctk.CTkButton(
             dir_input, text="...", width=40,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._browse_output_dir
-        ).pack(side="left", padx=(4, 0))
+        ), "output.directory", "button")
+        self.output_dir_btn.pack(side="left", padx=(4, 0))
         
         # Icon
         ctk.CTkLabel(
-            inner, text="Custom Icon",
+            inner, text=self._tr("output.custom_icon", "Custom Icon"),
             font=("Segoe UI", 10),
             text_color=self.theme["text2"]
         ).pack(anchor="w", pady=(0, 4))
@@ -1514,38 +1610,41 @@ class UniversalCompiler:
         icon_row = ctk.CTkFrame(inner, fg_color="transparent")
         icon_row.pack(fill="x")
         
-        self.icon_entry = ctk.CTkEntry(
+        self.icon_entry = self._register_accessible(ctk.CTkEntry(
             icon_row, height=38,
             fg_color=self.theme["input"],
             border_color=self.theme["border"],
             text_color=self.theme["text1"],
             state="readonly"
-        )
+        ), "output.custom_icon", "textbox")
         self.icon_entry.pack(side="left", fill="x", expand=True)
         
-        ctk.CTkButton(
-            icon_row, text="Browse", width=80,
+        self.icon_browse_btn = self._register_accessible(ctk.CTkButton(
+            icon_row, text=self._tr("actions.browse", "Browse"), width=80,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._browse_icon
-        ).pack(side="left", padx=(4, 0))
+        ), "output.custom_icon", "button")
+        self.icon_browse_btn.pack(side="left", padx=(4, 0))
         
-        ctk.CTkButton(
+        self.icon_clear_btn = self._register_accessible(ctk.CTkButton(
             icon_row, text="✕", width=40,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._clear_icon
-        ).pack(side="left", padx=(4, 0))
+        ), "actions.clear", "button")
+        self.icon_clear_btn.pack(side="left", padx=(4, 0))
 
-        ctk.CTkButton(
+        self.icon_extract_btn = self._register_accessible(ctk.CTkButton(
             icon_row, text="From EXE", width=82,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._extract_icon
-        ).pack(side="left", padx=(4, 0))
+        ), "actions.from_exe", "button")
+        self.icon_extract_btn.pack(side="left", padx=(4, 0))
     
     def _create_options_section(self, parent):
         """Create build options section."""
@@ -1560,18 +1659,18 @@ class UniversalCompiler:
         header.pack(fill="x", pady=(0, 10))
         
         ctk.CTkLabel(
-            header, text="🔧 Build Options",
+            header, text=self._tr("build.options", "🔧 Build Options"),
             font=("Segoe UI", 13, "bold"),
             text_color=self.theme["text1"]
         ).pack(side="left")
         
         ctk.CTkLabel(
-            header, text="Profile:",
+            header, text=self._tr("profile", "Profile:"),
             font=("Segoe UI", 10),
             text_color=self.theme["text3"]
         ).pack(side="left", padx=(20, 5))
         
-        self.profile_combo = ctk.CTkComboBox(
+        self.profile_combo = self._register_accessible(ctk.CTkComboBox(
             header, width=140,
             values=self.profiles.names(),
             fg_color=self.theme["input"],
@@ -1582,25 +1681,26 @@ class UniversalCompiler:
             dropdown_hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._on_profile_change
-        )
+        ), "profile", "combobox")
         self.profile_combo.set(self.settings.get("default_profile", "Default"))
         self.profile_combo.pack(side="left")
         
-        ctk.CTkButton(
+        self.save_profile_btn = self._register_accessible(ctk.CTkButton(
             header, text="💾", width=32,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._save_profile
-        ).pack(side="left", padx=(4, 0))
+        ), "actions.save_profile", "button")
+        self.save_profile_btn.pack(side="left", padx=(4, 0))
 
         ctk.CTkLabel(
-            header, text="Backend:",
+            header, text=self._tr("backend", "Backend:"),
             font=("Segoe UI", 10),
             text_color=self.theme["text3"]
         ).pack(side="left", padx=(16, 5))
 
-        self.backend_combo = ctk.CTkComboBox(
+        self.backend_combo = self._register_accessible(ctk.CTkComboBox(
             header, width=150,
             values=["auto"],
             fg_color=self.theme["input"],
@@ -1611,7 +1711,7 @@ class UniversalCompiler:
             dropdown_hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._on_backend_change
-        )
+        ), "backend", "combobox")
         self.backend_combo.set("auto")
         self.backend_combo.pack(side="left")
         
@@ -1623,49 +1723,51 @@ class UniversalCompiler:
         left_checks.pack(side="left", fill="x", expand=True)
         
         self.console_var = ctk.BooleanVar()
-        self.console_check = ctk.CTkCheckBox(
+        self.console_check = self._register_accessible(ctk.CTkCheckBox(
             left_checks, text="Console Application",
             variable=self.console_var,
             fg_color=self.theme["green"],
             hover_color=self.theme["green_hover"],
             border_color=self.theme["border"],
             text_color=self.theme["text1"]
-        )
+        ), "options.console", "checkbox")
         self.console_check.pack(anchor="w", pady=3)
         
         self.admin_var = ctk.BooleanVar()
-        self.admin_check = ctk.CTkCheckBox(
+        self.admin_check = self._register_accessible(ctk.CTkCheckBox(
             left_checks, text="Require Administrator",
             variable=self.admin_var,
             fg_color=self.theme["green"],
             hover_color=self.theme["green_hover"],
             border_color=self.theme["border"],
             text_color=self.theme["text1"]
-        )
+        ), "options.admin", "checkbox")
         self.admin_check.pack(anchor="w", pady=3)
         
         self.single_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
+        self.single_check = self._register_accessible(ctk.CTkCheckBox(
             left_checks, text="Single File",
             variable=self.single_var,
             fg_color=self.theme["green"],
             hover_color=self.theme["green_hover"],
             border_color=self.theme["border"],
             text_color=self.theme["text1"]
-        ).pack(anchor="w", pady=3)
+        ), "options.single_file", "checkbox")
+        self.single_check.pack(anchor="w", pady=3)
         
         right_checks = ctk.CTkFrame(checks, fg_color="transparent")
         right_checks.pack(side="left", fill="x", expand=True)
         
         self.notify_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
+        self.notify_check = self._register_accessible(ctk.CTkCheckBox(
             right_checks, text="Notify on Complete",
             variable=self.notify_var,
             fg_color=self.theme["green"],
             hover_color=self.theme["green_hover"],
             border_color=self.theme["border"],
             text_color=self.theme["text1"]
-        ).pack(anchor="w", pady=3)
+        ), "options.notify", "checkbox")
+        self.notify_check.pack(anchor="w", pady=3)
     
     def _create_postbuild_section(self, parent):
         """Create post-build action section."""
@@ -1676,7 +1778,7 @@ class UniversalCompiler:
         inner.pack(fill="x", padx=20, pady=16)
         
         ctk.CTkLabel(
-            inner, text="⚡ Post-Build Action",
+            inner, text=self._tr("post_build.action", "⚡ Post-Build Action"),
             font=("Segoe UI", 13, "bold"),
             text_color=self.theme["text1"]
         ).pack(anchor="w", pady=(0, 10))
@@ -1684,7 +1786,7 @@ class UniversalCompiler:
         row = ctk.CTkFrame(inner, fg_color="transparent")
         row.pack(fill="x")
         
-        self.postbuild_combo = ctk.CTkComboBox(
+        self.postbuild_combo = self._register_accessible(ctk.CTkComboBox(
             row, width=180,
             values=["None", "Open Output Folder", "Copy to Folder..."],
             fg_color=self.theme["input"],
@@ -1695,24 +1797,24 @@ class UniversalCompiler:
             dropdown_hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._on_postbuild_change
-        )
+        ), "post_build.action", "combobox")
         self.postbuild_combo.set("None")
         self.postbuild_combo.pack(side="left")
         
-        self.postbuild_path_entry = ctk.CTkEntry(
+        self.postbuild_path_entry = self._register_accessible(ctk.CTkEntry(
             row, width=200, height=32,
             fg_color=self.theme["input"],
             border_color=self.theme["border"],
             text_color=self.theme["text1"]
-        )
+        ), "output.directory", "textbox")
         
-        self.postbuild_path_btn = ctk.CTkButton(
+        self.postbuild_path_btn = self._register_accessible(ctk.CTkButton(
             row, text="...", width=40,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._browse_postbuild_path
-        )
+        ), "output.directory", "button")
     
     def _create_metadata_section(self, parent):
         """Create metadata section."""
@@ -1723,7 +1825,7 @@ class UniversalCompiler:
         inner.pack(fill="x", padx=20, pady=16)
         
         ctk.CTkLabel(
-            inner, text="📝 Metadata",
+            inner, text=self._tr("metadata", "📝 Metadata"),
             font=("Segoe UI", 13, "bold"),
             text_color=self.theme["text1"]
         ).pack(anchor="w", pady=(0, 10))
@@ -1732,12 +1834,15 @@ class UniversalCompiler:
         row1 = ctk.CTkFrame(inner, fg_color="transparent")
         row1.pack(fill="x", pady=(0, 8))
         
-        for label, attr, default in [("Product Name", "product_entry", ""), ("Version", "version_entry", "1.0.0.0")]:
+        for label, attr, default, label_key in [
+            ("Product Name", "product_entry", "", "metadata.product"),
+            ("Version", "version_entry", "1.0.0.0", "metadata.version"),
+        ]:
             frame = ctk.CTkFrame(row1, fg_color="transparent")
             frame.pack(side="left", fill="x", expand=True, padx=(0, 8) if attr == "product_entry" else 0)
             
-            ctk.CTkLabel(frame, text=label, font=("Segoe UI", 10), text_color=self.theme["text2"]).pack(anchor="w", pady=(0, 4))
-            entry = ctk.CTkEntry(frame, height=36, fg_color=self.theme["input"], border_color=self.theme["border"], text_color=self.theme["text1"])
+            ctk.CTkLabel(frame, text=self._tr(label_key, label), font=("Segoe UI", 10), text_color=self.theme["text2"]).pack(anchor="w", pady=(0, 4))
+            entry = self._register_accessible(ctk.CTkEntry(frame, height=36, fg_color=self.theme["input"], border_color=self.theme["border"], text_color=self.theme["text1"]), label_key, "textbox")
             entry.insert(0, default)
             entry.pack(fill="x")
             setattr(self, attr, entry)
@@ -1746,23 +1851,26 @@ class UniversalCompiler:
         row2 = ctk.CTkFrame(inner, fg_color="transparent")
         row2.pack(fill="x", pady=(0, 8))
         
-        for label, attr in [("Company", "company_entry"), ("Copyright", "copyright_entry")]:
+        for label, attr, label_key in [
+            ("Company", "company_entry", "metadata.company"),
+            ("Copyright", "copyright_entry", "metadata.copyright"),
+        ]:
             frame = ctk.CTkFrame(row2, fg_color="transparent")
             frame.pack(side="left", fill="x", expand=True, padx=(0, 8) if attr == "company_entry" else 0)
             
-            ctk.CTkLabel(frame, text=label, font=("Segoe UI", 10), text_color=self.theme["text2"]).pack(anchor="w", pady=(0, 4))
-            entry = ctk.CTkEntry(frame, height=36, fg_color=self.theme["input"], border_color=self.theme["border"], text_color=self.theme["text1"])
+            ctk.CTkLabel(frame, text=self._tr(label_key, label), font=("Segoe UI", 10), text_color=self.theme["text2"]).pack(anchor="w", pady=(0, 4))
+            entry = self._register_accessible(ctk.CTkEntry(frame, height=36, fg_color=self.theme["input"], border_color=self.theme["border"], text_color=self.theme["text1"]), label_key, "textbox")
             entry.pack(fill="x")
             setattr(self, attr, entry)
         
         # Description
-        ctk.CTkLabel(inner, text="Description", font=("Segoe UI", 10), text_color=self.theme["text2"]).pack(anchor="w", pady=(0, 4))
-        self.desc_entry = ctk.CTkTextbox(
+        ctk.CTkLabel(inner, text=self._tr("metadata.description", "Description"), font=("Segoe UI", 10), text_color=self.theme["text2"]).pack(anchor="w", pady=(0, 4))
+        self.desc_entry = self._register_accessible(ctk.CTkTextbox(
             inner, height=60,
             fg_color=self.theme["input"],
             border_color=self.theme["border"],
             text_color=self.theme["text1"]
-        )
+        ), "metadata.description", "textbox")
         self.desc_entry.pack(fill="x")
     
     def _create_queue_section(self, parent):
@@ -1777,7 +1885,7 @@ class UniversalCompiler:
         header.pack(fill="x", pady=(0, 8))
         
         ctk.CTkLabel(
-            header, text="📋 Batch Queue",
+            header, text=self._tr("queue.title", "📋 Batch Queue"),
             font=("Segoe UI", 12, "bold"),
             text_color=self.theme["text1"]
         ).pack(side="left")
@@ -1789,35 +1897,37 @@ class UniversalCompiler:
         )
         self.queue_count_label.pack(side="left")
         
-        self.queue_listbox = ctk.CTkTextbox(
+        self.queue_listbox = self._register_accessible(ctk.CTkTextbox(
             inner, height=70,
             fg_color=self.theme["log_bg"],
             text_color=self.theme["text2"],
             font=("Consolas", 10)
-        )
+        ), "accessibility.queue", "listbox")
         self.queue_listbox.pack(fill="x")
         self.queue_listbox.configure(state="disabled")
         
         btn_row = ctk.CTkFrame(inner, fg_color="transparent")
         btn_row.pack(fill="x", pady=(8, 0))
         
-        ctk.CTkButton(
-            btn_row, text="+ Add", width=60,
+        self.add_queue_btn = self._register_accessible(ctk.CTkButton(
+            btn_row, text=self._tr("actions.add", "+ Add"), width=60,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             font=("Segoe UI", 10),
             command=self._add_to_queue
-        ).pack(side="left")
+        ), "actions.add", "button")
+        self.add_queue_btn.pack(side="left")
         
-        ctk.CTkButton(
-            btn_row, text="Clear", width=60,
+        self.clear_queue_btn = self._register_accessible(ctk.CTkButton(
+            btn_row, text=self._tr("actions.clear", "Clear"), width=60,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             font=("Segoe UI", 10),
             command=self._clear_queue
-        ).pack(side="left", padx=(4, 0))
+        ), "actions.clear", "button")
+        self.clear_queue_btn.pack(side="left", padx=(4, 0))
     
     def _create_log_section(self, parent):
         """Create build log section."""
@@ -1834,16 +1944,16 @@ class UniversalCompiler:
         comparison.grid_rowconfigure(1, weight=1)
 
         ctk.CTkLabel(
-            comparison, text="📄 Source Preview",
+            comparison, text=self._tr("log.source_preview", "📄 Source Preview"),
             font=("Segoe UI", 11, "bold"),
             text_color=self.theme["text1"]
         ).grid(row=0, column=0, sticky="w", padx=(0, 6), pady=(0, 6))
-        self.source_preview = ctk.CTkTextbox(
+        self.source_preview = self._register_accessible(ctk.CTkTextbox(
             comparison,
             fg_color=self.theme["log_bg"],
             text_color=self.theme["text2"],
             font=("Consolas", 9)
-        )
+        ), "log.source_preview", "textbox")
         self.source_preview.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
         self.source_preview.configure(state="disabled")
 
@@ -1855,13 +1965,13 @@ class UniversalCompiler:
         header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
         ctk.CTkLabel(
-            header, text="📜 Build Log",
+            header, text=self._tr("log.title", "📜 Build Log"),
             font=("Segoe UI", 11, "bold"),
             text_color=self.theme["text1"]
         ).pack(side="left")
 
-        self.jump_error_btn = ctk.CTkButton(
-            header, text="Jump Error", width=74,
+        self.jump_error_btn = self._register_accessible(ctk.CTkButton(
+            header, text=self._tr("actions.jump_error", "Jump Error"), width=74,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
@@ -1869,35 +1979,37 @@ class UniversalCompiler:
             height=24,
             command=self._jump_to_error,
             state="disabled"
-        )
+        ), "actions.jump_error", "button")
         self.jump_error_btn.pack(side="left", padx=(8, 0))
 
-        ctk.CTkButton(
-            header, text="Clear", width=50,
+        self.clear_log_btn = self._register_accessible(ctk.CTkButton(
+            header, text=self._tr("actions.clear", "Clear"), width=50,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             font=("Segoe UI", 9),
             height=24,
             command=self._clear_log
-        ).pack(side="left", padx=(4, 0))
+        ), "actions.clear", "button")
+        self.clear_log_btn.pack(side="left", padx=(4, 0))
 
-        ctk.CTkButton(
-            header, text="Export", width=50,
+        self.export_log_btn = self._register_accessible(ctk.CTkButton(
+            header, text=self._tr("actions.export", "Export"), width=50,
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             font=("Segoe UI", 9),
             height=24,
             command=self._export_log
-        ).pack(side="left", padx=(4, 0))
+        ), "actions.export", "button")
+        self.export_log_btn.pack(side="left", padx=(4, 0))
 
-        self.log_text = ctk.CTkTextbox(
+        self.log_text = self._register_accessible(ctk.CTkTextbox(
             log_panel,
             fg_color=self.theme["log_bg"],
             text_color=self.theme["text2"],
             font=("Consolas", 10)
-        )
+        ), "accessibility.log", "log")
         self.log_text.grid(row=1, column=0, sticky="nsew")
         self.error_line: Optional[int] = None
     
@@ -1917,7 +2029,7 @@ class UniversalCompiler:
         
         # Status label
         self.status_label = ctk.CTkLabel(
-            actions, text="Ready",
+            actions, text=self._tr("status.ready", "Ready"),
             font=("Segoe UI", 10),
             text_color=self.theme["text3"]
         )
@@ -1927,53 +2039,66 @@ class UniversalCompiler:
         btn_row1 = ctk.CTkFrame(actions, fg_color="transparent")
         btn_row1.pack(fill="x")
         
-        ctk.CTkButton(
-            btn_row1, text="Manage Deps",
+        self.manage_deps_btn = self._register_accessible(ctk.CTkButton(
+            btn_row1, text=self._tr("actions.manage_dependencies", "Manage Deps"),
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._show_setup
-        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ), "actions.manage_dependencies", "button")
+        self.manage_deps_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
         
-        self.compile_btn = ctk.CTkButton(
-            btn_row1, text="⚡ Compile",
+        self.compile_btn = self._register_accessible(ctk.CTkButton(
+            btn_row1, text=self._tr("actions.compile", "⚡ Compile"),
             fg_color=self.theme["green"],
             hover_color=self.theme["green_hover"],
             text_color=self.theme["bg"],
             font=("Segoe UI", 12, "bold"),
             command=self._compile,
             state="disabled"
-        )
-        self.compile_btn.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ), "actions.compile", "button")
+        self.compile_btn.pack(side="left", fill="x", expand=True, padx=(4, 4))
+
+        self.cancel_btn = self._register_accessible(ctk.CTkButton(
+            btn_row1, text=self._tr("actions.cancel", "Cancel"),
+            fg_color=self.theme["red"],
+            hover_color=self.theme["red"],
+            text_color=self.theme["text1"],
+            command=self._cancel_compile,
+            state="disabled"
+        ), "accessibility.cancel", "button")
+        self.cancel_btn.pack(side="left", fill="x", expand=True, padx=(4, 0))
         
         # Compile all button (hidden initially)
-        self.compile_all_btn = ctk.CTkButton(
-            actions, text="Compile All in Queue",
+        self.compile_all_btn = self._register_accessible(ctk.CTkButton(
+            actions, text=self._tr("actions.compile_all", "Compile All in Queue"),
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._compile_all
-        )
+        ), "actions.compile_all", "button")
         
         # Secondary buttons
         btn_row2 = ctk.CTkFrame(actions, fg_color="transparent")
         btn_row2.pack(fill="x", pady=(8, 0))
         
-        ctk.CTkButton(
-            btn_row2, text="📄 Templates",
+        self.templates_btn = self._register_accessible(ctk.CTkButton(
+            btn_row2, text=self._tr("actions.templates", "📄 Templates"),
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._open_templates
-        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ), "actions.templates", "button")
+        self.templates_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
         
-        ctk.CTkButton(
-            btn_row2, text="📊 History",
+        self.history_btn = self._register_accessible(ctk.CTkButton(
+            btn_row2, text=self._tr("actions.history", "📊 History"),
             fg_color=self.theme["border"],
             hover_color=self.theme["card_hover"],
             text_color=self.theme["text1"],
             command=self._show_history
-        ).pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ), "actions.history", "button")
+        self.history_btn.pack(side="left", fill="x", expand=True, padx=(4, 0))
     
     def _setup_drag_drop(self):
         """Setup drag and drop handling."""
@@ -1998,7 +2123,7 @@ class UniversalCompiler:
             for f in files:
                 self.batch_queue.append(f)
             self._update_queue_display()
-            self.log(f"Added {len(files)} files to queue")
+            self.log(self.catalog.plural("queue.files", len(files), "{count} files", count=len(files)))
     
     def _browse_source(self):
         """Browse for source file."""
@@ -2014,7 +2139,10 @@ class UniversalCompiler:
         """Show recent files menu."""
         recent = self.recent_files.get_all()
         if not recent:
-            messagebox.showinfo("Recent Files", "No recent files")
+            messagebox.showinfo(
+                self._tr("actions.recent", "Recent Files"),
+                self._tr("message.no_recent_files", "No recent files"),
+            )
             return
         
         menu = tk.Menu(self.root, tearoff=0, bg=self.theme["card"], fg=self.theme["text1"])
@@ -2146,7 +2274,10 @@ class UniversalCompiler:
             values = list(self.profile_combo.cget("values")) + [name]
             self.profile_combo.configure(values=values)
         
-        self.log(f"Profile '{name}' saved", "success")
+        self.log(
+            self._tr("message.profile_saved", "Profile '{name}' saved", name=name),
+            "success",
+        )
     
     def _on_postbuild_change(self, value: str):
         """Handle post-build action change."""
@@ -2168,12 +2299,19 @@ class UniversalCompiler:
         """Toggle between dark and light theme."""
         new_theme = "Light" if self.settings.theme == "Dark" else "Dark"
         self.settings.theme = new_theme
-        messagebox.showinfo("Theme Changed", f"Theme changed to {new_theme}. Please restart the app.")
+        messagebox.showinfo(
+            self._tr("actions.theme", "Theme Changed"),
+            self._tr(
+                "message.theme_changed",
+                "Theme changed to {theme}. Please restart the app.",
+                theme=new_theme,
+            ),
+        )
     
     def _show_settings(self):
         """Show settings dialog."""
         messagebox.showinfo(
-            "Settings",
+            self._tr("actions.settings", "Settings"),
             f"Theme: {self.settings.theme}\n"
             f"Notifications: {self.settings.get('show_notifications')}\n"
             f"Recent Files: {self.settings.get('max_recent_files')}\n"
@@ -2192,7 +2330,7 @@ class UniversalCompiler:
                 self.backend_combo.get(),
             )
             self.status_label.configure(
-                text="Ready" if available else "Compiler not installed",
+                text=self._tr("status.ready", "Ready") if available else self._tr("status.failed", "Compiler not installed"),
                 text_color=self.theme["green"] if available else self.theme["red"]
             )
             self.compile_btn.configure(state="normal" if available else "disabled")
@@ -2338,7 +2476,7 @@ Source: {self.source_file}
             
             # Update info panel
             self.type_label.configure(text=compiler_info["desc"])
-            self.size_label.configure(text=format_size(file_size))
+            self.size_label.configure(text=self.catalog.format_size(file_size))
             backend_values = ["auto", *EXTENSION_BACKENDS.get(ext, ())]
             self.backend_combo.configure(values=backend_values)
             if self.backend_combo.get() not in backend_values:
@@ -2385,6 +2523,16 @@ Source: {self.source_file}
     # ========================================================================
     # COMPILATION
     # ========================================================================
+
+    def _cancel_compile(self) -> None:
+        """Request cancellation without interrupting the UI event loop."""
+
+        if not self.compiling:
+            return
+        self._cancel_event.set()
+        self.cancel_btn.configure(state="disabled")
+        self.status_label.configure(text=self._tr("status.cancelling", "Cancelling..."))
+        self.log(self._tr("status.cancelling", "Cancelling..."), "warning")
     
     def _compile(self):
         """Compile current file."""
@@ -2392,7 +2540,9 @@ Source: {self.source_file}
             return
         
         self.compiling = True
+        self._cancel_event.clear()
         self.compile_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
         
         # Get output path
         output_name = self.output_name_entry.get().strip()
@@ -2424,7 +2574,7 @@ Source: {self.source_file}
         self.log("=" * 40)
         self.log(f"Source: {source_file}")
         self.log(f"Output: {output_path}")
-        self.status_label.configure(text="Compiling...")
+        self.status_label.configure(text=self._tr("status.compiling", "Compiling..."))
         self.progress_bar.pack(fill="x", pady=(0, 8))
         self.progress_bar.set(0.3)
 
@@ -2440,6 +2590,7 @@ Source: {self.source_file}
                     single_file,
                     metadata,
                     backend=backend,
+                    cancel_event=self._cancel_event,
                 )
                 error_text = None
             except Exception as error:
@@ -2488,7 +2639,7 @@ Source: {self.source_file}
                 file_size = os.path.getsize(output_path)
                 self.log("=" * 40, "success")
                 self.log("BUILD SUCCESSFUL", "success")
-                self.log(f"Size: {format_size(file_size)}", "success")
+                self.log(f"Size: {self.catalog.format_size(file_size)}", "success")
                 if result and result.message:
                     self.log(result.message)
                 self.history.add(
@@ -2506,10 +2657,11 @@ Source: {self.source_file}
                     self.log(f"Copied to {copy_path}")
                 if notify:
                     show_notification(
-                        "Build Complete", f"{output_name} compiled successfully"
+                        self._tr("message.build_success", "{name} compiled successfully", name=output_name),
+                        self._tr("status.complete", "Complete!"),
                     )
             else:
-                self.log("BUILD FAILED", "error")
+                self.log(self._tr("status.failed", "Failed"), "error")
                 details = error_text or (result.message if result else "Unknown build error")
                 if result:
                     for command in result.commands:
@@ -2525,13 +2677,18 @@ Source: {self.source_file}
                     0,
                 )
                 if notify:
-                    show_notification("Build Failed", "Compilation failed")
+                    show_notification(
+                        self._tr("status.failed", "Failed"),
+                        self._tr("message.build_failed", "Compilation failed"),
+                    )
         finally:
             self.progress_bar.set(1.0)
             self.root.after(500, lambda: self.progress_bar.pack_forget())
-            self.status_label.configure(text="Ready")
+            self.status_label.configure(text=self._tr("status.ready", "Ready"))
             self.compiling = False
             self.compile_btn.configure(state="normal")
+            self.cancel_btn.configure(state="disabled")
+            self._cancel_event.clear()
     
     def _compile_all(self):
         """Compile all files in queue."""
@@ -2553,10 +2710,26 @@ Source: {self.source_file}
         
         self.batch_queue.clear()
         self._update_queue_display()
-        self.log(f"Batch complete: {done}/{total} files", "success")
+        self.log(
+            self._tr(
+                "message.batch_complete",
+                "{count} of {total} files compiled",
+                count=done,
+                total=total,
+            ),
+            "success",
+        )
         
         if self.notify_var.get():
-            show_notification("Batch Complete", f"{done} of {total} files compiled")
+            show_notification(
+                self._tr("status.complete", "Batch Complete"),
+                self._tr(
+                    "message.batch_complete",
+                    "{count} of {total} files compiled",
+                    count=done,
+                    total=total,
+                ),
+            )
     
     # ========================================================================
     # LOGGING
@@ -2564,7 +2737,7 @@ Source: {self.source_file}
     
     def log(self, message: str, level: str = "info"):
         """Add message to build log."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        timestamp = self.catalog.format_datetime(datetime.now()).split(" ", 1)[-1]
         prefix = {"info": "[*]", "success": "[OK]", "warning": "[!]", "error": "[X]"}.get(level, "[*]")
 
         if level == "error":
@@ -2583,8 +2756,12 @@ Source: {self.source_file}
     def run(self):
         """Start the application."""
         # Initial log messages
-        self.log(f"Universal Compiler v{APP_VERSION} ready", "success")
-        self.log("Drag files here or click Browse")
+        self.log(
+            f"{self._tr('app.title', APP_NAME)} v{APP_VERSION} "
+            f"{self._tr('status.ready', 'Ready')}",
+            "success",
+        )
+        self.log(self._tr("message.drag_hint", "Drag files here or click Browse"))
         
         if DependencyChecker.check_ps2exe():
             self.log("PS2EXE: Ready", "success")
