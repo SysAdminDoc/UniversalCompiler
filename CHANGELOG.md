@@ -2,7 +2,7 @@
 
 All notable changes to UniversalCompiler will be documented in this file.
 
-## [v2.1.0] - 2026-08-03
+## [v2.1.1] - 2026-08-08
 
 - Add a bounded, offline-by-default execution policy with executable-root
   validation, minimal environments, timeouts, cancellation, process cleanup,

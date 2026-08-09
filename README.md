@@ -1,7 +1,7 @@
 # ⚡ Universal Compiler
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.1.0-green?style=for-the-badge" alt="Version 2.1.0">
+  <img src="https://img.shields.io/badge/version-2.1.1-green?style=for-the-badge" alt="Version 2.1.1">
   <img src="https://img.shields.io/badge/platform-Windows-blue?style=for-the-badge" alt="Windows">
   <img src="https://img.shields.io/badge/PowerShell-5.1+-purple?style=for-the-badge" alt="PowerShell 5.1+">
   <img src="https://img.shields.io/badge/license-MIT-orange?style=for-the-badge" alt="MIT License">
@@ -71,7 +71,7 @@ availability, targets, architectures, lifecycle, and artifact boundaries.
 ### Main Interface
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ ⚡ Universal Compiler v2.1.0                  [🌙 Theme] [⚙]    │
+│ ⚡ Universal Compiler v2.1.1                  [🌙 Theme] [⚙]    │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  📁 SOURCE FILE (Drag & Drop)        │  📋 Batch Queue         │
@@ -634,7 +634,7 @@ Remove-Item "$env:APPDATA\UniversalCompiler" -Recurse -Force
 
 ## 📝 Changelog
 
-### v2.1.0 — 2026-08-03
+### v2.1.1 — 2026-08-08
 - ✨ Complete UI redesign with modern dark theme
 - 🖱️ Drag & drop support
 - 📋 Batch compilation

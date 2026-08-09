@@ -585,7 +585,7 @@ def test_release_dry_run_emits_hashes_sbom_provenance_and_report(
     destination = tmp_path / "release"
 
     result = release_bundle(
-        [artifact], destination, source_root=tmp_path, version="2.1.0"
+        [artifact], destination, source_root=tmp_path, version=APP_VERSION
     )
 
     assert result["passed"] is True
@@ -1325,7 +1325,8 @@ def test_version_source_and_release_metadata_are_synchronized() -> None:
     powershell = (root / "UniversalCompiler.ps1").read_text(encoding="utf-8")
     assert "APP_VERSION = CORE_APP_VERSION" in python_shell
     assert "version.json" in powershell
-    assert "$script:AppVersion = \"2.1.0\"" not in powershell
+    assert "$script:AppVersion = [string]$versionDocument.version" in powershell
+    assert not re.search(r'\$script:AppVersion = "\d', powershell)
 
 
 def test_github_actions_template_is_language_specific(tmp_path: Path) -> None:
