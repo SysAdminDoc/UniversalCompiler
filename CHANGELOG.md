@@ -50,6 +50,10 @@ All notable changes to UniversalCompiler will be documented in this file.
   cache and exit classifications, artifact hashes, redacted command metadata,
   bounded local JSONL retention, and explicit opt-in local export without
   network telemetry or source/environment leakage.
+- Replace the VS Code terminal integration with a cancellable argv child
+  process using explicit cwd/trusted-workspace checks and an allowlisted
+  environment; add profile/target/architecture/verification settings, bounded
+  capture, structured notifications, and source diagnostics without focus theft.
 - Require approved, hash-addressed dependency locks for prefetch, enforce
   explicit offline/online mirror and cache policies, and record dependency and
   toolchain snapshots in cache metadata and artifact manifests.

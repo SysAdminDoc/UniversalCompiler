@@ -249,6 +249,13 @@ artifact structures. It never signs, publishes, uploads, or needs credentials.
 The optional `vscode-extension/` package adds a **Universal Compiler: Build
 Active File** command. Point its `universalCompiler.scriptPath` setting at the
 repository's `UniversalCompiler.py` when the extension is installed locally.
+The extension launches the core with an argv array, an explicit workspace cwd,
+an allowlisted environment, and a cancellable progress operation; it never
+constructs or sends a terminal command. Configure `profile`, `target`,
+`architecture`, `verify`, `recordDiagnostics`, `diagnosticsPath`, and explicit
+namespaced `adapters` in VS Code settings. Failed builds are parsed into the
+Problems panel and structured result details remain in the output channel
+without forcing it into focus.
 `list-toolchains --json` is the authoritative, schema-versioned capability
 registry consumed by the CLI, both GUI shells, and the VS Code extension. It
 reports lifecycle, availability, host/target/architecture constraints,

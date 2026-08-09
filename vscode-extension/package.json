@@ -7,6 +7,9 @@
   "engines": {
     "vscode": ">=1.85.0"
   },
+  "scripts": {
+    "test": "node --test test/extension.test.js"
+  },
   "categories": [
     "Other"
   ],
@@ -38,6 +41,58 @@
           "type": "string",
           "default": "auto",
           "description": "Optional backend override, for example nuitka or bun."
+        },
+        "universalCompiler.profile": {
+          "type": "string",
+          "default": "Default",
+          "description": "Named project profile passed to the core build command."
+        },
+        "universalCompiler.target": {
+          "type": "string",
+          "enum": [
+            "native",
+            "windows",
+            "linux",
+            "darwin",
+            "wasm"
+          ],
+          "default": "native",
+          "description": "Target platform requested from the selected backend."
+        },
+        "universalCompiler.architecture": {
+          "type": "string",
+          "enum": [
+            "native",
+            "x86",
+            "x64",
+            "amd64",
+            "arm64"
+          ],
+          "default": "native",
+          "description": "Target architecture requested from the selected backend."
+        },
+        "universalCompiler.verify": {
+          "type": "boolean",
+          "default": true,
+          "description": "Request static artifact verification from the core command."
+        },
+        "universalCompiler.recordDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Retain privacy-safe local diagnostics for this extension build."
+        },
+        "universalCompiler.diagnosticsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional local JSONL diagnostics path."
+        },
+        "universalCompiler.adapters": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Explicitly allow namespaced external adapter entry points."
         }
       }
     }
