@@ -163,6 +163,8 @@ python .\UniversalCompiler.py build .\myscript.py --watch --watch-debounce 0.35
 # Compile Python bytecode only, or inspect local build analytics
 python .\UniversalCompiler.py bytecode .\module.py
 python .\UniversalCompiler.py analytics --recent 10
+python .\UniversalCompiler.py diagnostics --recent 10 --json
+python .\UniversalCompiler.py diagnostics --export .\diagnostics-export.json --allow-telemetry --json
 
 # Inspect available toolchains or verify an artifact without running it
 python .\UniversalCompiler.py list-toolchains
@@ -226,6 +228,15 @@ Successful builds also emit a versioned `*.manifest.json` sidecar containing
 source/config/toolchain identities, artifact SHA-256 and size, verification,
 warnings, and explicit unsigned status. `verify` checks both artifact structure
 and that sidecar when it is present.
+Build JSON results use `uc.result.v1` and include a correlation ID, bounded
+phase timings, cache status, exit classification, redacted command metadata,
+artifact hashes, and a privacy-safe `uc.diagnostics.v1` record. Local JSONL
+diagnostics are retained for 30 days/2,000 events by default and can be
+disabled with `--no-diagnostics` or redirected with
+`--diagnostics-path`; the `diagnostics --export` command requires an explicit
+`--allow-telemetry` opt-in and writes locally without network access. Source
+contents, full environment values, and unredacted command output are excluded
+from exported diagnostics.
 MSIX/APPX output is deliberately unsigned and is intended for packaging or
 internal testing only.
 

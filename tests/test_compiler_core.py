@@ -23,6 +23,9 @@ from compiler_core import (
     ARTIFACT_MANIFEST_SCHEMA_VERSION,
     BACKEND_CATALOG,
     CAPABILITY_SCHEMA_VERSION,
+    DIAGNOSTICS_KIND,
+    DIAGNOSTICS_SCHEMA_VERSION,
+    DiagnosticsStore,
     DEFAULT_PROFILES,
     DEPENDENCY_LOCK_KIND,
     DEPENDENCY_LOCK_SCHEMA_VERSION,
@@ -132,6 +135,23 @@ def test_execution_policy_bounds_output_redacts_secrets_and_preserves_environmen
     assert "spaces & quotes Ω" in result.output
     assert "token=[REDACTED]" in result.output
     assert "super-secret" not in result.output
+
+
+def test_command_diagnostics_are_correlated_and_do_not_export_output_or_environment() -> None:
+    result = run_command(
+        (sys.executable, "-c", "print('token=secret-value')"),
+        correlation_id="00112233445566778899aabbccddeeff",
+        phase="compile",
+    )
+
+    diagnostic = result.diagnostic_record()
+    assert diagnostic["schema_version"] == DIAGNOSTICS_SCHEMA_VERSION
+    assert diagnostic["kind"] == DIAGNOSTICS_KIND
+    assert diagnostic["correlation_id"] == "00112233445566778899aabbccddeeff"
+    assert diagnostic["phase"] == "compile"
+    assert diagnostic["exit_classification"] == "success"
+    assert "secret-value" not in json.dumps(diagnostic)
+    assert "output" in diagnostic and "stdout_bytes" in diagnostic["output"]
 
 
 def test_execution_policy_rejects_unapproved_tools_and_caps_output(tmp_path: Path) -> None:
@@ -513,6 +533,44 @@ def test_local_analytics_records_summary(tmp_path: Path) -> None:
     assert analytics.recent(1)[0]["backend"] == "pyinstaller"
 
 
+def test_diagnostics_store_has_bounded_local_retention_and_opt_in_export(
+    tmp_path: Path,
+) -> None:
+    request = BuildRequest(
+        source=tmp_path / "private-source.py",
+        output=tmp_path / "artifact.exe",
+        backend="pyinstaller",
+    )
+    result = BuildResult(
+        True,
+        "built",
+        request,
+        request.output,
+        backend="pyinstaller",
+        source_hash="a" * 64,
+        duration_seconds=0.25,
+    )
+    store = DiagnosticsStore(
+        tmp_path / "diagnostics.jsonl",
+        retention_days=30,
+        max_events=2,
+    )
+    for _ in range(3):
+        store.record(result)
+
+    assert len(store.recent(10)) == 2
+    raw = store.path.read_text(encoding="utf-8")
+    assert raw.count("\n") == 2
+    assert "private-source.py" not in raw
+    with pytest.raises(BuildValidationError, match="telemetry opt-in"):
+        store.export(tmp_path / "export.json")
+
+    exported = store.export(tmp_path / "export.json", opt_in=True)
+    exported_value = json.loads(exported.read_text(encoding="utf-8"))
+    assert exported_value["telemetry"] == {"opt_in": True, "network": False}
+    assert len(exported_value["events"]) == 2
+
+
 def test_engine_builds_and_uses_cache(tmp_path: Path) -> None:
     source = tmp_path / "hello.py"
     source.write_text("print('hello')\n", encoding="utf-8")
@@ -541,6 +599,10 @@ def test_engine_builds_and_uses_cache(tmp_path: Path) -> None:
     serialized = first.as_dict()
     assert serialized["schema_version"] == RESULT_SCHEMA_VERSION
     assert serialized["request"]["schema_version"] == REQUEST_SCHEMA_VERSION
+    assert serialized["correlation_id"] == first.request.correlation_id
+    assert serialized["cache_status"] == "miss"
+    assert serialized["phase_timings"]["commands"] == 0
+    assert serialized["diagnostics"]["artifacts"]["sha256"]["output"]
     assert first.manifest is not None and first.manifest.is_file()
     manifest = json.loads(first.manifest.read_text(encoding="utf-8"))
     assert manifest["schema_version"] == ARTIFACT_MANIFEST_SCHEMA_VERSION

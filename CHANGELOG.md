@@ -46,6 +46,10 @@ All notable changes to UniversalCompiler will be documented in this file.
   namespaced, allowlisted entry-point discovery, capability metadata, planner
   contracts, tool identity, and redacted adapter diagnostics; external adapters
   remain disabled unless explicitly enabled.
+- Add correlated `uc.diagnostics.v1` build/command records with phase timings,
+  cache and exit classifications, artifact hashes, redacted command metadata,
+  bounded local JSONL retention, and explicit opt-in local export without
+  network telemetry or source/environment leakage.
 - Require approved, hash-addressed dependency locks for prefetch, enforce
   explicit offline/online mirror and cache policies, and record dependency and
   toolchain snapshots in cache metadata and artifact manifests.

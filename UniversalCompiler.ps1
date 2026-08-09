@@ -1082,6 +1082,7 @@ function Invoke-CoreBuild {
     }
     $success = [bool]($processResult.Success -and $payload -and $payload.success)
     $message = if ($payload -and $payload.message) { [string]$payload.message } else { [string]$processResult.Output }
+    if ($payload -and $payload.correlation_id) { $message = "Correlation: $($payload.correlation_id)`n$message" }
     if ($payload -and $payload.verification) { $message += "`n$($payload.verification.details)" }
     return [pscustomobject]@{
         Success = $success

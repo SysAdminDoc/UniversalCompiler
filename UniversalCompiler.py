@@ -41,7 +41,7 @@ from compiler_core import (
 # install optional desktop packages.  The legacy GUI remains the default when
 # the script is launched without a command.
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1].lower() in {
-    "build", "batch", "inspect", "verify", "release", "list-toolchains", "init-profiles", "manifest",
+    "build", "batch", "inspect", "verify", "release", "list-toolchains", "diagnostics", "init-profiles", "manifest",
     "bytecode", "extract-icon", "wrap-msix", "obfuscate", "analytics", "init-actions", "--help", "-h"
 }:
     from compiler_core import cli_main
@@ -2488,6 +2488,8 @@ Source: {self.source_file}
 
         try:
             self.progress_bar.set(0.9)
+            if result:
+                self.log(f"Correlation: {result.correlation_id}", "info")
             success = bool(result and result.success and os.path.isfile(output_path))
             if success:
                 file_size = os.path.getsize(output_path)

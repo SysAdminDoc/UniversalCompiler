@@ -178,6 +178,18 @@ function activate(context) {
           output.appendLine(
             `Build ${result.success ? "succeeded" : "failed"}: ${result.message || result.status}.`
           );
+          if (result.diagnostics) {
+            const diagnostics = result.diagnostics;
+            const artifactHashes = diagnostics.artifacts?.sha256 || {};
+            output.appendLine(
+              `Correlation ${result.correlation_id || diagnostics.correlation_id}; ` +
+                `exit ${diagnostics.exit_classification}; ` +
+                `cache ${diagnostics.cache?.status || "unknown"}.`
+            );
+            if (artifactHashes.output) {
+              output.appendLine(`Artifact SHA-256: ${artifactHashes.output}`);
+            }
+          }
         } catch (error) {
           if (serialized) {
             output.append(serialized);

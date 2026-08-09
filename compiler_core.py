@@ -31,6 +31,7 @@ import threading
 import time
 import zipfile
 import xml.etree.ElementTree as ET
+import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -54,6 +55,10 @@ RELEASE_SCHEMA_VERSION = "uc.release.v1"
 RELEASE_KIND = "universal-compiler.release"
 SBOM_SCHEMA_VERSION = "uc.sbom.v1"
 PROVENANCE_SCHEMA_VERSION = "uc.provenance.v1"
+DIAGNOSTICS_SCHEMA_VERSION = "uc.diagnostics.v1"
+DIAGNOSTICS_KIND = "universal-compiler.diagnostics"
+DEFAULT_DIAGNOSTICS_RETENTION_DAYS = 30
+DEFAULT_DIAGNOSTICS_MAX_EVENTS = 2000
 ADAPTER_API_VERSION = "uc.adapter.v1"
 ADAPTER_ENTRY_POINT_GROUP = "universal_compiler.adapters"
 ADAPTER_ALLOWLIST_ENV = "UC_ADAPTER_ALLOWLIST"
@@ -587,6 +592,23 @@ def redact_text(value: str) -> str:
     return _SENSITIVE_TEXT_PATTERN.sub(r"\1[REDACTED]", value)
 
 
+def new_correlation_id() -> str:
+    """Create a local correlation token without including user or host data."""
+
+    return uuid.uuid4().hex
+
+
+def _normalize_correlation_id(value: str | None) -> str:
+    candidate = str(value or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32}", candidate):
+        return candidate
+    try:
+        return uuid.UUID(candidate).hex
+    except (ValueError, AttributeError):
+        pass
+    return new_correlation_id()
+
+
 @dataclass(frozen=True)
 class BuildRequest:
     """All inputs that affect a reproducible build."""
@@ -617,6 +639,7 @@ class BuildRequest:
     dependency_lockfile: Path | None = None
     dependency_cache_dir: Path | None = None
     dependency_mirror: str | None = None
+    correlation_id: str = field(default_factory=new_correlation_id, compare=False)
     cancel_event: threading.Event | None = field(
         default=None, repr=False, compare=False
     )
@@ -679,6 +702,7 @@ class BuildRequest:
                 if self.dependency_mirror
                 else None
             ),
+            correlation_id=_normalize_correlation_id(self.correlation_id),
             cancel_event=self.cancel_event,
         )
 
@@ -695,6 +719,12 @@ class CommandResult:
     timed_out: bool = False
     cancelled: bool = False
     output_truncated: bool = False
+    correlation_id: str = ""
+    phase: str = "command"
+
+    def __post_init__(self) -> None:
+        self.correlation_id = _normalize_correlation_id(self.correlation_id)
+        self.phase = str(self.phase or "command").strip().lower() or "command"
 
     @property
     def success(self) -> bool:
@@ -703,6 +733,62 @@ class CommandResult:
     @property
     def output(self) -> str:
         return "\n".join(part for part in (self.stdout, self.stderr) if part).strip()
+
+    @property
+    def exit_classification(self) -> str:
+        if self.cancelled:
+            return "cancelled"
+        if self.timed_out:
+            return "timed-out"
+        if self.returncode == 0:
+            return "success"
+        if self.returncode < 0:
+            return "signal"
+        return "failed"
+
+    def as_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        redacted = redact_command(self.command)
+        result["command"] = list(redacted)
+        result["stdout"] = redact_text(self.stdout)
+        result["stderr"] = redact_text(self.stderr)
+        result["exit_classification"] = self.exit_classification
+        result["command_metadata"] = {
+            "executable": Path(redacted[0]).name if redacted else "",
+            "argument_count": max(0, len(redacted) - 1),
+            "argv": list(redacted),
+            "redacted": True,
+        }
+        return result
+
+    def diagnostic_record(self, correlation_id: str | None = None) -> dict[str, Any]:
+        redacted = redact_command(self.command)
+        return {
+            "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
+            "kind": DIAGNOSTICS_KIND,
+            "correlation_id": _normalize_correlation_id(
+                correlation_id or self.correlation_id
+            ),
+            "phase": self.phase,
+            "duration_seconds": round(max(0.0, float(self.duration_seconds)), 6),
+            "returncode": self.returncode,
+            "exit_classification": self.exit_classification,
+            "command": {
+                "executable": Path(redacted[0]).name if redacted else "",
+                "argument_count": max(0, len(redacted) - 1),
+                "option_names": [
+                    item.split("=", 1)[0]
+                    for item in redacted[1:]
+                    if item.startswith("-")
+                ],
+                "redacted": True,
+            },
+            "output": {
+                "stdout_bytes": len(self.stdout.encode("utf-8", errors="replace")),
+                "stderr_bytes": len(self.stderr.encode("utf-8", errors="replace")),
+                "truncated": self.output_truncated,
+            },
+        }
 
 
 @dataclass
@@ -737,11 +823,89 @@ class BuildResult:
     message: str = ""
     duration_seconds: float = 0.0
     manifest: Path | None = None
+    phase_timings: Mapping[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.phase_timings:
+            timings: dict[str, float] = {
+                "total": round(max(0.0, float(self.duration_seconds)), 6)
+            }
+            command_seconds = sum(
+                max(0.0, float(command.duration_seconds)) for command in self.commands
+            )
+            if self.commands:
+                timings["commands"] = round(command_seconds, 6)
+                for command in self.commands:
+                    phase = command.phase or "command"
+                    timings[phase] = round(
+                        timings.get(phase, 0.0)
+                        + max(0.0, float(command.duration_seconds)),
+                        6,
+                    )
+            self.phase_timings = timings
+
+    @property
+    def correlation_id(self) -> str:
+        return _normalize_correlation_id(self.request.correlation_id)
+
+    @property
+    def cache_status(self) -> str:
+        if self.status == "cache-hit":
+            return "hit"
+        if not self.request.cache:
+            return "disabled"
+        if self.cache_key:
+            return "miss"
+        return "not-requested"
+
+    def artifact_hashes(self) -> dict[str, str]:
+        hashes: dict[str, str] = {}
+        if re.fullmatch(r"[0-9a-f]{64}", self.source_hash):
+            hashes["source"] = self.source_hash
+        for name, path in (("output", self.output), ("manifest", self.manifest)):
+            if path and Path(path).is_file():
+                try:
+                    hashes[name] = sha256_file(path)
+                except OSError:
+                    continue
+        return hashes
+
+    def diagnostic_record(self) -> dict[str, Any]:
+        return {
+            "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
+            "kind": DIAGNOSTICS_KIND,
+            "correlation_id": self.correlation_id,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "status": self.status,
+            "success": self.success,
+            "backend": self.backend,
+            "target": self.request.target,
+            "architecture": self.request.architecture,
+            "exit_classification": (
+                self.commands[-1].exit_classification
+                if self.commands
+                else ("success" if self.success else "failed")
+            ),
+            "phase_timings": {
+                str(name): round(max(0.0, float(seconds)), 6)
+                for name, seconds in self.phase_timings.items()
+            },
+            "cache": {"status": self.cache_status},
+            "artifacts": {"sha256": self.artifact_hashes()},
+            "commands": [
+                command.diagnostic_record(self.correlation_id)
+                for command in self.commands
+            ],
+        }
 
     def as_dict(self) -> dict[str, Any]:
         serializable_request = replace(self.request, cancel_event=None)
         result = asdict(replace(self, request=serializable_request))
         result["schema_version"] = RESULT_SCHEMA_VERSION
+        result["correlation_id"] = self.correlation_id
+        result["cache_status"] = self.cache_status
+        result["artifact_hashes"] = self.artifact_hashes()
+        result["exit_classification"] = self.diagnostic_record()["exit_classification"]
         result["request"]["source"] = str(self.request.source)
         result["request"]["schema_version"] = REQUEST_SCHEMA_VERSION
         result["request"]["output"] = str(self.request.output)
@@ -765,14 +929,10 @@ class BuildResult:
         result["manifest"] = str(self.manifest) if self.manifest else None
         result["message"] = redact_text(str(result.get("message", "")))
         result["commands"] = [
-            {
-                **asdict(command),
-                "command": list(redact_command(command.command)),
-                "stdout": redact_text(command.stdout),
-                "stderr": redact_text(command.stderr),
-            }
+            command.as_dict()
             for command in self.commands
         ]
+        result["diagnostics"] = self.diagnostic_record()
         return result
 
 
@@ -2091,6 +2251,8 @@ def run_command(
     timeout: float | None = None,
     policy: ExecutionPolicy | None = None,
     stop_event: threading.Event | None = None,
+    correlation_id: str | None = None,
+    phase: str = "command",
 ) -> CommandResult:
     """Run one bounded executable directly, with no shell or console window."""
 
@@ -2190,6 +2352,8 @@ def run_command(
             timed_out=timed_out,
             cancelled=cancelled,
             output_truncated=output_truncated,
+            correlation_id=correlation_id or "",
+            phase=phase,
         )
     except OSError as error:
         return CommandResult(
@@ -2197,6 +2361,8 @@ def run_command(
             returncode=127,
             stderr=str(error),
             duration_seconds=time.monotonic() - started,
+            correlation_id=correlation_id or "",
+            phase=phase,
         )
 
 
@@ -2517,6 +2683,7 @@ class CompilerEngine:
         command: Sequence[str],
         cwd: os.PathLike[str] | str | None = None,
         environment: Mapping[str, str] | None = None,
+        phase: str = "command",
     ) -> CommandResult:
         """Run a compiler command through the configured execution policy."""
 
@@ -2525,11 +2692,21 @@ class CompilerEngine:
             "cwd": cwd,
             "environment": environment,
             "timeout": policy.timeout_seconds,
+            "correlation_id": request.correlation_id,
+            "phase": phase,
         }
         if self.runner is run_command:
             kwargs["policy"] = policy
             kwargs["stop_event"] = request.cancel_event
-        return self.runner(command, **kwargs)
+        else:
+            kwargs.pop("correlation_id", None)
+            kwargs.pop("phase", None)
+        result = self.runner(command, **kwargs)
+        return replace(
+            result,
+            correlation_id=request.correlation_id,
+            phase=phase,
+        )
 
     def choose_backend(self, file_type: str, requested: str = "auto") -> str | None:
         normalized_type = file_type.lower().lstrip(".")
@@ -2615,7 +2792,7 @@ class CompilerEngine:
                 raise BuildValidationError(
                     f"Pinned toolchain is not installed: {backend} ({expected})"
                 )
-            result = self._run(request, command)
+            result = self._run(request, command, phase="toolchain-probe")
             if not result.success or str(expected) not in result.output:
                 actual = result.output.splitlines()[0] if result.output else "unknown"
                 raise BuildValidationError(
@@ -3268,7 +3445,15 @@ class CompilerEngine:
                 )
         else:
             raise BuildValidationError(f"Unsupported dependency manager: {manager}")
-        return [self._run(request, command, cwd=root, environment=environment)]
+        return [
+            self._run(
+                request,
+                command,
+                cwd=root,
+                environment=environment,
+                phase="dependency-prefetch",
+            )
+        ]
 
     def _staged_request(self, request: BuildRequest) -> tuple[BuildRequest, Path]:
         """Create a per-build staging directory on the output volume."""
@@ -3378,6 +3563,7 @@ class CompilerEngine:
                 plan.command,
                 cwd=plan.cwd,
                 environment=plan.environment,
+                phase="compile",
             )
             commands.append(result)
             if not result.success:
@@ -3449,6 +3635,7 @@ class CompilerEngine:
                     staged_request,
                     (upx, "--best", "--lzma", str(staged_request.output)),
                     cwd=staged_request.output.parent,
+                    phase="postprocess",
                 )
                 commands.append(compression)
                 if not compression.success:
@@ -4448,6 +4635,118 @@ class BuildAnalytics:
         return [dict(zip(keys, row)) for row in rows]
 
 
+class DiagnosticsStore:
+    """Local JSONL diagnostics with bounded, explicit retention.
+
+    Records contain hashes and redacted command metadata only. No network
+    export is performed; ``export`` requires an explicit opt-in flag and
+    writes a sanitized bundle to a caller-selected local path.
+    """
+
+    def __init__(
+        self,
+        path: os.PathLike[str] | str | None = None,
+        retention_days: int = DEFAULT_DIAGNOSTICS_RETENTION_DAYS,
+        max_events: int = DEFAULT_DIAGNOSTICS_MAX_EVENTS,
+    ) -> None:
+        self.path = (
+            Path(path).expanduser()
+            if path
+            else config_dir() / "diagnostics.jsonl"
+        )
+        self.retention_days = int(retention_days)
+        self.max_events = int(max_events)
+        if self.retention_days < 1:
+            raise BuildValidationError("Diagnostics retention must be at least one day")
+        if self.max_events < 1:
+            raise BuildValidationError("Diagnostics max events must be positive")
+
+    def _read(self) -> list[dict[str, Any]]:
+        if not self.path.is_file():
+            return []
+        records: list[dict[str, Any]] = []
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return records
+        for line in lines:
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if (
+                isinstance(value, Mapping)
+                and value.get("schema_version") == DIAGNOSTICS_SCHEMA_VERSION
+                and value.get("kind") == DIAGNOSTICS_KIND
+            ):
+                records.append(dict(value))
+        return records
+
+    def _rewrite(self, records: Sequence[Mapping[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        payload = "".join(
+            json.dumps(record, sort_keys=True, separators=(",", ":"), default=str)
+            + "\n"
+            for record in records
+        )
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, self.path)
+
+    def _retained(self, records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        cutoff = datetime.now(UTC).timestamp() - self.retention_days * 86400
+        retained: list[dict[str, Any]] = []
+        for record in records:
+            timestamp = record.get("timestamp")
+            try:
+                parsed = datetime.fromisoformat(str(timestamp)).timestamp()
+            except (TypeError, ValueError):
+                parsed = datetime.now(UTC).timestamp()
+            if parsed >= cutoff:
+                retained.append(dict(record))
+        return retained[-self.max_events :]
+
+    def append(self, record: Mapping[str, Any]) -> None:
+        if record.get("schema_version") != DIAGNOSTICS_SCHEMA_VERSION:
+            raise BuildValidationError("Unsupported diagnostics schema")
+        if record.get("kind") != DIAGNOSTICS_KIND:
+            raise BuildValidationError("Unsupported diagnostics kind")
+        sanitized = _redact_diagnostic_value(dict(record))
+        if not isinstance(sanitized, dict):
+            raise BuildValidationError("Diagnostics record must be an object")
+        sanitized["correlation_id"] = _normalize_correlation_id(
+            str(sanitized.get("correlation_id", ""))
+        )
+        records = self._retained([*self._read(), sanitized])
+        self._rewrite(records)
+
+    def record(self, result: BuildResult) -> None:
+        self.append(result.diagnostic_record())
+
+    def recent(self, limit: int = 10) -> list[dict[str, Any]]:
+        return self._retained(self._read())[-max(1, int(limit)) :]
+
+    def export(
+        self, destination: os.PathLike[str] | str, opt_in: bool = False
+    ) -> Path:
+        if not opt_in:
+            raise BuildValidationError(
+                "Diagnostics export requires explicit telemetry opt-in"
+            )
+        output = Path(destination).expanduser()
+        save_json(
+            output,
+            {
+                "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
+                "kind": DIAGNOSTICS_KIND,
+                "exported_at": datetime.now(UTC).isoformat(),
+                "events": self.recent(self.max_events),
+                "telemetry": {"opt_in": True, "network": False},
+            },
+        )
+        return output
+
+
 def parse_metadata(values: Sequence[str]) -> dict[str, str]:
     metadata: dict[str, str] = {}
     for value in values:
@@ -4613,6 +4912,7 @@ def _profile_request(
         dependency_mirror=(
             args.dependency_mirror or profile.get("dependency_mirror")
         ),
+        correlation_id=args.correlation_id or new_correlation_id(),
     )
 
 
@@ -4681,6 +4981,25 @@ def _add_build_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dependency-mirror",
         help="Override the lock file's explicit package mirror",
+    )
+    parser.add_argument(
+        "--correlation-id",
+        help="Optional 32-character or UUID correlation id for structured diagnostics",
+    )
+    parser.add_argument(
+        "--diagnostics-path",
+        help="Local JSONL diagnostics path (default: per-user diagnostics.jsonl)",
+    )
+    parser.add_argument(
+        "--diagnostics-retention-days",
+        type=int,
+        default=DEFAULT_DIAGNOSTICS_RETENTION_DAYS,
+        help="Local diagnostics retention window",
+    )
+    parser.add_argument(
+        "--no-diagnostics",
+        action="store_true",
+        help="Disable local structured diagnostics recording",
     )
     parser.add_argument(
         "--adapter",
@@ -4851,6 +5170,24 @@ def create_cli_parser() -> argparse.ArgumentParser:
     analytics_parser.add_argument("--path")
     analytics_parser.add_argument("--recent", type=int, default=0)
     analytics_parser.add_argument("--json", action="store_true")
+
+    diagnostics_parser = subparsers.add_parser(
+        "diagnostics", help="Show or explicitly export local structured diagnostics"
+    )
+    diagnostics_parser.add_argument("--path")
+    diagnostics_parser.add_argument(
+        "--retention-days", type=int, default=DEFAULT_DIAGNOSTICS_RETENTION_DAYS
+    )
+    diagnostics_parser.add_argument("--recent", type=int, default=10)
+    diagnostics_parser.add_argument(
+        "--export", dest="export_path", help="Write a sanitized local diagnostics bundle"
+    )
+    diagnostics_parser.add_argument(
+        "--allow-telemetry",
+        action="store_true",
+        help="Explicitly opt in to diagnostics export (no network is used)",
+    )
+    diagnostics_parser.add_argument("--json", action="store_true")
 
     return parser
 
@@ -5031,6 +5368,31 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             else json.dumps(analytics_value, indent=2, default=str)
         )
         return 0
+    if args.command == "diagnostics":
+        try:
+            diagnostics_store = DiagnosticsStore(
+                args.path,
+                retention_days=args.retention_days,
+            )
+            export_path = (
+                diagnostics_store.export(args.export_path, opt_in=args.allow_telemetry)
+                if args.export_path
+                else None
+            )
+        except (BuildValidationError, OSError, ValueError) as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+        diagnostics_value = {
+            "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
+            "kind": DIAGNOSTICS_KIND,
+            "path": str(diagnostics_store.path),
+            "retention_days": diagnostics_store.retention_days,
+            "events": diagnostics_store.recent(args.recent),
+            "export": str(export_path) if export_path else None,
+            "telemetry": {"opt_in": bool(args.allow_telemetry), "network": False},
+        }
+        print(json.dumps(diagnostics_value, indent=2, default=str))
+        return 0
     if args.command == "verify":
         verification_result = (
             verify_artifact_manifest(args.artifact)
@@ -5100,6 +5462,18 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     build_analytics: BuildAnalytics | None = (
         None if args.no_analytics else BuildAnalytics()
     )
+    try:
+        build_diagnostics: DiagnosticsStore | None = (
+            None
+            if args.no_diagnostics
+            else DiagnosticsStore(
+                args.diagnostics_path,
+                retention_days=args.diagnostics_retention_days,
+            )
+        )
+    except (BuildValidationError, OSError, ValueError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
     if args.command == "build":
         source = Path(args.source).expanduser()
         output = (
@@ -5129,6 +5503,8 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                 ):
                     if build_analytics:
                         build_analytics.record(result)
+                    if build_diagnostics:
+                        build_diagnostics.record(result)
                     print(
                         json.dumps(result.as_dict(), indent=2, default=str)
                         if args.json
@@ -5143,6 +5519,9 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             if build_analytics:
                 for matrix_result in results:
                     build_analytics.record(matrix_result)
+            if build_diagnostics:
+                for matrix_result in results:
+                    build_diagnostics.record(matrix_result)
             if args.json:
                 print(
                     json.dumps(
@@ -5157,6 +5536,8 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         build_result = engine.build(request)
         if build_analytics:
             build_analytics.record(build_result)
+        if build_diagnostics:
+            build_diagnostics.record(build_result)
         print(
             json.dumps(build_result.as_dict(), indent=2, default=str)
             if args.json
@@ -5186,6 +5567,9 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         if build_analytics:
             for batch_result in results:
                 build_analytics.record(batch_result)
+        if build_diagnostics:
+            for batch_result in results:
+                build_diagnostics.record(batch_result)
         if args.json:
             print(
                 json.dumps(
@@ -5219,6 +5603,9 @@ __all__ = [
     "CAPABILITY_SCHEMA_VERSION",
     "CommandResult",
     "CompilerEngine",
+    "DIAGNOSTICS_KIND",
+    "DIAGNOSTICS_SCHEMA_VERSION",
+    "DiagnosticsStore",
     "PROVENANCE_SCHEMA_VERSION",
     "RELEASE_KIND",
     "RELEASE_SCHEMA_VERSION",
@@ -5249,6 +5636,7 @@ __all__ = [
     "estimate_output_size",
     "extract_icon",
     "format_size",
+    "new_correlation_id",
     "github_actions_template",
     "obfuscate_source",
     "load_json",
