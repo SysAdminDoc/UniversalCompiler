@@ -104,3 +104,18 @@ All notable changes to UniversalCompiler will be documented in this file.
 - Rename Universalcompiler.ps1 to UniversalCompiler.ps1
 - Create Universalcompiler.ps1
 - Changed: Update README.md
+
+## Roadmap archive — 2026-08-10 — ROADMAP.md
+
+<details>
+<summary>Original roadmap snapshot</summary>
+
+```markdown
+# Roadmap
+
+Forward-looking plans for Universal Compiler — script-to-EXE compiler with drag-and-drop GUI, supporting PS1, PY, BAT, JS, CS, GO, RB, VBS, AHK. v2.1.1 today.
+
+## Research-Driven Additions
+```
+
+</details>
